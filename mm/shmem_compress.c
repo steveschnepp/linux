@@ -590,25 +590,33 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 		    unsigned long handle, void *dst,
 		    unsigned int *len)
 {
-	void *src;
-	unsigned int obj_size;
+	void *bounce, *src;
 
-	if (!pool || !dst || handle == 0)
+	if (!pool || !dst || !len || handle == 0)
 		return -EINVAL;
 
-	/* Read data from zsmalloc */
-	src = zs_obj_read_begin(pool->zs_pool, handle, *len, NULL);
-	if (!src)
+	/*
+	 * zs_obj_read_begin() writes into the caller-provided
+	 * @local_copy bounce buffer when the object spans two pages of
+	 * its zspage. Allocate one sized to the compressed length so
+	 * both the contained and spanning cases work. (Passing NULL
+	 * caused a NULL pointer dereference for spanning objects.)
+	 */
+	bounce = kmalloc(*len, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+
+	src = zs_obj_read_begin(pool->zs_pool, handle, *len, bounce);
+	if (!src) {
+		kfree(bounce);
 		return -EINVAL;
+	}
 
-	/* Get object size - we stored it as the length */
-	obj_size = *len;  /* Length was passed in */
+	memcpy(dst, src, *len);
 
-	/* Copy data to destination */
-	memcpy(dst, src, obj_size);
-	*len = obj_size;
-
-	zs_obj_read_end(pool->zs_pool, handle, obj_size, src);
+	/* In the contained case src is a kmap address and gets unmapped */
+	zs_obj_read_end(pool->zs_pool, handle, *len, src);
+	kfree(bounce);
 
 	return 0;
 }
@@ -637,7 +645,8 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
  * here and referenced by a small ID from the page cache entry.
  */
 
-static DEFINE_XARRAY(shmem_comp_entries);
+/* XA_FLAGS_ALLOC reserves index 0: the page cache uses 0 for "empty" */
+static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 
 unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length)
 {
@@ -653,16 +662,15 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length)
 	ent->length = length;
 	ent->referenced = true;
 
-	xa_lock(&shmem_comp_entries);
+	/*
+	 * xa_alloc() takes the xarray lock internally. Wrapping it in
+	 * xa_lock() deadlocks against itself (non-recursive spinlock,
+	 * observed as a soft lockup in QEMU).
+	 *
+	 * XA_FLAGS_ALLOC reserves index 0, so id is never 0 here.
+	 */
 	ret = xa_alloc(&shmem_comp_entries, &id, ent,
 			xa_limit_32b, GFP_KERNEL | __GFP_NOWARN);
-	/* ID 0 is reserved: the page cache uses 0 to mean "no entry" */
-	if (!ret && id == 0) {
-		xa_store(&shmem_comp_entries, 0, NULL, GFP_KERNEL);
-		ret = -EBUSY;
-	}
-	xa_unlock(&shmem_comp_entries);
-
 	if (ret) {
 		kfree(ent);
 		return 0;
@@ -686,9 +694,8 @@ void shmem_comp_entry_put(unsigned int id)
 {
 	struct shmem_comp_entry *ent;
 
-	xa_lock(&shmem_comp_entries);
+	/* xa_erase() takes the xarray lock internally */
 	ent = xa_erase(&shmem_comp_entries, id);
-	xa_unlock(&shmem_comp_entries);
 
 	if (ent)
 		kfree_rcu(ent, rcu);
