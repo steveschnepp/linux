@@ -2329,7 +2329,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	struct folio *folio;
 	unsigned long handle;
 	unsigned int comp_len;
-	void *dst;
+	void *src, *dst;
 	int ret;
 
 	*foliop = NULL;
@@ -2356,12 +2356,27 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return -EEXIST;
 	}
 
-	/* Load compressed data from zsmalloc pool and decompress */
+	/* Load compressed data from zsmalloc pool */
+	src = kmalloc(comp_len, GFP_KERNEL);
+	if (!src) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return -ENOMEM;
+	}
+
+	ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
+	if (ret) {
+		kfree(src);
+		folio_unlock(folio);
+		folio_put(folio);
+		return ret;
+	}
+
+	/* Decompress data to folio */
 	dst = kmap_local_folio(folio, 0);
-	ret = shmem_comp_decompress(sbinfo->comp_pool,
-				    /* src needs to be loaded first */,
-				    comp_len, dst);
+	ret = shmem_comp_decompress(sbinfo->comp_pool, src, comp_len, dst);
 	kunmap_local(dst);
+	kfree(src);
 
 	if (ret) {
 		folio_unlock(folio);
