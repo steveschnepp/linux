@@ -133,6 +133,68 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
 	return xa_mk_value(entry.val);
 }
 
+/*
+ * tmpfs transparent compression entry helpers.
+ *
+ * Compressed pages in tmpfs are stored in the page cache xarray as
+ * special swap-like entries using SWP_SHMEM_COMPRESS type. The entry
+ * encodes both the zsmalloc handle and the compressed length.
+ */
+
+/**
+ * make_shmem_comp_entry - Create a swap entry for compressed page
+ * @handle: zsmalloc handle for compressed data
+ * @length: Compressed data length in bytes
+ *
+ * Return: swp_entry_t encoding the compression entry
+ *
+ * Packs the zsmalloc handle and compressed length into a swap entry
+ * using the SWP_SHMEM_COMPRESS type. The handle occupies the upper
+ * bits and length the lower bits of the offset field.
+ */
+#ifdef CONFIG_TMPFS_COMPRESSION
+static inline swp_entry_t make_shmem_comp_entry(unsigned long handle,
+						unsigned int length)
+{
+	/* Pack handle (upper bits) and length (lower 12 bits) */
+	pgoff_t offset = (handle << 12) | (length & 0xFFF);
+	return swp_entry(SWP_SHMEM_COMPRESS, offset);
+}
+
+/**
+ * shmem_comp_entry_handle - Extract zsmalloc handle from entry
+ * @entry: swp_entry_t from page cache xarray
+ *
+ * Return: zsmalloc handle
+ */
+static inline unsigned long shmem_comp_entry_handle(swp_entry_t entry)
+{
+	return swp_offset(entry) >> 12;
+}
+
+/**
+ * shmem_comp_entry_length - Extract compressed length from entry
+ * @entry: swp_entry_t from page cache xarray
+ *
+ * Return: Compressed data length in bytes
+ */
+static inline unsigned int shmem_comp_entry_length(swp_entry_t entry)
+{
+	return swp_offset(entry) & 0xFFF;
+}
+
+/**
+ * is_shmem_comp_entry - Check if entry is a compressed page entry
+ * @entry: swp_entry_t to check
+ *
+ * Return: true if entry is a compressed page, false otherwise
+ */
+static inline bool is_shmem_comp_entry(swp_entry_t entry)
+{
+	return swp_type(entry) == SWP_SHMEM_COMPRESS;
+}
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 #if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
 static inline swp_entry_t make_readable_device_private_entry(pgoff_t offset)
 {

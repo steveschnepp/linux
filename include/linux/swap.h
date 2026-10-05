@@ -57,6 +57,22 @@ static inline int current_is_kswapd(void)
 			    SWP_MIGRATION_NUM + SWP_DEVICE_NUM)
 
 /*
+ * tmpfs transparent compression support.
+ *
+ * Compressed pages in tmpfs are stored in the page cache xarray using
+ * a special entry type, similar to how swap entries are stored. This
+ * allows compressed pages to be transparently decompressed on access.
+ */
+#define SWP_SHMEM_COMPRESS_NUM 1
+#ifdef CONFIG_TMPFS_COMPRESSION
+#define SWP_SHMEM_COMPRESS   (MAX_SWAPFILES + SWP_HWPOISON_NUM + \
+			      SWP_MIGRATION_NUM + SWP_DEVICE_NUM + \
+			      SWP_PTE_MARKER_NUM)
+#else
+#define SWP_SHMEM_COMPRESS   0
+#endif
+
+/*
  * Unaddressable device memory support. See include/linux/hmm.h and
  * Documentation/mm/hmm.rst. Short description is we need struct pages for
  * device memory that is unaddressable (inaccessible) by CPU, so that we can
@@ -108,7 +124,7 @@ static inline int current_is_kswapd(void)
 #define MAX_SWAPFILES \
 	((1 << MAX_SWAPFILES_SHIFT) - SWP_DEVICE_NUM - \
 	SWP_MIGRATION_NUM - SWP_HWPOISON_NUM - \
-	SWP_PTE_MARKER_NUM)
+	SWP_PTE_MARKER_NUM - SWP_SHMEM_COMPRESS_NUM)
 
 /*
  * Magic header for a swap area. The first part of the union is
