@@ -45,6 +45,7 @@
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
 #include <linux/zsmalloc.h>
+#include <linux/swapops.h>
 #include <crypto/acompress.h>
 #include <linux/shmem_compress.h>
 
@@ -348,6 +349,39 @@ void shmem_comp_pool_put(struct shmem_comp_pool *pool)
 	if (atomic_dec_and_test(&pool->refcount))
 		shmem_comp_pool_destroy(pool);
 }
+
+/*
+ * XArray entry type checking.
+ */
+
+/**
+ * shmem_comp_type_check - Check if xa_value is a compression entry
+ * @entry: xa_value to check
+ *
+ * Return: true if entry is a compressed page entry, false otherwise
+ *
+ * Checks if the xa_value uses the SWP_SHMEM_COMPRESS type tag.
+ * This function should only be called after xa_is_value() returns true.
+ *
+ * The check extracts the swap type from the value and compares it
+ * against SWP_SHMEM_COMPRESS. If CONFIG_TMPFS_COMPRESSION is disabled,
+ * this always returns false.
+ */
+bool shmem_comp_type_check(const void *entry)
+{
+#ifdef CONFIG_TMPFS_COMPRESSION
+	swp_entry_t swap;
+
+	/* Convert xa_value back to swp_entry_t format */
+	swap.val = xa_to_value(entry);
+
+	/* Check if this is a compression entry */
+	return swp_type(swap) == SWP_SHMEM_COMPRESS;
+#else
+	return false;
+#endif
+}
+EXPORT_SYMBOL_GPL(shmem_comp_type_check);
 
 /*
  * Compression/decompression operations.
