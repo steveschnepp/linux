@@ -3580,6 +3580,22 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 		folio_mark_uptodate(folio);
 	}
 	folio_mark_dirty(folio);
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Attempt compression if file is large enough */
+	{
+		struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+
+		if (sbinfo->comp_enabled && sbinfo->comp_pool &&
+		    i_size_read(inode) >= sbinfo->comp_threshold) {
+			pgoff_t index = pos >> PAGE_SHIFT;
+
+			/* Try to compress - ignore failures */
+			shmem_compress_folio(inode, index, folio);
+		}
+	}
+#endif
+
 	folio_unlock(folio);
 	folio_put(folio);
 
