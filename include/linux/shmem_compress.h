@@ -297,4 +297,34 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
  */
 void shmem_comp_get_stats(struct shmem_comp_stats *stats);
 
+/**
+ * shmem_comp_update_stats - Update compression statistics
+ * @compressed: true if page was compressed, false for decompression
+ * @orig_size: Original page size (PAGE_SIZE)
+ * @comp_size: Compressed size
+ *
+ * Updates global statistics counters. Called after successful
+ * compression or decompression operations.
+ */
+void shmem_comp_update_stats(bool compressed, unsigned int orig_size,
+			      unsigned int comp_size);
+
+/**
+ * shmem_comp_pool_get - Get reference to a pool
+ * @pool: Pool to reference
+ *
+ * Increments the pool refcount. Callers must call shmem_comp_pool_put()
+ * when done with the pool.
+ */
+void shmem_comp_pool_get(struct shmem_comp_pool *pool);
+
+/**
+ * shmem_comp_pool_put - Release reference to a pool
+ * @pool: Pool to release
+ *
+ * Decrements the pool refcount. If refcount reaches zero, the pool
+ * is destroyed.
+ */
+void shmem_comp_pool_put(struct shmem_comp_pool *pool);
+
 #endif /* __LINUX_SHMEM_COMPRESS_H */
