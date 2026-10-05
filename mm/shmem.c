@@ -345,33 +345,6 @@ static struct dquot __rcu **shmem_get_dquots(struct inode *inode)
 }
 #endif /* CONFIG_TMPFS_QUOTA */
 
-#ifdef CONFIG_TMPFS_COMPRESSION
-	/* Initialize compression pool if enabled */
-	if (ctx->comp_enabled) {
-		const char *algo;
-
-		/* Use mount-specified algorithm or global default */
-		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
-
-		/* Validate algorithm and create pool */
-		if (algo && strcmp(algo, "none") != 0) {
-			sbinfo->comp_pool = shmem_comp_pool_create(algo);
-			if (IS_ERR(sbinfo->comp_pool)) {
-				pr_warn("tmpfs: failed to create compression pool, "
-					"running uncompressed\n");
-				sbinfo->comp_pool = NULL;
-			} else {
-				sbinfo->comp_enabled = ctx->comp_compress;
-				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
-				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
-				atomic_long_set(&sbinfo->comp_pages, 0);
-				atomic_long_set(&sbinfo->comp_bytes, 0);
-				pr_info("tmpfs: compression enabled with %s\n", algo);
-			}
-		}
-	}
-#endif /* CONFIG_TMPFS_COMPRESSION */
-
 /*
  * shmem_reserve_inode() performs bookkeeping to reserve a shmem inode, and
  * produces a novel ino for the newly allocated inode.
@@ -2305,26 +2278,27 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 				struct folio *folio);
 
 /**
- * shmem_decompress_folio - Decompress a page from compression pool
+ * shmem_decompress_folio - Decompress a page from the compression pool
  * @inode: shmem inode
- * @index: Page index in file
- * @comp_entry: Compressed entry from page cache
- * @sgp: Page allocation type
- * @gfp: Allocation flags
- * @foliop: Output folio pointer
+ * @index: page index in the file
+ * @comp_entry: compression entry found in the page cache
+ * @gfp: allocation flags for the replacement folio
+ * @foliop: output, receives the decompressed folio
  *
  * Return: 0 on success, negative errno on failure
  *
- * Decompresses a page from the compression pool and returns it as a
- * regular folio. The compressed entry is removed from the page cache
- * and replaced with the decompressed folio.
+ * Loads the compressed data from the zsmalloc pool, decompresses it
+ * into a freshly allocated folio and atomically swaps the compression
+ * entry for that folio in the page cache xarray. The folio is returned
+ * locked and with a reference, matching the shmem_get_folio() contract.
  *
- * This is called when a compressed page is accessed via read, mmap,
- * or any other path that needs the page content.
+ * Races with a concurrent compress/decompress of the same index are
+ * resolved by shmem_add_to_page_cache(): it only installs the folio if
+ * the slot still holds @comp_entry, otherwise -EEXIST is returned and
+ * the caller retries.
  */
 static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
-				   swp_entry_t comp_entry,
-				   enum sgp_type sgp, gfp_t gfp,
+				   swp_entry_t comp_entry, gfp_t gfp,
 				   struct folio **foliop)
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
@@ -2340,42 +2314,30 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (!sbinfo->comp_pool)
 		return -ENOENT;
 
-	/* Extract handle and length from swap entry */
+	/* Extract the zsmalloc handle and compressed length */
 	handle = shmem_comp_entry_handle(comp_entry);
 	comp_len = shmem_comp_entry_length(comp_entry);
 
-	/* Allocate a new folio for the decompressed page */
-	folio = shmem_alloc_and_add_folio(NULL, gfp, inode, index,
-					   current->mm, 0);
-	if (IS_ERR(folio))
-		return PTR_ERR(folio);
-
-	folio_lock(folio);
-
-	/* Verify folio is still in the page cache */
-	if (folio->mapping != mapping) {
-		folio_unlock(folio);
-		folio_put(folio);
-		return -EEXIST;
-	}
-
-	/* Load compressed data from zsmalloc pool */
-	src = kmalloc(comp_len, GFP_KERNEL);
-	if (!src) {
-		folio_unlock(folio);
-		folio_put(folio);
+	/* Read the compressed bytes out of the pool first */
+	src = kmalloc(comp_len, gfp);
+	if (!src)
 		return -ENOMEM;
-	}
 
 	ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
 	if (ret) {
 		kfree(src);
-		folio_unlock(folio);
-		folio_put(folio);
 		return ret;
 	}
 
-	/* Decompress data to folio */
+	/* Allocate a folio that is not part of any mapping yet */
+	folio = filemap_alloc_folio(gfp, 0, NULL);
+	if (!folio) {
+		kfree(src);
+		return -ENOMEM;
+	}
+	folio_lock(folio);
+
+	/* Decompress into the folio */
 	dst = kmap_local_folio(folio, 0);
 	ret = shmem_comp_decompress(sbinfo->comp_pool, src, comp_len, dst);
 	kunmap_local(dst);
@@ -2387,13 +2349,21 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return ret;
 	}
 
-	/* Mark folio as uptodate */
 	folio_mark_uptodate(folio);
 
-	/* Remove compressed entry from page cache */
-	shmem_delete_from_page_cache(folio, comp_entry);
+	/*
+	 * Atomically replace the compression entry with the folio.
+	 * @comp_entry is passed as the expected xarray slot contents.
+	 */
+	ret = shmem_add_to_page_cache(folio, mapping, index,
+				       swp_to_radix_entry(comp_entry), gfp);
+	if (ret) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return ret;
+	}
 
-	/* Free compressed data from pool */
+	/* The data now lives in the folio: free the compressed copy */
 	shmem_comp_free(sbinfo->comp_pool, handle);
 
 	/* Update accounting */
@@ -2401,6 +2371,8 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
 	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
 
+	folio_set_referenced(folio);
+	/* Hand back the folio locked, with a reference for the caller */
 	*foliop = folio;
 	return 0;
 }
@@ -2481,33 +2453,24 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	/* Create compression entry */
 	comp_entry = make_shmem_comp_entry(handle, comp_len);
 
-	/* Replace folio with compressed entry in page cache */
-	/* First, remove the folio from page cache */
-	folio_clear_dirty(folio);
-	folio_clear_uptodate(folio);
-
-	/* Delete from page cache - this removes the folio mapping */
-	shmem_delete_from_page_cache(folio, NULL);
-
-	/* Add compressed entry to page cache */
-	ret = shmem_add_to_page_cache(folio, mapping, index,
-				       swp_to_radix_entry(comp_entry),
-				       __GFP_NOFAIL);
-	if (ret) {
-		/* Failed to add - cleanup */
-		shmem_comp_free(sbinfo->comp_pool, handle);
-		folio_unlock(folio);
-		folio_put(folio);
-		return ret;
-	}
+	/*
+	 * Atomically swap the folio for the compression entry in the
+	 * page cache xarray. shmem_delete_from_page_cache() replaces
+	 * the slot under xa_lock and drops the page cache's reference
+	 * to the folio; the caller keeps its own reference.
+	 */
+	shmem_delete_from_page_cache(folio, swp_to_radix_entry(comp_entry));
 
 	/* Update accounting */
 	atomic_long_inc(&sbinfo->comp_pages);
 	atomic_long_add(comp_len, &sbinfo->comp_bytes);
 	shmem_comp_update_stats(true, PAGE_SIZE, comp_len);
 
+	/*
+	 * The folio has left the page cache; the caller (write_end)
+	 * still owns a reference and releases it after we return.
+	 */
 	folio_unlock(folio);
-	folio_put(folio);
 
 	return 0;
 }
@@ -2734,7 +2697,7 @@ repeat:
 
 			comp_entry = radix_to_swp_entry(folio);
 			error = shmem_decompress_folio(inode, index,
-							comp_entry, sgp, gfp,
+							comp_entry, gfp,
 							&folio);
 			if (error == -EEXIST)
 				goto repeat;
@@ -3580,23 +3543,24 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 		folio_mark_uptodate(folio);
 	}
 	folio_mark_dirty(folio);
+	folio_unlock(folio);
 
 #ifdef CONFIG_TMPFS_COMPRESSION
-	/* Attempt compression if file is large enough */
+	/*
+	 * Attempt compression after dropping the folio lock:
+	 * shmem_compress_folio() takes the lock itself and folio_lock()
+	 * is not recursive. The caller still holds a reference until
+	 * the folio_put() below.
+	 */
 	{
 		struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 
 		if (sbinfo->comp_enabled && sbinfo->comp_pool &&
-		    i_size_read(inode) >= sbinfo->comp_threshold) {
-			pgoff_t index = pos >> PAGE_SHIFT;
-
-			/* Try to compress - ignore failures */
-			shmem_compress_folio(inode, index, folio);
-		}
+		    i_size_read(inode) >= sbinfo->comp_threshold)
+			shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
 	}
 #endif
 
-	folio_unlock(folio);
 	folio_put(folio);
 
 	return copied;
@@ -5429,33 +5393,6 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 #endif /* CONFIG_TMPFS_COMPRESSION */
 
-#ifdef CONFIG_TMPFS_COMPRESSION
-	/* Initialize compression pool if enabled */
-	if (ctx->comp_enabled) {
-		const char *algo;
-
-		/* Use mount-specified algorithm or global default */
-		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
-
-		/* Validate algorithm and create pool */
-		if (algo && strcmp(algo, "none") != 0) {
-			sbinfo->comp_pool = shmem_comp_pool_create(algo);
-			if (IS_ERR(sbinfo->comp_pool)) {
-				pr_warn("tmpfs: failed to create compression pool, "
-					"running uncompressed\n");
-				sbinfo->comp_pool = NULL;
-			} else {
-				sbinfo->comp_enabled = ctx->comp_compress;
-				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
-				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
-				atomic_long_set(&sbinfo->comp_pages, 0);
-				atomic_long_set(&sbinfo->comp_bytes, 0);
-				pr_info("tmpfs: compression enabled with %s\n", algo);
-			}
-		}
-	}
-#endif /* CONFIG_TMPFS_COMPRESSION */
-
 	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL,
 				S_IFDIR | sbinfo->mode, 0,
 				mk_vma_flags(VMA_NORESERVE_BIT));
@@ -5791,7 +5728,6 @@ static ssize_t compressor_store(struct kobject *kobj,
 {
 	extern char *shmem_comp_default_compressor;
 	char *algo;
-	int ret;
 
 	algo = kstrdup(buf, GFP_KERNEL);
 	if (!algo)

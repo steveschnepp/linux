@@ -45,6 +45,7 @@
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
 #include <linux/zsmalloc.h>
+#include <linux/swap.h>
 #include <linux/swapops.h>
 #include <crypto/acompress.h>
 #include <linux/shmem_compress.h>
