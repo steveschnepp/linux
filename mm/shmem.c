@@ -2301,6 +2301,9 @@ unlock:
 
 #ifdef CONFIG_TMPFS_COMPRESSION
 
+static int shmem_compress_folio(struct inode *inode, pgoff_t index,
+				struct folio *folio);
+
 /**
  * shmem_decompress_folio - Decompress a page from compression pool
  * @inode: shmem inode
@@ -2399,6 +2402,113 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
 
 	*foliop = folio;
+	return 0;
+}
+
+/**
+ * shmem_compress_folio - Compress a folio and store in compression pool
+ * @inode: shmem inode
+ * @index: Page index in file
+ * @folio: Folio to compress
+ *
+ * Return: 0 on success, negative errno on failure
+ *
+ * Compresses the folio data and stores it in the compression pool.
+ * The folio is removed from the page cache and replaced with a
+ * compressed entry. This allows the memory to be reclaimed while
+ * preserving the data for later decompression.
+ *
+ * The compression is skipped if:
+ * - The data doesn't compress well (incompressible)
+ * - The compression pool is not available
+ * - Memory allocation fails
+ */
+static int shmem_compress_folio(struct inode *inode, pgoff_t index,
+				struct folio *folio)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	swp_entry_t comp_entry;
+	void *src, *comp_buf;
+	unsigned int comp_len;
+	unsigned long handle;
+	int ret;
+
+	if (!sbinfo->comp_pool || !sbinfo->comp_enabled)
+		return -ENOTSUPP;
+
+	/* Lock folio to ensure stability during compression */
+	folio_lock(folio);
+
+	/* Verify folio is still valid and uptodate */
+	if (folio->mapping != mapping || !folio_test_uptodate(folio)) {
+		folio_unlock(folio);
+		return -ENOENT;
+	}
+
+	/* Get source data from folio */
+	src = kmap_local_folio(folio, 0);
+
+	/* Allocate buffer for compressed data */
+	comp_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!comp_buf) {
+		kunmap_local(src);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+
+	/* Compress the page */
+	comp_len = PAGE_SIZE;
+	ret = shmem_comp_compress(sbinfo->comp_pool, src, comp_buf, &comp_len);
+	kunmap_local(src);
+
+	if (ret || comp_len >= PAGE_SIZE) {
+		/* Compression didn't reduce size - skip */
+		kfree(comp_buf);
+		folio_unlock(folio);
+		return -ENOSPC;
+	}
+
+	/* Store compressed data in zsmalloc pool */
+	handle = shmem_comp_store(sbinfo->comp_pool, comp_buf, comp_len);
+	kfree(comp_buf);
+
+	if (!handle) {
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+
+	/* Create compression entry */
+	comp_entry = make_shmem_comp_entry(handle, comp_len);
+
+	/* Replace folio with compressed entry in page cache */
+	/* First, remove the folio from page cache */
+	folio_clear_dirty(folio);
+	folio_clear_uptodate(folio);
+
+	/* Delete from page cache - this removes the folio mapping */
+	shmem_delete_from_page_cache(folio, NULL);
+
+	/* Add compressed entry to page cache */
+	ret = shmem_add_to_page_cache(folio, mapping, index,
+				       swp_to_radix_entry(comp_entry),
+				       __GFP_NOFAIL);
+	if (ret) {
+		/* Failed to add - cleanup */
+		shmem_comp_free(sbinfo->comp_pool, handle);
+		folio_unlock(folio);
+		folio_put(folio);
+		return ret;
+	}
+
+	/* Update accounting */
+	atomic_long_inc(&sbinfo->comp_pages);
+	atomic_long_add(comp_len, &sbinfo->comp_bytes);
+	shmem_comp_update_stats(true, PAGE_SIZE, comp_len);
+
+	folio_unlock(folio);
+	folio_put(folio);
+
 	return 0;
 }
 
