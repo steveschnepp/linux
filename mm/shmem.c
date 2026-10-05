@@ -577,6 +577,12 @@ static int shmem_confirm_swap(struct address_space *mapping, pgoff_t index,
 #define SHMEM_HUGE_DENY		(-1)
 #define SHMEM_HUGE_FORCE	(-2)
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+/* Global defaults for tmpfs compression, overridable via sysfs */
+bool shmem_comp_default_enabled __read_mostly = false;
+char *shmem_comp_default_compressor __read_mostly = NULL;
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 /* ifdef here to avoid bloating shmem.o when not necessary */
 
@@ -595,12 +601,6 @@ static int shmem_confirm_swap(struct address_space *mapping, pgoff_t index,
 static int shmem_huge __read_mostly = SHMEM_HUGE_DEFAULT;
 
 #undef SHMEM_HUGE_DEFAULT
-
-#ifdef CONFIG_TMPFS_COMPRESSION
-/* Global defaults for tmpfs compression */
-bool shmem_comp_default_enabled __read_mostly = false;
-char *shmem_comp_default_compressor __read_mostly = NULL;
-#endif /* CONFIG_TMPFS_COMPRESSION */
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE_TMPFS_HUGE_NEVER)
 #define TMPFS_HUGE_DEFAULT SHMEM_HUGE_NEVER
