@@ -5674,7 +5674,8 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 		const char *algo;
 
 		/* Use mount-specified algorithm or global default */
-		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
+		algo = ctx->comp_compressor ?: shmem_comp_default_compressor ?:
+			CONFIG_TMPFS_COMPRESSOR_DEFAULT;
 
 		/* Validate algorithm and create pool */
 		if (algo && strcmp(algo, "none") != 0) {
@@ -6043,10 +6044,9 @@ static ssize_t compressor_store(struct kobject *kobj,
 	/* Strip newline */
 	algo[strcspn(algo, "\n")] = '\0';
 
-	/* Validate algorithm */
-	if (strcmp(algo, "lz4") && strcmp(algo, "lzo") &&
-	    strcmp(algo, "lzo-rle") && strcmp(algo, "none")) {
-		pr_warn("tmpfs: unsupported compressor '%s'\n", algo);
+	/* Validate: "none" disables, anything else must be an acomp algo */
+	if (strcmp(algo, "none") != 0 && !crypto_has_acomp(algo, 0, 0)) {
+		pr_warn("tmpfs: compressor '%s' not available\n", algo);
 		kfree(algo);
 		return -EINVAL;
 	}
