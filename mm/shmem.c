@@ -35,6 +35,9 @@
 #include <linux/export.h>
 #include <linux/shmem_fs.h>
 #include <linux/swap.h>
+#ifdef CONFIG_TMPFS_COMPRESSION
+#include <linux/shmem_compress.h>
+#endif
 #include <linux/uio.h>
 #include <linux/hugetlb.h>
 #include <linux/fs_parser.h>
@@ -619,6 +622,12 @@ static int shmem_confirm_swap(struct address_space *mapping, pgoff_t index,
 static int shmem_huge __read_mostly = SHMEM_HUGE_DEFAULT;
 
 #undef SHMEM_HUGE_DEFAULT
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+/* Global defaults for tmpfs compression */
+bool shmem_comp_default_enabled __read_mostly = false;
+char *shmem_comp_default_compressor __read_mostly = NULL;
+#endif /* CONFIG_TMPFS_COMPRESSION */
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE_TMPFS_HUGE_NEVER)
 #define TMPFS_HUGE_DEFAULT SHMEM_HUGE_NEVER
@@ -5336,6 +5345,12 @@ static void shmem_free_fc(struct fs_context *fc)
 
 	if (ctx) {
 		mpol_put(ctx->mpol);
+#ifdef CONFIG_TMPFS_COMPRESSION
+		kfree(ctx->comp_compressor);
+#endif
+#ifdef CONFIG_TMPFS_COMPRESSION
+		kfree(ctx->comp_compressor);
+#endif
 		kfree(ctx);
 	}
 }
@@ -5586,6 +5601,125 @@ static ssize_t casefold_show(struct kobject *kobj, struct kobj_attribute *a,
 TMPFS_ATTR_RO(casefold, casefold_show);
 #endif
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Sysfs attributes for transparent compression.
+ *
+ * These provide runtime visibility into compression status and statistics.
+ */
+
+static ssize_t compression_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	/* Show global compression default status */
+	extern bool shmem_comp_default_enabled;
+	return sysfs_emit(buf, "%d\n", shmem_comp_default_enabled);
+}
+
+static ssize_t compression_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	extern bool shmem_comp_default_enabled;
+	int ret;
+	bool enabled;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	shmem_comp_default_enabled = enabled;
+	pr_info("tmpfs: default compression %s\n",
+		enabled ? "enabled" : "disabled");
+	return count;
+}
+static struct kobj_attribute compression_attr = __ATTR(compression, 0644,
+					compression_show, compression_store);
+
+static ssize_t compressor_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	extern char *shmem_comp_default_compressor;
+	return sysfs_emit(buf, "%s\n",
+		shmem_comp_default_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT);
+}
+
+static ssize_t compressor_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	extern char *shmem_comp_default_compressor;
+	char *algo;
+	int ret;
+
+	algo = kstrdup(buf, GFP_KERNEL);
+	if (!algo)
+		return -ENOMEM;
+
+	/* Strip newline */
+	algo[strcspn(algo, "\n")] = '\0';
+
+	/* Validate algorithm */
+	if (strcmp(algo, "lz4") && strcmp(algo, "lzo") &&
+	    strcmp(algo, "lzo-rle") && strcmp(algo, "none")) {
+		pr_warn("tmpfs: unsupported compressor '%s'\n", algo);
+		kfree(algo);
+		return -EINVAL;
+	}
+
+	/* Free old value */
+	kfree(shmem_comp_default_compressor);
+	shmem_comp_default_compressor = algo;
+
+	pr_info("tmpfs: default compressor set to %s\n", algo);
+	return count;
+}
+static struct kobj_attribute compressor_attr = __ATTR(compressor, 0644,
+					compressor_show, compressor_store);
+
+static ssize_t comp_stats_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	struct shmem_comp_stats stats;
+
+	shmem_comp_get_stats(&stats);
+
+	return sysfs_emit(buf,
+		"compressed_pages: %lu\n"
+		"uncompressed_pages: %lu\n"
+		"total_compressed_bytes: %lu\n"
+		"total_uncompressed_bytes: %lu\n"
+		"ratio: %lu.%02lu%%\n"
+		"compress_fails: %lu\n"
+		"decompress_fails: %lu\n"
+		"avg_compress_time_ns: %lu\n"
+		"avg_decompress_time_ns: %lu\n",
+		stats.compressed_pages,
+		stats.uncompressed_pages,
+		stats.total_compressed_bytes,
+		stats.total_uncompressed_bytes,
+		stats.ratio / 100,
+		stats.ratio % 100,
+		stats.compress_fails,
+		stats.decompress_fails,
+		stats.avg_compress_time_ns,
+		stats.avg_decompress_time_ns);
+}
+static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
+
+static struct attribute *tmpfs_comp_attrs[] = {
+	&compression_attr.attr,
+	&compressor_attr.attr,
+	&comp_stats_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group tmpfs_comp_attribute_group = {
+	.attrs = tmpfs_comp_attrs,
+	.name = "compression",
+};
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 static struct attribute *tmpfs_attributes[] = {
 #if IS_ENABLED(CONFIG_UNICODE)
 	&tmpfs_attr_casefold.attr,
@@ -5609,8 +5743,24 @@ static int __init tmpfs_sysfs_init(void)
 		return -ENOMEM;
 
 	ret = sysfs_create_group(tmpfs_kobj, &tmpfs_attribute_group);
-	if (ret)
+	if (ret) {
 		kobject_put(tmpfs_kobj);
+		return ret;
+	}
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	ret = sysfs_create_group(tmpfs_kobj, &tmpfs_comp_attribute_group);
+	if (ret)
+		pr_warn("tmpfs: failed to create compression sysfs group\n");
+#endif
+
+	return ret;
+}
+#ifdef CONFIG_TMPFS_COMPRESSION
+	ret = sysfs_create_group(tmpfs_kobj, &tmpfs_comp_attribute_group);
+	if (ret)
+		pr_warn("tmpfs: failed to create compression sysfs group\n");
+#endif
 
 	return ret;
 }
