@@ -124,6 +124,13 @@ struct shmem_options {
 	bool noswap;
 	unsigned short quota_types;
 	struct shmem_quota_limits qlimits;
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Transparent compression options */
+	bool comp_enabled;           /* Compression explicitly enabled/disabled */
+	bool comp_compress;          /* true=compress, false=nocompress */
+	char *comp_compressor;       /* Algorithm name (NULL = default) */
+	unsigned int comp_threshold; /* Min file size to compress */
+#endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
 	bool strict_encoding;
@@ -4574,6 +4581,12 @@ enum shmem_param {
 	Opt_usrquota_inode_hardlimit,
 	Opt_grpquota_block_hardlimit,
 	Opt_grpquota_inode_hardlimit,
+#ifdef CONFIG_TMPFS_COMPRESSION
+	Opt_compress,
+	Opt_nocompress,
+	Opt_compress_algo,
+	Opt_compress_threshold,
+#endif
 	Opt_casefold_version,
 	Opt_casefold,
 	Opt_strict_encoding,
@@ -4607,6 +4620,12 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_string("usrquota_inode_hardlimit", Opt_usrquota_inode_hardlimit),
 	fsparam_string("grpquota_block_hardlimit", Opt_grpquota_block_hardlimit),
 	fsparam_string("grpquota_inode_hardlimit", Opt_grpquota_inode_hardlimit),
+#endif
+#ifdef CONFIG_TMPFS_COMPRESSION
+	fsparam_flag  ("compress", Opt_compress),
+	fsparam_flag  ("nocompress", Opt_nocompress),
+	fsparam_string("compress", Opt_compress_algo),
+	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -4813,6 +4832,24 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 				       "Group quota inode hardlimit too large.");
 		ctx->qlimits.grpquota_ihardlimit = size;
 		break;
+#ifdef CONFIG_TMPFS_COMPRESSION
+	case Opt_compress:
+		ctx->comp_enabled = true;
+		ctx->comp_compress = true;
+		break;
+	case Opt_nocompress:
+		ctx->comp_enabled = true;
+		ctx->comp_compress = false;
+		break;
+	case Opt_compress_algo:
+		kfree(ctx->comp_compressor);
+		ctx->comp_compressor = param->string;
+		param->string = NULL;
+		break;
+	case Opt_compress_threshold:
+		ctx->comp_threshold = result.uint_32;
+		break;
+#endif
 	case Opt_casefold_version:
 		return shmem_parse_opt_casefold(fc, param, false);
 	case Opt_casefold:
