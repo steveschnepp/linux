@@ -2249,6 +2249,104 @@ unlock:
 }
 
 /*
+ * Transparent compression support for tmpfs.
+ *
+ * Compressed pages are stored in the page cache xarray using the
+ * SWP_SHMEM_COMPRESS entry type. When a page is accessed, it is
+ * transparently decompressed back into a regular folio.
+ */
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+
+/**
+ * shmem_decompress_folio - Decompress a page from compression pool
+ * @inode: shmem inode
+ * @index: Page index in file
+ * @comp_entry: Compressed entry from page cache
+ * @sgp: Page allocation type
+ * @gfp: Allocation flags
+ * @foliop: Output folio pointer
+ *
+ * Return: 0 on success, negative errno on failure
+ *
+ * Decompresses a page from the compression pool and returns it as a
+ * regular folio. The compressed entry is removed from the page cache
+ * and replaced with the decompressed folio.
+ *
+ * This is called when a compressed page is accessed via read, mmap,
+ * or any other path that needs the page content.
+ */
+static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
+				   swp_entry_t comp_entry,
+				   enum sgp_type sgp, gfp_t gfp,
+				   struct folio **foliop)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *folio;
+	unsigned long handle;
+	unsigned int comp_len;
+	void *dst;
+	int ret;
+
+	*foliop = NULL;
+
+	if (!sbinfo->comp_pool)
+		return -ENOENT;
+
+	/* Extract handle and length from swap entry */
+	handle = shmem_comp_entry_handle(comp_entry);
+	comp_len = shmem_comp_entry_length(comp_entry);
+
+	/* Allocate a new folio for the decompressed page */
+	folio = shmem_alloc_and_add_folio(NULL, gfp, inode, index,
+					   current->mm, 0);
+	if (IS_ERR(folio))
+		return PTR_ERR(folio);
+
+	folio_lock(folio);
+
+	/* Verify folio is still in the page cache */
+	if (folio->mapping != mapping) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return -EEXIST;
+	}
+
+	/* Load compressed data from zsmalloc pool and decompress */
+	dst = kmap_local_folio(folio, 0);
+	ret = shmem_comp_decompress(sbinfo->comp_pool,
+				    /* src needs to be loaded first */,
+				    comp_len, dst);
+	kunmap_local(dst);
+
+	if (ret) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return ret;
+	}
+
+	/* Mark folio as uptodate */
+	folio_mark_uptodate(folio);
+
+	/* Remove compressed entry from page cache */
+	shmem_delete_from_page_cache(folio, comp_entry);
+
+	/* Free compressed data from pool */
+	shmem_comp_free(sbinfo->comp_pool, handle);
+
+	/* Update accounting */
+	atomic_long_dec(&sbinfo->comp_pages);
+	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
+	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
+
+	*foliop = folio;
+	return 0;
+}
+
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
+/*
  * Swap in the folio pointed to by *foliop.
  * Caller has to make sure that *foliop contains a valid swapped folio.
  * Returns 0 and the folio in foliop if success. On failure, returns the
@@ -2461,6 +2559,22 @@ repeat:
 	}
 
 	if (xa_is_value(folio)) {
+#ifdef CONFIG_TMPFS_COMPRESSION
+		/* Check if this is a compressed page entry */
+		if (xa_is_shmem_comp(folio)) {
+			swp_entry_t comp_entry;
+
+			comp_entry = radix_to_swp_entry(folio);
+			error = shmem_decompress_folio(inode, index,
+							comp_entry, sgp, gfp,
+							&folio);
+			if (error == -EEXIST)
+				goto repeat;
+
+			*foliop = folio;
+			return error;
+		}
+#endif
 		error = shmem_swapin_folio(inode, index, &folio,
 					   sgp, gfp, vmf, fault_type);
 		if (error == -EEXIST)
