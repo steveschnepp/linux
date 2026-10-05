@@ -99,6 +99,7 @@ struct shmem_sb_info {
 	struct shmem_comp_pool *comp_pool; /* Compression pool */
 	atomic_long_t comp_pages;    /* Number of compressed pages */
 	atomic_long_t comp_bytes;    /* Total compressed bytes stored */
+	unsigned int comp_merge;     /* pages per compression group */
 #endif
 };
 

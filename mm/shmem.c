@@ -133,6 +133,7 @@ struct shmem_options {
 	bool comp_compress;          /* true=compress, false=nocompress */
 	char *comp_compressor;       /* Algorithm name (NULL = default) */
 	unsigned int comp_threshold; /* Min file size to compress */
+	unsigned int comp_merge;     /* pages per compression group */
 #endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
@@ -581,6 +582,7 @@ static int shmem_confirm_swap(struct address_space *mapping, pgoff_t index,
 /* Global defaults for tmpfs compression, overridable via sysfs */
 bool shmem_comp_default_enabled __read_mostly = false;
 char *shmem_comp_default_compressor __read_mostly = NULL;
+unsigned int shmem_comp_default_merge __read_mostly = 1;
 #endif /* CONFIG_TMPFS_COMPRESSION */
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -2276,6 +2278,256 @@ unlock:
 
 static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 				struct folio *folio);
+static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
+						  pgoff_t pgoff);
+static int shmem_decompress_group(struct inode *inode, pgoff_t index,
+				   unsigned int id, unsigned long handle,
+				   unsigned int comp_len,
+				   unsigned short nr_pages,
+				   gfp_t gfp, struct folio **foliop);
+static int shmem_compress_group(struct inode *inode, pgoff_t last);
+
+/*
+ * Fetch an existing folio without allocating: used by group
+ * compression to gather the sibling pages of a merge group. The
+ * shmem_get_folio_noalloc() helper is only compiled with
+ * CONFIG_USERFAULTFD, so keep a local wrapper that works
+ * unconditionally.
+ */
+static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
+						  pgoff_t pgoff)
+{
+	struct folio *folio;
+	int err;
+
+	err = shmem_get_folio(inode, pgoff, 0, &folio, SGP_NOALLOC);
+	if (err)
+		return ERR_PTR(err);
+
+	return folio;
+}
+
+/*
+ * Decompress a merged group (merge_pages > 1) and install one folio
+ * per slice. The ID entry is replicated in every slot of the group;
+ * each successfully installed slice releases one reference, and the
+ * entry plus its zsmalloc block are freed with the last release.
+ *
+ * The folio covering @index is returned locked (shmem_get_folio()
+ * contract); sibling slices remain cached, so sequential reads of a
+ * group cost a single decompression.
+ *
+ * Per-slot races (concurrent reader, truncation) are resolved by
+ * shmem_add_to_page_cache(): it only installs a folio if the slot
+ * still holds the replicated ID, otherwise -EEXIST is returned and
+ * the caller retries.
+ */
+static int shmem_decompress_group(struct inode *inode, pgoff_t index,
+				   unsigned int id, unsigned long handle,
+				   unsigned int comp_len,
+				   unsigned short nr_pages,
+				   gfp_t gfp, struct folio **foliop)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	pgoff_t head = index - (index % nr_pages);
+	void *cbuf, *dbuf, *dst;
+	unsigned int dlen;
+	unsigned short slice;
+	int ret = 0;
+
+	*foliop = NULL;
+
+	/*
+	 * Merged blocks live in a kmalloc buffer owned by the entry
+	 * (zsmalloc caps objects at PAGE_SIZE). The buffer is freed
+	 * when the last slot releases the entry.
+	 */
+	{
+		struct shmem_comp_entry *ent2;
+
+		ent2 = shmem_comp_entry_get(id);
+		if (!ent2 || !ent2->data)
+			return -ENOENT;
+		cbuf = ent2->data;
+	}
+
+	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, gfp);
+	if (!dbuf) {
+		kfree(cbuf);
+		return -ENOMEM;
+	}
+
+	dlen = (unsigned int)nr_pages * PAGE_SIZE;
+	ret = shmem_comp_decompress(sbinfo->comp_pool, cbuf, comp_len,
+				    dbuf, &dlen);
+	if (ret) {
+		kfree(dbuf);
+		return ret;
+	}
+
+	for (slice = 0; slice < nr_pages; slice++) {
+		pgoff_t sidx = head + slice;
+		struct folio *sib;
+
+		sib = filemap_alloc_folio(gfp, 0, NULL);
+		if (!sib) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		dst = kmap_local_folio(sib, 0);
+		memcpy(dst, dbuf + (size_t)slice * PAGE_SIZE, PAGE_SIZE);
+		kunmap_local(dst);
+		folio_mark_uptodate(sib);
+		folio_lock(sib);
+
+		ret = shmem_add_to_page_cache(sib, mapping, sidx,
+					       swp_to_radix_entry(
+						       make_shmem_comp_entry(id)),
+					       gfp);
+		if (ret) {
+			folio_unlock(sib);
+			folio_put(sib);
+			if (sidx == index) {
+				/* requested slice lost the race: retry */
+				kfree(dbuf);
+				return ret;
+			}
+			continue;
+		}
+
+		if (shmem_comp_entry_release(id))
+			shmem_comp_free(sbinfo->comp_pool, handle);
+
+		if (sidx == index) {
+			folio_set_referenced(sib);
+			*foliop = sib;	/* locked, ref for caller */
+		} else {
+			folio_unlock(sib);
+			folio_put(sib);
+		}
+		ret = 0;
+	}
+
+	/* One group decompressed: update accounting once */
+	atomic_long_dec(&sbinfo->comp_pages);
+	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
+	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
+				comp_len);
+
+	kfree(dbuf);
+	return *foliop ? 0 : ret;
+}
+
+/*
+ * Compress a completed merge group: @last is the index of the final
+ * page of the group, so head = last + 1 - comp_merge. All pages are
+ * copied into one buffer and compressed as a single block; the entry
+ * ID is then replicated into every slot of the group.
+ *
+ * Folios stay locked across the compression to keep the group stable;
+ * the inode i_rwsem (held by the write path) already excludes
+ * truncation of this inode.
+ */
+static int shmem_compress_group(struct inode *inode, pgoff_t last)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	unsigned int nr = sbinfo->comp_merge;
+	pgoff_t head = last + 1 - nr;
+	struct folio *folios[64] = { NULL };
+	struct folio *folio;
+	void *kbuf, *cbuf = NULL, *src;
+	unsigned int comp_len;
+	unsigned int id;
+	unsigned int i;
+	int ret = 0;
+
+	if (nr < 2 || nr > 64)
+		return -EINVAL;
+
+	kbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	for (i = 0; i < nr; i++) {
+		folio = shmem_comp_get_folio_noalloc(inode, head + i);
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio);
+			goto cleanup;
+		}
+		if (!folio || !folio_test_uptodate(folio)) {
+			if (folio) {
+				folio_unlock(folio);
+				folio_put(folio);
+			}
+			ret = -EIO;
+			goto cleanup;
+		}
+		src = kmap_local_folio(folio, 0);
+		memcpy(kbuf + (size_t)i * PAGE_SIZE, src, PAGE_SIZE);
+		kunmap_local(src);
+		folios[i] = folio;	/* stays locked until swap-out */
+	}
+
+	cbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
+	if (!cbuf) {
+		ret = -ENOMEM;
+		goto cleanup;
+	}
+
+	/* One crypto call covers the whole group */
+	comp_len = (unsigned int)nr * PAGE_SIZE;
+	ret = shmem_comp_compress(sbinfo->comp_pool, kbuf,
+				  (unsigned int)nr * PAGE_SIZE,
+				  cbuf, &comp_len);
+	if (ret || comp_len >= nr * PAGE_SIZE) {
+		/* incompressible group: keep pages uncompressed */
+		ret = 0;
+		goto cleanup;
+	}
+
+	/*
+	 * zsmalloc caps objects at PAGE_SIZE, so a merged block that
+	 * may exceed that lives in the kmalloc buffer itself; entry
+	 * ownership transfers here and the buffer is freed when the
+	 * last slot releases the entry.
+	 */
+	id = shmem_comp_entry_alloc(0, comp_len, nr, cbuf);
+	if (!id) {
+		ret = 0;
+		goto cleanup;	/* cbuf freed below */
+	}
+	cbuf = NULL;	/* owned by the entry now */
+
+	/* Swap every folio of the group for the replicated ID entry */
+	for (i = 0; i < nr; i++) {
+		shmem_delete_from_page_cache(folios[i],
+			swp_to_radix_entry(make_shmem_comp_entry(id)));
+		folio_unlock(folios[i]);
+		folio_put(folios[i]);
+	}
+
+	atomic_long_add(nr, &sbinfo->comp_pages);
+	atomic_long_add(comp_len, &sbinfo->comp_bytes);
+	shmem_comp_update_stats(true, (unsigned int)nr * PAGE_SIZE,
+				comp_len);
+
+	kfree(cbuf);
+	kfree(kbuf);
+	return 0;
+
+cleanup:
+	for (i = 0; i < nr; i++) {
+		if (folios[i]) {
+			folio_unlock(folios[i]);
+			folio_put(folios[i]);
+		}
+	}
+	kfree(cbuf);
+	kfree(kbuf);
+	return ret;
+}
 
 /**
  * shmem_decompress_folio - Decompress a page from the compression pool
@@ -2308,6 +2560,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	unsigned long handle;
 	unsigned int comp_len;
 	unsigned int id;
+	unsigned int dlen;
 	void *src, *dst;
 	int ret;
 
@@ -2323,6 +2576,16 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return -ENOENT;
 	handle = ent->handle;
 	comp_len = ent->length;
+
+	/*
+	 * Merged group (merge_pages > 1): the ID is replicated in all
+	 * nr_pages slots of the group. Decompress the whole block and
+	 * install one folio per slice; the requested slice is returned.
+	 */
+	if (ent->nr_pages > 1)
+		return shmem_decompress_group(inode, index, id, handle,
+					       comp_len, ent->nr_pages,
+					       gfp, foliop);
 
 	/* Read the compressed bytes out of the pool first */
 	src = kmalloc(comp_len, gfp);
@@ -2345,7 +2608,9 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 
 	/* Decompress into the folio */
 	dst = kmap_local_folio(folio, 0);
-	ret = shmem_comp_decompress(sbinfo->comp_pool, src, comp_len, dst);
+	dlen = PAGE_SIZE;
+	ret = shmem_comp_decompress(sbinfo->comp_pool, src, comp_len,
+				    dst, &dlen);
 	kunmap_local(dst);
 	kfree(src);
 
@@ -2369,9 +2634,9 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return ret;
 	}
 
-	/* The data now lives in the folio: free the compressed copy */
-	shmem_comp_free(sbinfo->comp_pool, handle);
-	shmem_comp_entry_put(id);
+	/* Last slot referencing the entry frees the compressed copy */
+	if (shmem_comp_entry_release(id))
+		shmem_comp_free(sbinfo->comp_pool, handle);
 
 	/* Update accounting */
 	atomic_long_dec(&sbinfo->comp_pages);
@@ -2417,6 +2682,17 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	if (!sbinfo->comp_pool || !sbinfo->comp_enabled)
 		return -ENOTSUPP;
 
+	/*
+	 * merge_pages > 1: compress only when a full group has just
+	 * been written (index is the last page of the group). Tail
+	 * pages that do not fill a group remain uncompressed.
+	 */
+	if (sbinfo->comp_merge > 1) {
+		if ((index + 1) % sbinfo->comp_merge == 0)
+			return shmem_compress_group(inode, index);
+		return 0;
+	}
+
 	/* Lock folio to ensure stability during compression */
 	folio_lock(folio);
 
@@ -2439,7 +2715,8 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 
 	/* Compress the page */
 	comp_len = PAGE_SIZE;
-	ret = shmem_comp_compress(sbinfo->comp_pool, src, comp_buf, &comp_len);
+	ret = shmem_comp_compress(sbinfo->comp_pool, src, PAGE_SIZE,
+				 comp_buf, &comp_len);
 	kunmap_local(src);
 
 	if (ret || comp_len >= PAGE_SIZE) {
@@ -2463,7 +2740,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * zsmalloc handle is a kernel pointer and cannot be packed
 	 * into the xarray value, so the page cache stores only the ID.
 	 */
-	id = shmem_comp_entry_alloc(handle, comp_len);
+	id = shmem_comp_entry_alloc(handle, comp_len, 1, NULL);
 	if (!id) {
 		shmem_comp_free(sbinfo->comp_pool, handle);
 		folio_unlock(folio);
@@ -4745,6 +5022,7 @@ enum shmem_param {
 	Opt_nocompress,
 	Opt_compress_algo,
 	Opt_compress_threshold,
+	Opt_compress_merge,
 #endif
 	Opt_casefold_version,
 	Opt_casefold,
@@ -4785,6 +5063,7 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_string("compress", Opt_compress_algo),
 	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
+	fsparam_u32   ("compress_merge", Opt_compress_merge),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -5007,6 +5286,11 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_compress_threshold:
 		ctx->comp_threshold = result.uint_32;
+		break;
+	case Opt_compress_merge:
+		if (result.uint_32 < 1 || result.uint_32 > 64)
+			goto bad_value;
+		ctx->comp_merge = result.uint_32;
 		break;
 #endif
 	case Opt_casefold_version:
@@ -5403,6 +5687,11 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 				sbinfo->comp_enabled = ctx->comp_compress;
 				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
 				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
+			sbinfo->comp_merge = ctx->comp_merge ?:
+					     (shmem_comp_default_merge ?: 1);
+			pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%lu\n",
+				sbinfo->comp_compressor, sbinfo->comp_merge,
+				sbinfo->comp_threshold);
 				atomic_long_set(&sbinfo->comp_pages, 0);
 				atomic_long_set(&sbinfo->comp_bytes, 0);
 				pr_info("tmpfs: compression enabled with %s\n", algo);
@@ -5800,11 +6089,38 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		stats.avg_compress_time_ns,
 		stats.avg_decompress_time_ns);
 }
+static ssize_t merge_pages_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", shmem_comp_default_merge);
+}
+
+static ssize_t merge_pages_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned int v;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &v);
+	if (ret)
+		return ret;
+	if (v < 1 || v > 64)
+		return -EINVAL;
+
+	shmem_comp_default_merge = v;
+	pr_info("tmpfs: default merge_pages set to %u\n", v);
+	return count;
+}
+static struct kobj_attribute merge_pages_attr = __ATTR(merge_pages, 0644,
+					merge_pages_show, merge_pages_store);
+
 static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
 
 static struct attribute *tmpfs_comp_attrs[] = {
 	&compression_attr.attr,
 	&compressor_attr.attr,
+	&merge_pages_attr.attr,
 	&comp_stats_attr.attr,
 	NULL,
 };

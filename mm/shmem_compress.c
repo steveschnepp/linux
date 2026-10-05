@@ -406,8 +406,8 @@ EXPORT_SYMBOL_GPL(shmem_comp_type_check);
  * use in process context on the local CPU).
  */
 int shmem_comp_compress(struct shmem_comp_pool *pool,
-			const void *src, void *dst,
-			unsigned int *dst_len)
+			const void *src, unsigned int slen,
+			void *dst, unsigned int *dst_len)
 {
 	struct shmem_comp_pcpu *pcpu;
 	struct scatterlist input, output;
@@ -416,7 +416,7 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 	s64 duration;
 	int ret;
 
-	if (!pool || !src || !dst || !dst_len)
+	if (!pool || !src || !dst || !dst_len || slen == 0)
 		return -EINVAL;
 
 	pcpu = this_cpu_ptr(pool->pcpu);
@@ -427,12 +427,12 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 	start = ktime_get();
 
 	/* Setup scatterlists for crypto operation */
-	sg_init_one(&input, src, PAGE_SIZE);
+	sg_init_one(&input, src, slen);
 	sg_init_one(&output, dst, dlen);
 
 	/* Configure compression request */
 	acomp_request_set_params(pcpu->req, &input, &output,
-				 PAGE_SIZE, dlen);
+				 slen, dlen);
 
 	/* Execute compression (synchronous wait for async op) */
 	ret = crypto_wait_req(crypto_acomp_compress(pcpu->req),
@@ -446,7 +446,7 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 		*dst_len = dlen;
 
 		/* Check if compression actually reduced size */
-		if (dlen >= PAGE_SIZE) {
+		if (dlen >= slen) {
 			ret = -ENOSPC;
 		} else {
 			/* Update statistics */
@@ -483,31 +483,33 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
  * Must be called from the CPU that owns the per-CPU context.
  */
 int shmem_comp_decompress(struct shmem_comp_pool *pool,
-			  const void *src, unsigned int src_len,
-			  void *dst)
+			  const void *src, unsigned int slen,
+			  void *dst, unsigned int *dst_len)
 {
 	struct shmem_comp_pcpu *pcpu;
 	struct scatterlist input, output;
+	unsigned int dlen;
 	ktime_t start, end;
 	s64 duration;
 	int ret;
 
-	if (!pool || !src || !dst || src_len == 0)
+	if (!pool || !src || !dst || !dst_len || slen == 0)
 		return -EINVAL;
 
 	pcpu = this_cpu_ptr(pool->pcpu);
+	dlen = *dst_len;
 
 	mutex_lock(&pcpu->lock);
 
 	start = ktime_get();
 
 	/* Setup scatterlists for crypto operation */
-	sg_init_one(&input, src, src_len);
-	sg_init_one(&output, dst, PAGE_SIZE);
+	sg_init_one(&input, src, slen);
+	sg_init_one(&output, dst, dlen);
 
 	/* Configure decompression request */
 	acomp_request_set_params(pcpu->req, &input, &output,
-				 src_len, PAGE_SIZE);
+				 slen, dlen);
 
 	/* Execute decompression */
 	ret = crypto_wait_req(crypto_acomp_decompress(pcpu->req),
@@ -517,6 +519,7 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 	duration = ktime_to_ns(ktime_sub(end, start));
 
 	if (!ret) {
+		*dst_len = pcpu->req->dlen;
 		/* Update statistics */
 		spin_lock(&shmem_comp_stats_lock);
 		shmem_comp_global_stats.avg_decompress_time_ns =
@@ -648,7 +651,8 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 /* XA_FLAGS_ALLOC reserves index 0: the page cache uses 0 for "empty" */
 static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 
-unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length)
+unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
+				    unsigned short nr_pages, void *data)
 {
 	struct shmem_comp_entry *ent;
 	unsigned int id;
@@ -660,7 +664,9 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length)
 
 	ent->handle = handle;
 	ent->length = length;
-	ent->referenced = true;
+	ent->nr_pages = nr_pages;
+	ent->data = data;
+	atomic_set(&ent->refs, nr_pages);
 
 	/*
 	 * xa_alloc() takes the xarray lock internally. Wrapping it in
@@ -690,15 +696,27 @@ struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id)
 	return ent;
 }
 
-void shmem_comp_entry_put(unsigned int id)
+bool shmem_comp_entry_release(unsigned int id)
 {
 	struct shmem_comp_entry *ent;
 
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent || !atomic_dec_and_test(&ent->refs)) {
+		rcu_read_unlock();
+		return false;
+	}
+	rcu_read_unlock();
+
+	/* Last reference: erase the ID and free the entry */
 	/* xa_erase() takes the xarray lock internally */
 	ent = xa_erase(&shmem_comp_entries, id);
-
-	if (ent)
+	if (ent) {
+		kfree(ent->data);	/* merged group block, if any */
 		kfree_rcu(ent, rcu);
+	}
+
+	return true;
 }
 
 /*

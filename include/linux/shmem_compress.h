@@ -52,8 +52,12 @@
  * struct shmem_comp_entry - Compressed page metadata
  * @handle: zsmalloc allocation handle for compressed data (a kernel
  *          pointer, must not be packed into the xarray value)
- * @length: Compressed size in bytes (max 4095)
- * @referenced: Whether entry was recently accessed (for LRU eviction)
+ * @length: Compressed size in bytes
+ * @nr_pages: number of consecutive pages merged into this block
+ *            (1 = single page, >1 = merge_pages group)
+ * @refs: number of page cache slots referencing this entry; for a
+ *        merged group the ID is replicated in each slot, one ref per
+ *        slot. The entry is released when refs drops to zero.
  * @rcu: for kfree_rcu() after removal from the ID table
  *
  * Registered in a global ID table; the page cache xarray only stores
@@ -62,7 +66,12 @@
 struct shmem_comp_entry {
 	unsigned long handle;		/* zsmalloc handle */
 	unsigned int length;		/* compressed size in bytes */
-	bool referenced;		/* for LRU eviction tracking */
+	unsigned short nr_pages;	/* pages merged into this block */
+	atomic_t refs;			/* xarray slots referencing us */
+	void *data;			/* kmalloc'd block for merged groups:
+					 * zsmalloc caps objects at PAGE_SIZE, so
+					 * blocks larger than that live here;
+					 * freed when the last slot releases */
 	struct rcu_head rcu;
 };
 
@@ -93,49 +102,13 @@ struct shmem_comp_stats {
 };
 
 /*
- * Compressed entry encoding/decoding functions.
+ * Compressed entry xarray representation.
  *
- * These pack/unpack shmem_comp_entry into xa_value format for storage
- * in the page cache xarray. Similar to swp_to_radix_entry()/radix_to_swp_entry()
- * but for compression entries instead of swap entries.
+ * The page cache xarray stores only a small entry ID, encoded via
+ * make_shmem_comp_entry()/shmem_comp_entry_id() in <linux/swapops.h>.
+ * The zsmalloc handle lives in the ID table (struct shmem_comp_entry)
+ * because handles are kernel pointers and do not fit xarray values.
  */
-
-/**
- * shmem_comp_to_radix_entry - Encode compressed entry as xarray value
- * @entry: Compressed entry to encode
- *
- * Return: xa_value suitable for storing in page cache xarray
- *
- * Packs the zsmalloc handle and compressed length into an xa_value.
- * The handle is shifted left by 12 bits, with length in the lower bits.
- */
-static inline void *shmem_comp_to_radix_entry(const struct shmem_comp_entry *entry)
-{
-	unsigned long val;
-
-	val = (entry->handle << 12) | (entry->length & 0xFFF);
-	return xa_mk_value(val);
-}
-
-/**
- * shmem_radix_to_comp_entry - Decode xarray value to compressed entry
- * @arg: xa_value from page cache xarray
- *
- * Return: Decoded shmem_comp_entry structure
- *
- * Unpacks an xa_value into a shmem_comp_entry. The referenced flag is
- * set to true by default; callers should clear it if needed.
- */
-static inline struct shmem_comp_entry shmem_radix_to_comp_entry(void *arg)
-{
-	unsigned long val = xa_to_value(arg);
-	struct shmem_comp_entry entry;
-
-	entry.handle = val >> 12;
-	entry.length = val & 0xFFF;
-	entry.referenced = true;	/* default to referenced */
-	return entry;
-}
 
 /*
  * XArray entry type checking functions.
@@ -214,40 +187,38 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo);
 void shmem_comp_pool_destroy(struct shmem_comp_pool *pool);
 
 /**
- * shmem_comp_compress - Compress a page
+ * shmem_comp_compress - Compress a block of memory
  * @pool: Compression pool to use
- * @src: Source data (PAGE_SIZE bytes)
+ * @src: Source data
+ * @slen: Source length in bytes (PAGE_SIZE, or a merge_pages multiple)
  * @dst: Destination buffer for compressed data
- * @dst_len: [in,out] Buffer size on input, compressed size on output
+ * @dst_len: [in,out] buffer capacity on input, compressed size output
  *
- * Return: 0 on success, negative errno on failure
- *
- * Compresses PAGE_SIZE bytes from src to dst using the pool's algorithm.
- * If compression doesn't reduce size, returns -ENOSPC.
+ * Return: 0 on success, -ENOSPC if compression does not reduce size,
+ *         other negative errno on failure
  *
  * Must be called from the CPU that owns the per-CPU context.
  */
 int shmem_comp_compress(struct shmem_comp_pool *pool,
-			const void *src, void *dst,
-			unsigned int *dst_len);
+			const void *src, unsigned int slen,
+			void *dst, unsigned int *dst_len);
 
 /**
- * shmem_comp_decompress - Decompress a page
+ * shmem_comp_decompress - Decompress a block of memory
  * @pool: Compression pool to use
  * @src: Compressed source data
- * @src_len: Compressed data size
- * @dst: Destination buffer (PAGE_SIZE bytes)
+ * @slen: Compressed data size
+ * @dst: Destination buffer
+ * @dst_len: [in,out] buffer capacity input, decompressed size output
  *
  * Return: 0 on success, negative errno on failure
  *
- * Decompresses src_len bytes from src to PAGE_SIZE bytes in dst.
  * This is the hot path - must be as fast as possible.
- *
  * Must be called from the CPU that owns the per-CPU context.
  */
 int shmem_comp_decompress(struct shmem_comp_pool *pool,
-			  const void *src, unsigned int src_len,
-			  void *dst);
+			  const void *src, unsigned int slen,
+			  void *dst, unsigned int *dst_len);
 
 /**
  * shmem_comp_store - Store compressed data in pool
@@ -298,15 +269,20 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
 
 /**
  * shmem_comp_entry_alloc - Register compressed data, get an entry ID
- * @handle: zsmalloc handle from shmem_comp_store()
+ * @handle: zsmalloc handle from shmem_comp_store() (0 for merged groups)
  * @length: compressed data length in bytes
+ * @nr_pages: pages merged into this block (1 for single pages)
+ * @data: kmalloc'd compressed block for merged groups (owned by the
+ *        entry, freed on the last release); NULL for single pages
  *
  * Return: entry ID (>0) on success, 0 on allocation failure
  *
- * The ID is stored in the page cache xarray via make_shmem_comp_entry().
- * Release with shmem_comp_entry_put() once decompression is done.
+ * The ID is stored once per page cache slot of the group via
+ * make_shmem_comp_entry(); refs is initialised to @nr_pages.
+ * Release each slot with shmem_comp_entry_release().
  */
-unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length);
+unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
+				    unsigned short nr_pages, void *data);
 
 /**
  * shmem_comp_entry_get - Look up an entry by ID
@@ -315,18 +291,24 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length);
  * Return: entry pointer under RCU, or NULL if unknown
  *
  * The caller must not dereference the pointer after the current RCU
- * read-side critical section. shmem_comp_entry_put() must be called
- * when the compressed data is released.
+ * read-side critical section. Each page cache slot must be released
+ * with shmem_comp_entry_release() when it no longer references the
+ * entry.
  */
 struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id);
 
 /**
- * shmem_comp_entry_put - Remove an entry from the ID table
+ * shmem_comp_entry_release - Drop one reference to an entry
  * @id: entry ID
  *
- * Erases the ID and frees the entry after an RCU grace period.
+ * Return: true if this was the last reference
+ *
+ * Each page cache slot holding the ID calls this once when the slot
+ * is replaced by a decompressed folio. On the last reference the ID
+ * is erased and the entry freed; the caller must then free the
+ * zsmalloc block via shmem_comp_free().
  */
-void shmem_comp_entry_put(unsigned int id);
+bool shmem_comp_entry_release(unsigned int id);
 
 /*
  * Statistics functions.
