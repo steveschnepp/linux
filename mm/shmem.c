@@ -5897,14 +5897,6 @@ static int __init tmpfs_sysfs_init(void)
 
 	return ret;
 }
-#ifdef CONFIG_TMPFS_COMPRESSION
-	ret = sysfs_create_group(tmpfs_kobj, &tmpfs_comp_attribute_group);
-	if (ret)
-		pr_warn("tmpfs: failed to create compression sysfs group\n");
-#endif
-
-	return ret;
-}
 #endif /* CONFIG_SYSFS && CONFIG_TMPFS */
 
 void __init shmem_init(void)

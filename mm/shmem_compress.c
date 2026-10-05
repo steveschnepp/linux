@@ -568,7 +568,7 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	if (!handle)
 		return 0;
 
-	zs_obj_write(pool->zs_pool, handle, data, len);
+	zs_obj_write(pool->zs_pool, handle, (void *)data, len);
 
 	return handle;
 }
@@ -589,17 +589,25 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 		    unsigned long handle, void *dst,
 		    unsigned int *len)
 {
+	void *src;
 	unsigned int obj_size;
 
-	if (!pool || !dst || !len || handle == 0)
+	if (!pool || !dst || handle == 0)
 		return -EINVAL;
 
-	obj_size = zs_get_object_size(pool->zs_pool, handle);
-	if (obj_size > *len)
-		return -ENOSPC;
+	/* Read data from zsmalloc */
+	src = zs_obj_read_begin(pool->zs_pool, handle, *len, NULL);
+	if (!src)
+		return -EINVAL;
 
-	zs_obj_read(pool->zs_pool, handle, dst, obj_size);
+	/* Get object size - we stored it as the length */
+	obj_size = *len;  /* Length was passed in */
+
+	/* Copy data to destination */
+	memcpy(dst, src, obj_size);
 	*len = obj_size;
+
+	zs_obj_read_end(pool->zs_pool, handle, obj_size, src);
 
 	return 0;
 }
