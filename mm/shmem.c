@@ -342,6 +342,33 @@ static struct dquot __rcu **shmem_get_dquots(struct inode *inode)
 }
 #endif /* CONFIG_TMPFS_QUOTA */
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Initialize compression pool if enabled */
+	if (ctx->comp_enabled) {
+		const char *algo;
+
+		/* Use mount-specified algorithm or global default */
+		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
+
+		/* Validate algorithm and create pool */
+		if (algo && strcmp(algo, "none") != 0) {
+			sbinfo->comp_pool = shmem_comp_pool_create(algo);
+			if (IS_ERR(sbinfo->comp_pool)) {
+				pr_warn("tmpfs: failed to create compression pool, "
+					"running uncompressed\n");
+				sbinfo->comp_pool = NULL;
+			} else {
+				sbinfo->comp_enabled = ctx->comp_compress;
+				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
+				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
+				atomic_long_set(&sbinfo->comp_pages, 0);
+				atomic_long_set(&sbinfo->comp_bytes, 0);
+				pr_info("tmpfs: compression enabled with %s\n", algo);
+			}
+		}
+	}
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 /*
  * shmem_reserve_inode() performs bookkeeping to reserve a shmem inode, and
  * produces a novel ino for the newly allocated inode.
@@ -5090,6 +5117,14 @@ static void shmem_put_super(struct super_block *sb)
 #endif
 	free_percpu(sbinfo->ino_batch);
 	percpu_counter_destroy(&sbinfo->used_blocks);
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Clean up compression pool */
+	if (sbinfo->comp_pool) {
+		shmem_comp_pool_put(sbinfo->comp_pool);
+		sbinfo->comp_pool = NULL;
+	}
+	kfree(sbinfo->comp_compressor);
+#endif /* CONFIG_TMPFS_COMPRESSION */
 	mpol_put(sbinfo->mpol);
 #ifdef CONFIG_TMPFS_XATTR
 	simple_xattr_cache_cleanup(&sbinfo->xa_cache);
@@ -5216,6 +5251,60 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 			goto failed;
 	}
 #endif /* CONFIG_TMPFS_QUOTA */
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Initialize compression pool if enabled */
+	if (ctx->comp_enabled) {
+		const char *algo;
+
+		/* Use mount-specified algorithm or global default */
+		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
+
+		/* Validate algorithm and create pool */
+		if (algo && strcmp(algo, "none") != 0) {
+			sbinfo->comp_pool = shmem_comp_pool_create(algo);
+			if (IS_ERR(sbinfo->comp_pool)) {
+				pr_warn("tmpfs: failed to create compression pool, "
+					"running uncompressed\n");
+				sbinfo->comp_pool = NULL;
+			} else {
+				sbinfo->comp_enabled = ctx->comp_compress;
+				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
+				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
+				atomic_long_set(&sbinfo->comp_pages, 0);
+				atomic_long_set(&sbinfo->comp_bytes, 0);
+				pr_info("tmpfs: compression enabled with %s\n", algo);
+			}
+		}
+	}
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Initialize compression pool if enabled */
+	if (ctx->comp_enabled) {
+		const char *algo;
+
+		/* Use mount-specified algorithm or global default */
+		algo = ctx->comp_compressor ?: CONFIG_TMPFS_COMPRESSOR_DEFAULT;
+
+		/* Validate algorithm and create pool */
+		if (algo && strcmp(algo, "none") != 0) {
+			sbinfo->comp_pool = shmem_comp_pool_create(algo);
+			if (IS_ERR(sbinfo->comp_pool)) {
+				pr_warn("tmpfs: failed to create compression pool, "
+					"running uncompressed\n");
+				sbinfo->comp_pool = NULL;
+			} else {
+				sbinfo->comp_enabled = ctx->comp_compress;
+				sbinfo->comp_compressor = kstrdup(algo, GFP_KERNEL);
+				sbinfo->comp_threshold = ctx->comp_threshold ?: 65536;
+				atomic_long_set(&sbinfo->comp_pages, 0);
+				atomic_long_set(&sbinfo->comp_bytes, 0);
+				pr_info("tmpfs: compression enabled with %s\n", algo);
+			}
+		}
+	}
+#endif /* CONFIG_TMPFS_COMPRESSION */
 
 	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL,
 				S_IFDIR | sbinfo->mode, 0,
