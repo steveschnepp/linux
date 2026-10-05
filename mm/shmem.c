@@ -5086,9 +5086,11 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 #endif
 #ifdef CONFIG_TMPFS_COMPRESSION
 	fsparam_string("compress", Opt_compress_algo),
+	fsparam_string("compressor", Opt_compress_algo), /* sysfs-style alias */
 	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
 	fsparam_u32   ("compress_merge", Opt_compress_merge),
+	fsparam_u32   ("merge_pages", Opt_compress_merge), /* alias */
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -5305,11 +5307,16 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->comp_compress = false;
 		break;
 	case Opt_compress_algo:
-		/* bare "compress" (NULL/empty) enables with default algo */
+		/* compress=/compressor= : bare form enables the default */
 		ctx->comp_enabled = true;
 		ctx->comp_compress = true;
 		if (param->string && param->string[0] &&
 		    strcmp(param->string, "none")) {
+			/* fail the mount early on typos/missing algorithms */
+			if (!crypto_has_acomp(param->string, 0, 0))
+				return invalfc(fc,
+					"tmpfs: compressor '%s' unavailable",
+					param->string);
 			kfree(ctx->comp_compressor);
 			ctx->comp_compressor = param->string;
 			param->string = NULL;
@@ -5705,8 +5712,14 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 		const char *algo;
 
 		/* Use mount-specified algorithm or global default */
-		algo = ctx->comp_compressor ?: shmem_comp_default_compressor ?:
-			CONFIG_TMPFS_COMPRESSOR_DEFAULT;
+		/* use mount algo, else sysfs default, else Kconfig default;
+		 * empty strings and "none" all mean "no compression"
+		 */
+		algo = ctx->comp_compressor;
+		if (!algo || !algo[0])
+			algo = shmem_comp_default_compressor;
+		if (!algo || !algo[0])
+			algo = CONFIG_TMPFS_COMPRESSOR_DEFAULT;
 
 		/* Validate algorithm and create pool */
 		if (algo && strcmp(algo, "none") != 0) {
@@ -6082,9 +6095,11 @@ static ssize_t compressor_store(struct kobject *kobj,
 		return -EINVAL;
 	}
 
-	/* Free old value */
+	/* Free old value; "none" clears the default (new mounts uncompressed) */
 	kfree(shmem_comp_default_compressor);
-	shmem_comp_default_compressor = algo;
+	shmem_comp_default_compressor = strcmp(algo, "none") ? algo : NULL;
+	if (!shmem_comp_default_compressor)
+		kfree(algo);
 
 	pr_info("tmpfs: default compressor set to %s\n", algo);
 	return count;
