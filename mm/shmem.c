@@ -1010,8 +1010,32 @@ static long shmem_free_swap(struct address_space *mapping,
 	}
 	xas_unlock_irq(&xas);
 
-	if (nr_pages)
-		swap_put_entries_direct(radix_to_swp_entry(radswap), nr_pages);
+	if (nr_pages) {
+#ifdef CONFIG_TMPFS_COMPRESSION
+		/*
+		 * Compression entries are not swap entries: release them
+		 * via the entry ID table instead of the swap code (which
+		 * WARNs "Bad swap file entry" and leaks the compressed
+		 * block on truncate/eviction).
+		 */
+		if (is_shmem_comp_entry(radix_to_swp_entry(radswap))) {
+			swp_entry_t se = radix_to_swp_entry(radswap);
+			struct shmem_sb_info *sbinfo =
+				SHMEM_SB(mapping->host->i_sb);
+			struct shmem_comp_entry *ent;
+			unsigned long handle = 0;
+			unsigned int id = shmem_comp_entry_id(se);
+
+			ent = shmem_comp_entry_get(id);
+			if (ent)
+				handle = ent->handle;
+			if (handle && shmem_comp_entry_release(id))
+				shmem_comp_free(sbinfo->comp_pool, handle);
+		} else
+#endif
+			swap_put_entries_direct(radix_to_swp_entry(radswap),
+						nr_pages);
+	}
 
 	return nr_pages;
 }
@@ -2352,7 +2376,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		cbuf = ent2->data;
 	}
 
-	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, gfp);
+	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
 	if (!dbuf) {
 		kfree(cbuf);
 		return -ENOMEM;
@@ -2587,8 +2611,10 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 					       comp_len, ent->nr_pages,
 					       gfp, foliop);
 
-	/* Read the compressed bytes out of the pool first */
-	src = kmalloc(comp_len, gfp);
+	/* Read the compressed bytes out of the pool first.
+	 * GFP_KERNEL: transient slab buffer, must not carry __GFP_HIGHMEM.
+	 */
+	src = kmalloc(comp_len, GFP_KERNEL);
 	if (!src)
 		return -ENOMEM;
 
@@ -5059,9 +5085,8 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_string("grpquota_inode_hardlimit", Opt_grpquota_inode_hardlimit),
 #endif
 #ifdef CONFIG_TMPFS_COMPRESSION
-	fsparam_flag  ("compress", Opt_compress),
-	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_string("compress", Opt_compress_algo),
+	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
 	fsparam_u32   ("compress_merge", Opt_compress_merge),
 #endif
@@ -5280,9 +5305,15 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->comp_compress = false;
 		break;
 	case Opt_compress_algo:
-		kfree(ctx->comp_compressor);
-		ctx->comp_compressor = param->string;
-		param->string = NULL;
+		/* bare "compress" (NULL/empty) enables with default algo */
+		ctx->comp_enabled = true;
+		ctx->comp_compress = true;
+		if (param->string && param->string[0] &&
+		    strcmp(param->string, "none")) {
+			kfree(ctx->comp_compressor);
+			ctx->comp_compressor = param->string;
+			param->string = NULL;
+		}
 		break;
 	case Opt_compress_threshold:
 		ctx->comp_threshold = result.uint_32;
