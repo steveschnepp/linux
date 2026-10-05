@@ -630,6 +630,71 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 }
 
 /*
+ * Compression entry ID table.
+ *
+ * zsmalloc handles are kernel pointers and cannot be packed into the
+ * xarray value stored in the page cache. Compressed data is registered
+ * here and referenced by a small ID from the page cache entry.
+ */
+
+static DEFINE_XARRAY(shmem_comp_entries);
+
+unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int id;
+	int ret;
+
+	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
+	if (!ent)
+		return 0;
+
+	ent->handle = handle;
+	ent->length = length;
+	ent->referenced = true;
+
+	xa_lock(&shmem_comp_entries);
+	ret = xa_alloc(&shmem_comp_entries, &id, ent,
+			xa_limit_32b, GFP_KERNEL | __GFP_NOWARN);
+	/* ID 0 is reserved: the page cache uses 0 to mean "no entry" */
+	if (!ret && id == 0) {
+		xa_store(&shmem_comp_entries, 0, NULL, GFP_KERNEL);
+		ret = -EBUSY;
+	}
+	xa_unlock(&shmem_comp_entries);
+
+	if (ret) {
+		kfree(ent);
+		return 0;
+	}
+
+	return id;
+}
+
+struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	rcu_read_unlock();
+
+	return ent;
+}
+
+void shmem_comp_entry_put(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
+
+	xa_lock(&shmem_comp_entries);
+	ent = xa_erase(&shmem_comp_entries, id);
+	xa_unlock(&shmem_comp_entries);
+
+	if (ent)
+		kfree_rcu(ent, rcu);
+}
+
+/*
  * Statistics functions.
  */
 
@@ -649,9 +714,9 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 
 	*stats = shmem_comp_global_stats;
 
-	/* Calculate compression ratio */
+	/* Calculate compression ratio (percent * 100 for two decimals) */
 	if (stats->total_uncompressed_bytes > 0) {
-		stats->ratio = (stats->total_compressed_bytes * 100) /
+		stats->ratio = (stats->total_compressed_bytes * 10000) /
 			       stats->total_uncompressed_bytes;
 	} else {
 		stats->ratio = 0;
@@ -676,11 +741,14 @@ void shmem_comp_update_stats(bool compressed, unsigned int orig_size,
 
 	if (compressed) {
 		shmem_comp_global_stats.compressed_pages++;
+		shmem_comp_global_stats.uncompressed_pages++;
 		shmem_comp_global_stats.total_compressed_bytes += comp_size;
 		shmem_comp_global_stats.total_uncompressed_bytes += orig_size;
 	} else {
 		if (shmem_comp_global_stats.compressed_pages > 0)
 			shmem_comp_global_stats.compressed_pages--;
+		if (shmem_comp_global_stats.uncompressed_pages > 0)
+			shmem_comp_global_stats.uncompressed_pages--;
 		if (shmem_comp_global_stats.total_compressed_bytes >= comp_size)
 			shmem_comp_global_stats.total_compressed_bytes -= comp_size;
 		if (shmem_comp_global_stats.total_uncompressed_bytes >= orig_size)

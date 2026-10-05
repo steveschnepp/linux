@@ -2303,9 +2303,11 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
+	struct shmem_comp_entry *ent;
 	struct folio *folio;
 	unsigned long handle;
 	unsigned int comp_len;
+	unsigned int id;
 	void *src, *dst;
 	int ret;
 
@@ -2314,9 +2316,13 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (!sbinfo->comp_pool)
 		return -ENOENT;
 
-	/* Extract the zsmalloc handle and compressed length */
-	handle = shmem_comp_entry_handle(comp_entry);
-	comp_len = shmem_comp_entry_length(comp_entry);
+	/* Look up the compressed data via its entry ID */
+	id = shmem_comp_entry_id(comp_entry);
+	ent = shmem_comp_entry_get(id);
+	if (!ent)
+		return -ENOENT;
+	handle = ent->handle;
+	comp_len = ent->length;
 
 	/* Read the compressed bytes out of the pool first */
 	src = kmalloc(comp_len, gfp);
@@ -2365,6 +2371,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 
 	/* The data now lives in the folio: free the compressed copy */
 	shmem_comp_free(sbinfo->comp_pool, handle);
+	shmem_comp_entry_put(id);
 
 	/* Update accounting */
 	atomic_long_dec(&sbinfo->comp_pages);
@@ -2403,6 +2410,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	swp_entry_t comp_entry;
 	void *src, *comp_buf;
 	unsigned int comp_len;
+	unsigned int id;
 	unsigned long handle;
 	int ret;
 
@@ -2450,8 +2458,18 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 		return -ENOMEM;
 	}
 
-	/* Create compression entry */
-	comp_entry = make_shmem_comp_entry(handle, comp_len);
+	/*
+	 * Register the compressed data in the entry ID table. The
+	 * zsmalloc handle is a kernel pointer and cannot be packed
+	 * into the xarray value, so the page cache stores only the ID.
+	 */
+	id = shmem_comp_entry_alloc(handle, comp_len);
+	if (!id) {
+		shmem_comp_free(sbinfo->comp_pool, handle);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+	comp_entry = make_shmem_comp_entry(id);
 
 	/*
 	 * Atomically swap the folio for the compression entry in the

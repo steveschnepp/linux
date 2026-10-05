@@ -49,18 +49,21 @@
 #include <crypto/acompress.h>
 
 /**
- * struct shmem_comp_entry - Compressed page entry stored in xarray
- * @handle: zsmalloc allocation handle for compressed data
+ * struct shmem_comp_entry - Compressed page metadata
+ * @handle: zsmalloc allocation handle for compressed data (a kernel
+ *          pointer, must not be packed into the xarray value)
  * @length: Compressed size in bytes (max 4095)
  * @referenced: Whether entry was recently accessed (for LRU eviction)
+ * @rcu: for kfree_rcu() after removal from the ID table
  *
- * This structure represents a compressed page in the tmpfs page cache.
- * It is encoded into an xa_value for storage in the xarray.
+ * Registered in a global ID table; the page cache xarray only stores
+ * the small ID via make_shmem_comp_entry().
  */
 struct shmem_comp_entry {
 	unsigned long handle;		/* zsmalloc handle */
 	unsigned int length;		/* compressed size in bytes */
 	bool referenced;		/* for LRU eviction tracking */
+	struct rcu_head rcu;
 };
 
 /**
@@ -284,6 +287,46 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
  * The handle must not be used after this call.
  */
 void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
+
+/*
+ * Compression entry ID table.
+ *
+ * The page cache xarray can only store small integer values, but
+ * zsmalloc handles are kernel pointers. Entries are registered here
+ * and referenced by ID from the page cache.
+ */
+
+/**
+ * shmem_comp_entry_alloc - Register compressed data, get an entry ID
+ * @handle: zsmalloc handle from shmem_comp_store()
+ * @length: compressed data length in bytes
+ *
+ * Return: entry ID (>0) on success, 0 on allocation failure
+ *
+ * The ID is stored in the page cache xarray via make_shmem_comp_entry().
+ * Release with shmem_comp_entry_put() once decompression is done.
+ */
+unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length);
+
+/**
+ * shmem_comp_entry_get - Look up an entry by ID
+ * @id: entry ID
+ *
+ * Return: entry pointer under RCU, or NULL if unknown
+ *
+ * The caller must not dereference the pointer after the current RCU
+ * read-side critical section. shmem_comp_entry_put() must be called
+ * when the compressed data is released.
+ */
+struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id);
+
+/**
+ * shmem_comp_entry_put - Remove an entry from the ID table
+ * @id: entry ID
+ *
+ * Erases the ID and frees the entry after an RCU grace period.
+ */
+void shmem_comp_entry_put(unsigned int id);
 
 /*
  * Statistics functions.

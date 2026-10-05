@@ -153,34 +153,30 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
  * bits and length the lower bits of the offset field.
  */
 #ifdef CONFIG_TMPFS_COMPRESSION
-static inline swp_entry_t make_shmem_comp_entry(unsigned long handle,
-						unsigned int length)
+/**
+ * make_shmem_comp_entry - Create a compression xarray entry from an ID
+ * @id: entry ID from shmem_comp_entry_alloc()
+ *
+ * Return: swp_entry_t encoding the compression entry
+ *
+ * Only the small ID is packed into the entry; the zsmalloc handle is a
+ * kernel pointer and cannot be stored in the xarray value bits. The ID
+ * indexes a global xarray mapping ID -> struct shmem_comp_entry.
+ */
+static inline swp_entry_t make_shmem_comp_entry(unsigned int id)
 {
-	/* Pack handle (upper bits) and length (lower 12 bits) */
-	pgoff_t offset = (handle << 12) | (length & 0xFFF);
-	return swp_entry(SWP_SHMEM_COMPRESS, offset);
+	return swp_entry(SWP_SHMEM_COMPRESS, (pgoff_t)id);
 }
 
 /**
- * shmem_comp_entry_handle - Extract zsmalloc handle from entry
+ * shmem_comp_entry_id - Extract entry ID from a compression entry
  * @entry: swp_entry_t from page cache xarray
  *
- * Return: zsmalloc handle
+ * Return: entry ID for shmem_comp_entry_get()
  */
-static inline unsigned long shmem_comp_entry_handle(swp_entry_t entry)
+static inline unsigned int shmem_comp_entry_id(swp_entry_t entry)
 {
-	return swp_offset(entry) >> 12;
-}
-
-/**
- * shmem_comp_entry_length - Extract compressed length from entry
- * @entry: swp_entry_t from page cache xarray
- *
- * Return: Compressed data length in bytes
- */
-static inline unsigned int shmem_comp_entry_length(swp_entry_t entry)
-{
-	return swp_offset(entry) & 0xFFF;
+	return (unsigned int)swp_offset(entry);
 }
 
 /**
