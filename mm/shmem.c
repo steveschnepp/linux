@@ -2459,7 +2459,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	unsigned int nr = sbinfo->comp_merge;
 	pgoff_t head = last + 1 - nr;
-	struct folio *folios[64] = { NULL };
+	struct folio **folios;
 	struct folio *folio;
 	void *kbuf, *cbuf = NULL, *src;
 	unsigned int comp_len;
@@ -2467,12 +2467,22 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	unsigned int i;
 	int ret = 0;
 
-	if (nr < 2 || nr > 64)
+	if (nr < 2 || nr > SHMEM_COMP_MERGE_MAX)
 		return -EINVAL;
 
-	kbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
-	if (!kbuf)
+	/*
+	 * Heap-allocate the folio array: at SHMEM_COMP_MERGE_MAX the
+	 * pointer table alone is 8KiB, far too much for the kernel stack.
+	 */
+	folios = kcalloc(nr, sizeof(*folios), GFP_KERNEL);
+	if (!folios)
 		return -ENOMEM;
+
+	kbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
+	if (!kbuf) {
+		kfree(folios);
+		return -ENOMEM;
+	}
 
 	for (i = 0; i < nr; i++) {
 		folio = shmem_comp_get_folio_noalloc(inode, head + i);
@@ -2539,6 +2549,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 
 	kfree(cbuf);
 	kfree(kbuf);
+	kfree(folios);
 	return 0;
 
 cleanup:
@@ -2550,6 +2561,7 @@ cleanup:
 	}
 	kfree(cbuf);
 	kfree(kbuf);
+	kfree(folios);
 	return ret;
 }
 
@@ -5326,7 +5338,7 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->comp_threshold = result.uint_32;
 		break;
 	case Opt_compress_merge:
-		if (result.uint_32 < 1 || result.uint_32 > 64)
+		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_MERGE_MAX)
 			goto bad_value;
 		ctx->comp_merge = result.uint_32;
 		break;
@@ -6123,7 +6135,12 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		"compress_fails: %lu\n"
 		"decompress_fails: %lu\n"
 		"avg_compress_time_ns: %lu\n"
-		"avg_decompress_time_ns: %lu\n",
+		"avg_decompress_time_ns: %lu\n"
+		"ram_pool_bytes: %lu\n"
+		"ram_merged_bytes: %lu\n"
+		"ram_entry_bytes: %lu\n"
+		"ram_entries: %lu\n"
+		"ram_total_bytes: %lu\n",
 		stats.compressed_pages,
 		stats.uncompressed_pages,
 		stats.total_compressed_bytes,
@@ -6133,7 +6150,12 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		stats.compress_fails,
 		stats.decompress_fails,
 		stats.avg_compress_time_ns,
-		stats.avg_decompress_time_ns);
+		stats.avg_decompress_time_ns,
+		stats.ram_pool_bytes,
+		stats.ram_merged_bytes,
+		stats.ram_entry_bytes,
+		stats.ram_entries,
+		stats.ram_total_bytes);
 }
 static ssize_t merge_pages_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -6151,7 +6173,7 @@ static ssize_t merge_pages_store(struct kobject *kobj,
 	ret = kstrtouint(buf, 10, &v);
 	if (ret)
 		return ret;
-	if (v < 1 || v > 64)
+	if (v < 1 || v > SHMEM_COMP_MERGE_MAX)
 		return -EINVAL;
 
 	shmem_comp_default_merge = v;
