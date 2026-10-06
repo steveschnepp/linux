@@ -350,6 +350,13 @@ struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool)
 	return pool ? pool->cells : NULL;
 }
 
+unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool)
+{
+	if (!pool || !pool->use_cells || !pool->cells)
+		return 0;
+	return 1U << pool->cells->cell_order;
+}
+
 /**
  * shmem_comp_pool_put - Release reference to a pool
  * @pool: Pool to release

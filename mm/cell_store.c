@@ -164,6 +164,19 @@ int cell_store(struct cell_pool *cp, const void *data,
 {
 	struct cell *c;
 	u32 off;
+	u32 cell_size;
+
+	/*
+	 * A block larger than a single cell can never be stored: the
+	 * bump allocator places one block per region and there is no
+	 * multi-cell spanning.  Reject loudly here rather than
+	 * allocating a fresh cell and memcpy'ing past its end — the
+	 * caller treats this as incompressible and keeps the pages
+	 * uncompressed.
+	 */
+	cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
+	if (len == 0 || len > cell_size)
+		return -E2BIG;
 
 	spin_lock(&cp->lock);
 

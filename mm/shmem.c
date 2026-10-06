@@ -2541,11 +2541,10 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
  * the inode i_rwsem (held by the write path) already excludes
  * truncation of this inode.
  */
-static int shmem_compress_group(struct inode *inode, pgoff_t last)
+static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
+				     unsigned int nr)
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
-	unsigned int nr = sbinfo->comp_merge;
-	pgoff_t head = last + 1 - nr;
 	struct folio **folios;
 	struct folio *folio;
 	void *kbuf, *cbuf = NULL, *src;
@@ -2554,7 +2553,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	unsigned int i;
 	int ret = 0;
 
-	if (nr < 2 || nr > SHMEM_COMP_MERGE_MAX)
+	if (!nr || nr > SHMEM_COMP_MERGE_MAX)
 		return -EINVAL;
 
 	/*
@@ -2646,9 +2645,12 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 		id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle,
 					     comp_len, nr, NULL, 0);
 		if (!id) {
+			u16 cellid;
+			u32 offset;
+
+			shmem_comp_unpack_loc(handle, &cellid, &offset);
 			cell_free(shmem_comp_pool_cells(sbinfo->comp_pool),
-				  handle >> 32, handle & 0xFFFFFFFFUL,
-				  comp_len);
+				  cellid, offset, comp_len);
 			ret = 0;
 			goto cleanup;
 		}
@@ -2713,6 +2715,62 @@ cleanup:
 	kfree(kbuf);
 	kfree(folios);
 	return ret;
+}
+
+/*
+ * Choose how many pages of a merge group to compress together.
+ *
+ * Cell storage holds one compressed block per cell region and a
+ * block cannot span cells, so a group whose compressed form might
+ * exceed a cell must be split.  Compression never grows data
+ * (incompressible groups are discarded), so bounding the
+ * uncompressed slice by the cell size guarantees the compressed
+ * slice fits.  The slice must also divide the merge size: the
+ * group head is merge-aligned (the call site only fires on a full
+ * group), so any divisor of merge keeps every slice head aligned,
+ * which is what shmem_decompress_group() relies on to recover the
+ * head from an interior index (index - index % nr_pages).
+ *
+ * merge <= 1024, so the divisor scan is bounded and cheap.  A
+ * prime merge larger than the cell falls back to single pages —
+ * inefficient but correct, and unreachable for power-of-two merge
+ * values with cells >= 16 KiB.
+ */
+static unsigned int shmem_comp_chunk_nr(struct shmem_sb_info *sbinfo,
+					unsigned int nr)
+{
+	unsigned int cell_pages = shmem_comp_pool_cell_pages(sbinfo->comp_pool);
+	unsigned int d;
+
+	if (!cell_pages || nr <= cell_pages)
+		return nr;
+
+	for (d = cell_pages; d > 1; d--)
+		if (nr % d == 0)
+			return d;
+	return 1;
+}
+
+static int shmem_compress_group(struct inode *inode, pgoff_t last)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
+	unsigned int nr = sbinfo->comp_merge;
+	unsigned int chunk, off;
+	pgoff_t head;
+
+	if (nr < 2 || nr > SHMEM_COMP_MERGE_MAX)
+		return -EINVAL;
+
+	head = last + 1 - nr;
+	chunk = shmem_comp_chunk_nr(sbinfo, nr);
+
+	for (off = 0; off < nr; off += chunk) {
+		int ret = shmem_comp_compress_chunk(inode, head + off,
+						    min(chunk, nr - off));
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /**
@@ -5565,7 +5623,13 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		unsigned long bytes = memparse(param->string, NULL);
 		unsigned int order;
 
-		if (bytes == 0 || !is_power_of_2(bytes) ||
+		/* cell=0 explicitly opts out of cell storage */
+		if (bytes == 0) {
+			ctx->comp_cell_order = 0;
+			ctx->seen |= SHMEM_SEEN_COMPRESS;
+			break;
+		}
+		if (!is_power_of_2(bytes) ||
 		    bytes < (PAGE_SIZE << CELL_ORDER_MIN) ||
 		    bytes > (PAGE_SIZE << CELL_ORDER_MAX))
 			goto bad_value;
@@ -5987,8 +6051,39 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 		/* Validate algorithm and create pool */
 		if (strcmp(algo, "none") != 0) {
+			unsigned int cell_order = ctx->comp_cell_order;
+			unsigned int merge;
+			unsigned long tmpfs_bytes;
+
+			/*
+			 * Default cell order when cell= is not given:
+			 * scale with the filesystem size so ~100-1000 cells
+			 * cover the tmpfs.  Larger tmpfs → larger cells →
+			 * fewer alloc_pages calls, less per-cell metadata.
+			 * Merged groups use larger blocks, so bump one order
+			 * to keep ~10-30 blocks per cell.
+			 *
+			 * Explicit cell= always wins.  cell=0 opts out of
+			 * cell storage entirely (zsmalloc backend).
+			 */
+			if (cell_order == 0 && ctx->comp_compress) {
+				merge = ctx->comp_merge ?: 1;
+				tmpfs_bytes = (ctx->blocks ?:
+						 shmem_default_max_blocks()) << PAGE_SHIFT;
+
+				if (tmpfs_bytes >= (256UL << 20))
+					cell_order = 8;	/* 1 MiB */
+				else if (tmpfs_bytes >= (32UL << 20))
+					cell_order = 6;	/* 256 KiB */
+				else
+					cell_order = 4;	/* 64 KiB */
+
+				if (merge >= 8 && cell_order < CELL_ORDER_MAX)
+					cell_order++;
+			}
+
 			sbinfo->comp_pool = shmem_comp_pool_create(algo,
-							 ctx->comp_cell_order);
+								 cell_order);
 			if (IS_ERR(sbinfo->comp_pool)) {
 				pr_warn("tmpfs: failed to create compression pool, "
 					"running uncompressed\n");
@@ -6000,7 +6095,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 				algo = NULL;
 				sbinfo->comp_threshold =
 					ctx->comp_threshold ?: 65536;
-				sbinfo->comp_cell_order = ctx->comp_cell_order;
+				sbinfo->comp_cell_order = cell_order;
 				mutex_lock(&shmem_comp_defaults_lock);
 				sbinfo->comp_merge = ctx->comp_merge ?:
 						     (shmem_comp_default_merge ?: 1);

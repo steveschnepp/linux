@@ -147,20 +147,25 @@ struct shmem_comp_entry {
 /*
  * Encode/decode a cell location into the handle field.
  *
- * The packing is lossless because cellid never exceeds 16 bits
- * (max_cells is 256) and offset never exceeds 22 bits (max cell
- * size is 4 MiB).  The shift constants are fixed, not derived from
- * the struct layout, so they are stable across compiler versions.
+ * cellid is biased by +1 so that the first object of the first cell
+ * (cellid=0, offset=0) never encodes to handle 0.  Handle 0 is the
+ * universal "storage failed" sentinel in the compression paths —
+ * without the bias, that object would be silently discarded on every
+ * fresh pool.
+ *
+ * Lossless because cellid never exceeds 16 bits (max_cells is 256)
+ * and offset never exceeds 22 bits (max cell size is 4 MiB); the
+ * biased cellid fits comfortably in the upper 32 bits.
  */
 static inline unsigned long shmem_comp_pack_loc(u16 cellid, u32 offset)
 {
-	return ((unsigned long)cellid << 32) | offset;
+	return ((unsigned long)(cellid + 1) << 32) | offset;
 }
 
 static inline void shmem_comp_unpack_loc(unsigned long handle,
 					 u16 *cellid, u32 *offset)
 {
-	*cellid = handle >> 32;
+	*cellid = (handle >> 32) - 1;
 	*offset = handle & 0xFFFFFFFFUL;
 }
 
@@ -299,6 +304,7 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool);
  */
 bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
 struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
+unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 
 /**
  * shmem_comp_compress - Compress a block of memory
