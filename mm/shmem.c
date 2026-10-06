@@ -129,7 +129,6 @@ struct shmem_options {
 	struct shmem_quota_limits qlimits;
 #ifdef CONFIG_TMPFS_COMPRESSION
 	/* Transparent compression options */
-	bool comp_enabled;           /* Compression explicitly enabled/disabled */
 	bool comp_compress;          /* true=compress, false=nocompress */
 	char *comp_compressor;       /* Algorithm name (NULL = default) */
 	unsigned int comp_threshold; /* Min file size to compress */
@@ -144,6 +143,7 @@ struct shmem_options {
 #define SHMEM_SEEN_HUGE 4
 #define SHMEM_SEEN_INUMS 8
 #define SHMEM_SEEN_QUOTA 16
+#define SHMEM_SEEN_COMPRESS 32
 };
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -5187,7 +5187,6 @@ enum shmem_param {
 	Opt_grpquota_block_hardlimit,
 	Opt_grpquota_inode_hardlimit,
 #ifdef CONFIG_TMPFS_COMPRESSION
-	Opt_compress,
 	Opt_nocompress,
 	Opt_compress_algo,
 	Opt_compress_threshold,
@@ -5441,37 +5440,39 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->qlimits.grpquota_ihardlimit = size;
 		break;
 #ifdef CONFIG_TMPFS_COMPRESSION
-	case Opt_compress:
-		ctx->comp_enabled = true;
-		ctx->comp_compress = true;
-		break;
 	case Opt_nocompress:
-		ctx->comp_enabled = true;
 		ctx->comp_compress = false;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_algo:
-		/* compress=/compressor= : bare form enables the default */
-		ctx->comp_enabled = true;
-		ctx->comp_compress = true;
-		if (param->string && param->string[0] &&
-		    strcmp(param->string, "none")) {
-			/* fail the mount early on typos/missing algorithms */
-			if (!crypto_has_acomp(param->string, 0, 0))
-				return invalfc(fc,
-					"tmpfs: compressor '%s' unavailable",
-					param->string);
-			kfree(ctx->comp_compressor);
-			ctx->comp_compressor = param->string;
+		if (param->string && strcmp(param->string, "none") == 0) {
+			ctx->comp_compress = false;
+			kfree(param->string);
 			param->string = NULL;
+		} else {
+			ctx->comp_compress = true;
+			if (param->string && param->string[0]) {
+				/* fail the mount early on typos/missing algorithms */
+				if (!crypto_has_acomp(param->string, 0, 0))
+					return invalfc(fc,
+						"tmpfs: compressor '%s' unavailable",
+						param->string);
+				kfree(ctx->comp_compressor);
+				ctx->comp_compressor = param->string;
+				param->string = NULL;
+			}
 		}
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_threshold:
 		ctx->comp_threshold = result.uint_32;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_merge:
 		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_MERGE_MAX)
 			goto bad_value;
 		ctx->comp_merge = result.uint_32;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 #endif
 	case Opt_casefold_version:
@@ -5540,6 +5541,11 @@ static int shmem_reconfigure(struct fs_context *fc)
 
 	raw_spin_lock(&sbinfo->stat_lock);
 	used_isp = sbinfo->max_inodes * BOGO_INODE_SIZE - sbinfo->free_ispace;
+
+	if (ctx->seen & SHMEM_SEEN_COMPRESS) {
+		err = "Cannot retroactively change compression options";
+		goto out;
+	}
 
 	if ((ctx->seen & SHMEM_SEEN_BLOCKS) && ctx->blocks) {
 		if (!sbinfo->max_blocks) {
@@ -5851,7 +5857,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 #ifdef CONFIG_TMPFS_COMPRESSION
 	/* Initialize compression pool if enabled */
-	if (ctx->comp_enabled) {
+	if (ctx->comp_compress) {
 		char *algo = NULL;
 
 		/*
@@ -5887,7 +5893,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 					"running uncompressed\n");
 				sbinfo->comp_pool = NULL;
 			} else {
-				sbinfo->comp_enabled = ctx->comp_compress;
+				sbinfo->comp_enabled = true;
 				/* ownership transfers */
 				sbinfo->comp_compressor = algo;
 				algo = NULL;
@@ -6143,6 +6149,9 @@ int shmem_init_fs_context(struct fs_context *fc)
 	ctx->mode = 0777 | S_ISVTX;
 	ctx->uid = current_fsuid();
 	ctx->gid = current_fsgid();
+#ifdef CONFIG_TMPFS_COMPRESSION
+	ctx->comp_compress = shmem_comp_default_enabled;
+#endif
 
 #if IS_ENABLED(CONFIG_UNICODE)
 	ctx->encoding = NULL;
