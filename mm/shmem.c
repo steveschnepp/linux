@@ -2383,30 +2383,19 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
-	 * Load the compressed data.  Cell storage reads the entire
-	 * group in one cell_load() call; zsmalloc loads chunk by
-	 * chunk through the handle array.
+	 * Load the compressed data.  Cell storage uses the pinned,
+	 * retry-safe loader — GC may relocate the block between the
+	 * caller's entry_get() and this copy, and a stale handle would
+	 * memcpy from a cell already returned to the buddy.  Zsmalloc
+	 * loads chunk by chunk through the handle array.
 	 */
 	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool)) {
-		unsigned long handle = 0;
-		u16 cellid;
-		u32 offset;
-
-		if (!shmem_comp_entry_get(id, &handle, NULL, NULL,
-					   NULL, NULL) || !handle) {
-			if (handle)
-				shmem_comp_entry_put(id);
-			return -ENOENT;
-		}
-		shmem_comp_unpack_loc(handle, &cellid, &offset);
-
 		cbuf = kmalloc(comp_len, GFP_KERNEL);
 		if (!cbuf) {
 			shmem_comp_entry_put(id);
 			return -ENOMEM;
 		}
-		ret = cell_load(shmem_comp_pool_cells(sbinfo->comp_pool),
-				cellid, offset, cbuf, &comp_len);
+		ret = shmem_comp_load_entry(id, cbuf, &comp_len);
 		if (ret) {
 			kfree(cbuf);
 			shmem_comp_entry_put(id);
@@ -2847,7 +2836,18 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return -ENOMEM;
 	}
 
-	ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
+	/*
+	 * Cell storage: the handle copied above can go stale between
+	 * entry_get() and here — GC may relocate the block and return
+	 * its cell to the buddy.  The retry-safe loader revalidates the
+	 * handle under the cell's read lock.  Zsmalloc handles never
+	 * move under us (objects stay put until zs_free), so the plain
+	 * load is safe there.
+	 */
+	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool))
+		ret = shmem_comp_load_entry(id, src, &comp_len);
+	else
+		ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
 	if (ret) {
 		kfree(src);
 		shmem_comp_entry_put(id);
@@ -6569,12 +6569,35 @@ static ssize_t cell_stats_show(struct kobject *kobj,
 }
 static struct kobj_attribute cell_stats_attr = __ATTR_RO(cell_stats);
 
+/*
+ * Debug hook: run one async GC pass on all cell-backed pools.
+ * Lets tests exercise evacuation deterministically instead of
+ * waiting for memory pressure to hit the shrinker.
+ */
+static ssize_t gc_now_store(struct kobject *kobj,
+			    struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	bool v;
+	int ret;
+
+	ret = kstrtobool(buf, &v);
+	if (ret)
+		return ret;
+	if (v)
+		shmem_comp_cell_gc_all();
+	return count;
+}
+static struct kobj_attribute gc_now_attr = __ATTR(gc_now, 0200, NULL,
+						  gc_now_store);
+
 static struct attribute *tmpfs_comp_attrs[] = {
 	&compression_attr.attr,
 	&compressor_attr.attr,
 	&merge_pages_attr.attr,
 	&comp_stats_attr.attr,
 	&cell_stats_attr.attr,
+	&gc_now_attr.attr,
 	NULL,
 };
 

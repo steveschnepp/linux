@@ -52,6 +52,16 @@
 #include <linux/shmem_compress.h>
 #include <linux/cell_store.h>
 
+#define cell_dbg(fmt, ...) \
+	pr_debug("shmem_comp: " fmt "\n", ##__VA_ARGS__)
+
+/* GC implementation lives after the entry table (needs the xarray) */
+static void shmem_comp_cell_gc(struct shmem_comp_pool *pool);
+static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
+					   struct shrink_control *sc);
+static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
+					  struct shrink_control *sc);
+
 /*
  * Per-CPU compression context.
  *
@@ -242,6 +252,27 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 		}
 		pool->use_cells = true;
 		pool->zs_pool = NULL;
+
+		/*
+		 * Register the shrinker: sparse cells are reclaimed
+		 * only under memory pressure — the free path never
+		 * evacuates synchronously so that one GC pass can
+		 * batch many cells into a single entry-table scan.
+		 */
+		pool->cells->shrinker = shrinker_alloc(0,
+			"tmpfs-comp-cell:%s", pool->algo_name);
+		if (pool->cells->shrinker) {
+			pool->cells->shrinker->count_objects =
+				shmem_comp_cell_count;
+			pool->cells->shrinker->scan_objects =
+				shmem_comp_cell_scan;
+			pool->cells->shrinker->private_data = pool;
+			shrinker_register(pool->cells->shrinker);
+		} else {
+			pr_warn("shmem_comp: cell shrinker alloc failed; "
+				"sparse cells wait for pool teardown\n");
+		}
+
 		pr_info("shmem_comp: cell storage enabled, order=%u (%lu KiB/cell)\n",
 			cell_order, (PAGE_SIZE << cell_order) / 1024);
 	} else {
@@ -329,8 +360,11 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 	}
 
 	/* Destroy storage pool */
-	if (pool->cells)
+	if (pool->cells) {
+		if (pool->cells->shrinker)
+			shrinker_free(pool->cells->shrinker);
 		cell_pool_destroy(pool->cells);
+	}
 	if (pool->zs_pool)
 		zs_destroy_pool(pool->zs_pool);
 
@@ -960,6 +994,254 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 				 &shmem_comp_ram_merged_bytes);
 
 	return id;
+}
+
+/*
+ * shmem_comp_cell_gc - evacuate sparse cells into the active cell
+ * @pool: cell-backed compression pool
+ *
+ * The async half of the cell allocator.  cell_free() only links
+ * sparse cells; this pass does the actual relocation.  Batching is
+ * the point: up to GC_BATCH victims are harvested first, then ONE
+ * entry-table scan relocates every live block that resides in any
+ * of them, then all emptied cells return to the buddy.  Per-free
+ * synchronous evacuation could never amortise the scan this way.
+ * Runs from the shrinker (memory pressure) or the gc_now debug
+ * hook — never from the free path.
+ *
+ * Protocol:
+ *   pick_victim()    harvests a sparse cell and takes down_write on
+ *                    it; no reader can be inside cell_load() for it,
+ *                    and cell_free()'s empty-return path blocks on
+ *                    the same lock.  Repeated up to GC_BATCH times.
+ *   scan             pins each entry residing in any victim
+ *                    (inc_not_zero — dying entries are skipped, their
+ *                    own free path handles the accounting), copies
+ *                    the block, relocates it, updates the entry
+ *                    handle with a WRITE_ONCE.
+ *   release_victim() per victim: rechecks under cp->lock — empty →
+ *                    buddy, still sparse → re-link for a later pass.
+ *
+ * Lock order: victim rwsem → cp->lock, matching cell_free()
+ * (down_read → cp->lock).  The reader's retry loop in
+ * shmem_comp_load_entry() closes the window where a stale handle
+ * outlives the relocation.
+ */
+static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
+{
+	struct cell_pool *cp = pool->cells;
+	struct cell *victims[GC_BATCH];
+	unsigned int nv = 0, v;
+	unsigned long id;
+	struct shmem_comp_entry *ent;
+	unsigned int moved = 0;
+
+	/* Harvest phase: batch victims under their write locks */
+	while (nv < GC_BATCH) {
+		struct cell *c = cell_pool_pick_victim(cp);
+
+		if (!c)
+			break;
+		victims[nv++] = c;
+	}
+	if (!nv)
+		return;
+
+	/* One scan relocates blocks from every victim */
+	xa_for_each(&shmem_comp_entries, id, ent) {
+		unsigned long h;
+		u16 cellid;
+		u32 offset;
+		unsigned int len;
+		u16 nc;
+		u32 no;
+		struct cell *vic = NULL;
+		int ret;
+
+		if (ent->pool != pool)
+			continue;
+
+		h = READ_ONCE(ent->handle);
+		if (!h)
+			continue;	/* merged zsmalloc entry */
+		shmem_comp_unpack_loc(h, &cellid, &offset);
+
+		for (v = 0; v < nv; v++) {
+			if (victims[v]->cellid == cellid) {
+				vic = victims[v];
+				break;
+			}
+		}
+		if (!vic)
+			continue;
+
+		/* Pin: skip entries whose last reference is dropping */
+		if (!atomic_inc_not_zero(&ent->refs))
+			continue;
+
+		len = ent->length;
+		if (offset + len > (1UL << vic->order) * PAGE_SIZE) {
+			shmem_comp_entry_put(id);
+			continue;
+		}
+
+		ret = cell_relocate_one(cp, vic,
+					 vic->base + offset, len,
+					 &nc, &no);
+		if (ret == 0) {
+			WRITE_ONCE(ent->handle,
+				   shmem_comp_pack_loc(nc, no));
+			moved++;
+		}
+		shmem_comp_entry_put(id);
+	}
+
+	/* Release phase: emptied cells go back to the buddy */
+	for (v = 0; v < nv; v++)
+		cell_pool_release_victim(cp, victims[v]);
+
+	cell_dbg("gc pass: moved %u objects, released %u victim cells",
+		 moved, nv);
+}
+
+/*
+ * Shrinker: one GC pass per pool per invocation.  count_objects
+ * reports sparse cells as reclaimable objects; scan reclaims them.
+ */
+static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
+					   struct shrink_control *sc)
+{
+	struct shmem_comp_pool *pool = shrinker->private_data;
+	struct cell_pool *cp = pool->cells;
+	unsigned long n = 0;
+	struct cell *c;
+
+	spin_lock(&cp->lock);
+	list_for_each_entry(c, &cp->sparse, node)
+		n++;
+	spin_unlock(&cp->lock);
+	return n;
+}
+
+static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
+					  struct shrink_control *sc)
+{
+	struct shmem_comp_pool *pool = shrinker->private_data;
+	struct cell_pool *cp = pool->cells;
+	unsigned long before, after, freed_cells = 0;
+
+	if (!(sc->gfp_mask & __GFP_DIRECT_RECLAIM))
+		return SHRINK_STOP;
+
+	/* One pass per scan invocation; the shrinker re-invokes if
+	 * more sparse cells remain.  "Objects" are sparse cells. */
+	mutex_lock(&cp->gc_lock);
+	before = shmem_comp_cell_count(shrinker, sc);
+	shmem_comp_cell_gc(pool);
+	after = shmem_comp_cell_count(shrinker, sc);
+	mutex_unlock(&cp->gc_lock);
+
+	freed_cells = before > after ? before - after : 0;
+	return freed_cells;
+}
+
+
+/*
+ * shmem_comp_load_entry - pinned, relocation-safe block load
+ * @id: entry ID (caller need not pin)
+ * @dst: destination buffer
+ * @len: [in,out] buffer size in, data size out
+ *
+ * Return: 0 on success, -ENOENT if the entry is gone, -EIO if the
+ * cell vanished without the handle changing (unreachable unless the
+ * entry table and cell accounting disagree).
+ *
+ * The reader's side of the GC contract.  A plain load could memcpy
+ * from a cell that GC relocated and returned to the buddy between
+ * the caller's entry_get() and the copy.  This helper re-reads the
+ * entry handle under the cell's read lock and retries if GC moved
+ * the block — the same -EEXIST-retry shape the page-cache install
+ * path uses.  The entry pin taken here keeps the entry (and its
+ * accounting) alive across the retry.
+ */
+int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len)
+{
+	struct shmem_comp_entry *ent;
+	struct cell_pool *cp;
+	unsigned int budget = 8;
+	int ret = -EIO;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent || !atomic_inc_not_zero(&ent->refs)) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	rcu_read_unlock();
+
+	cp = ent->pool->cells;
+	if (!cp)
+		goto out;
+
+	while (budget--) {
+		unsigned long h = READ_ONCE(ent->handle);
+		u16 cellid;
+		u32 offset;
+		struct cell *c;
+		u32 cell_size;
+
+		if (!h)
+			break;
+		shmem_comp_unpack_loc(h, &cellid, &offset);
+		c = &cp->cells[cellid];
+
+		down_read(&c->lock);
+		/*
+		 * Re-read under the lock: GC updates the handle while
+		 * holding down_write on this very rwsem, so a change
+		 * here means the block moved — retry with the fresh
+		 * location.  Slot reuse cannot fool this check: the
+		 * handle would differ, and an unchanged handle implies
+		 * the original cell is still live (its last object is
+		 * this one, pinned by us).
+		 */
+		if (READ_ONCE(ent->handle) != h) {
+			up_read(&c->lock);
+			continue;
+		}
+		if (!c->pages[0] || !c->base) {
+			up_read(&c->lock);
+			continue;
+		}
+
+		cell_size = (1UL << c->order) * PAGE_SIZE;
+		if (offset + *len > cell_size)
+			*len = cell_size - offset;
+		memcpy(dst, c->base + offset, *len);
+		up_read(&c->lock);
+		ret = 0;
+		break;
+	}
+
+out:
+	shmem_comp_entry_put(id);
+	return ret;
+}
+
+/* Debug hook: run one GC pass on every cell-backed pool. */
+void shmem_comp_cell_gc_all(void)
+{
+	struct shmem_comp_pool *pool;
+
+	spin_lock(&shmem_comp_pools_lock);
+	list_for_each_entry(pool, &shmem_comp_pools, list) {
+		if (!pool->use_cells || !pool->cells)
+			continue;
+		mutex_lock(&pool->cells->gc_lock);
+		shmem_comp_cell_gc(pool);
+		mutex_unlock(&pool->cells->gc_lock);
+	}
+	spin_unlock(&shmem_comp_pools_lock);
 }
 
 /*

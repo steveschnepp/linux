@@ -58,14 +58,19 @@
 #define CELL_ORDER_DEF	4		/* 64 KiB  */
 
 /*
- * A cell with fewer live objects than this is a compaction
- * candidate.  The threshold exists because evacuating a cell costs
- * one read+write per live block; evacuating a cell that is nearly
- * full would waste more bandwidth than it saves.  Four is chosen so
- * that a cell that has lost most of its blocks is prioritized over
- * one that has lost a few.
+ * A cell is a GC candidate when more than half its capacity is
+ * waste: live_bytes * 2 <= cell_size.  Utilization, not object
+ * count — twelve 2 KB blocks in a 64 KiB cell is 75% waste whether
+ * we call that "a few objects" or not, and evacuating returns a
+ * whole cell to the buddy for the price of twelve memcpys.  The
+ * active cell is never a candidate (it takes new allocations), so
+ * every pass strictly reduces memory held.
  */
-#define CELL_SPARSE_THRESHOLD	4
+#define CELL_IS_SPARSE(live_bytes, cell_size) \
+	((live_bytes) * 2 <= (cell_size))
+
+/* Victims batched per GC pass: one entry-table scan reclaims all. */
+#define GC_BATCH	8
 
 struct cell {
 	/*
@@ -93,20 +98,34 @@ struct cell {
 
 struct cell_pool {
 	/*
-	 * Protects: active pointer, nr_cells, every cell's
-	 * next_free/live_bytes/live_objects/active/node fields, and
-	 * the sparse list.  Held briefly during allocation and free;
-	 * never held across a memcpy or a page allocator call.
+	 * Protects: active pointer, the cell directory (including
+	 * free-slot reuse), every cell's next_free/live_bytes/
+	 * live_objects/active/node fields, and the sparse list.  Lock
+	 * order: a cell's rwsem is always taken BEFORE cp->lock, never
+	 * after — GC holds down_write(victim) and then takes cp->lock
+	 * for bump allocation; cell_free takes down_read when it might
+	 * return a cell, then cp->lock for the recheck.
 	 */
 	spinlock_t	lock;
+	/*
+	 * Serialises GC passes.  Without it two shrinker scans could
+	 * relocate the same object concurrently and corrupt accounting.
+	 */
+	struct mutex	gc_lock;
 	struct cell	*active;	/* current allocation target, or NULL */
 	struct cell	*cells;		/* directory array, indexed by cellid */
-	u16		nr_cells;	/* cells currently allocated */
+	u16		nr_cells;	/* high-water mark of directory use */
 	u16		max_cells;	/* directory capacity */
 	u8		cell_order;	/* alloc_pages order, same for all cells */
 	bool		use_thp;	/* request THP-backed pages */
 	struct list_head sparse;	/* cells below SPARSE_THRESHOLD objects */
-	atomic_long_t	pages_used;	/* (1 << cell_order) * nr_live_cells */
+	atomic_long_t	pages_used;	/* (1 << cell_order) * live cells */
+	/*
+	 * Registered by the compression layer when the pool is cell-
+	 * backed; NULL otherwise.  The shrinker is the async GC trigger
+	 * under memory pressure.
+	 */
+	struct shrinker	*shrinker;
 };
 
 /*
@@ -151,5 +170,16 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
  */
 int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 	      void *dst, unsigned int *len);
+
+/*
+ * Async GC interface.  cell_free() only links sparse cells; the
+ * evacuation pass (shmem_compress.c) uses these to move live
+ * objects into the active cell and release the emptied victim.
+ */
+struct cell *cell_pool_pick_victim(struct cell_pool *cp);
+int cell_relocate_one(struct cell_pool *cp, struct cell *victim,
+		      const void *data, unsigned int len,
+		      u16 *new_cellid, u32 *new_offset);
+void cell_pool_release_victim(struct cell_pool *cp, struct cell *victim);
 
 #endif /* _LINUX_CELL_STORE_H */

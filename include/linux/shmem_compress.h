@@ -306,6 +306,15 @@ bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
 struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 
+/*
+ * Pinned, relocation-safe block load for cell storage.  Retries if
+ * GC moves the block mid-read; see implementation for the protocol.
+ */
+int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len);
+
+/* Debug hook: run one async GC pass on every cell-backed pool. */
+void shmem_comp_cell_gc_all(void);
+
 /**
  * shmem_comp_compress - Compress a block of memory
  * @pool: Compression pool to use

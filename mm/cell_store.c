@@ -19,6 +19,8 @@
 
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/shrinker.h>
 #include <linux/cell_store.h>
 
 #define cell_dbg(fmt, ...) \
@@ -34,6 +36,7 @@ static gfp_t cell_gfp(struct cell_pool *cp)
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 {
 	struct cell_pool *cp;
+	u16 i;
 
 	if (order < CELL_ORDER_MIN || order > CELL_ORDER_MAX)
 		return NULL;
@@ -43,6 +46,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 		return NULL;
 
 	spin_lock_init(&cp->lock);
+	mutex_init(&cp->gc_lock);
 	INIT_LIST_HEAD(&cp->sparse);
 	cp->cell_order = order;
 	cp->use_thp = use_thp;
@@ -53,6 +57,16 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 		kfree(cp);
 		return NULL;
 	}
+
+	/*
+	 * Initialise every cell rwsem exactly once.  GC returns cells
+	 * to the buddy and cell_pool_new_cell() reuses directory slots;
+	 * re-running init_rwsem on a reused slot would corrupt the lock
+	 * state if a stale reader still holds it from the previous
+	 * incarnation.
+	 */
+	for (i = 0; i < cp->max_cells; i++)
+		init_rwsem(&cp->cells[i].lock);
 
 	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d",
 		 order, (PAGE_SIZE << order) / 1024, use_thp);
@@ -90,39 +104,98 @@ void cell_pool_destroy(struct cell_pool *cp)
  * cannot satisfy the request.  The caller treats this as -ENOMEM;
  * the compression path falls back to leaving pages uncompressed.
  */
-static struct cell *cell_pool_new_cell(struct cell_pool *cp)
+/*
+ * cell_pool_new_cell - Allocate a new cell and make it active
+ * @cp: pool
+ *
+ * Called with cp->lock held.  Scans the directory for a slot freed
+ * by a previous return — GC hands whole cells back frequently and a
+ * monotonic high-water mark would exhaust the directory even while
+ * most slots are empty.  Allocates from the buddy allocator
+ * (THP-backed when use_thp is set).  Returns the new active cell,
+ * or NULL when the directory is full or memory is unavailable.
+ */
+/*
+ * cell_make_active - ensure cp->active has room for @len bytes
+ * @cp: pool
+ * @len: block size that must fit
+ *
+ * Returns with cp->lock HELD and cp->active non-NULL with at least
+ * @len bytes free, or NULL with the lock released (-ENOMEM).
+ *
+ * The page allocation happens OUTSIDE the spinlock — GFP_KERNEL may
+ * sleep, which is illegal under spin_lock().  After reacquiring the
+ * lock we re-check: a concurrent caller may have installed an active
+ * cell while we were in the page allocator, in which case our page
+ * is freed and theirs is used.  This makes concurrent store paths
+ * safe without ever allocating in atomic context.
+ */
+static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len)
 {
+	u32 cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
 	struct cell *c;
 	struct page *page;
-	u16 id;
 
-	if (cp->nr_cells >= cp->max_cells)
-		return NULL;
-
-	id = cp->nr_cells;
-	c = &cp->cells[id];
+	spin_lock(&cp->lock);
+	c = cp->active;
+	if (c && c->next_free + len <= cell_size)
+		return c;
+	spin_unlock(&cp->lock);
 
 	page = alloc_pages(cell_gfp(cp), cp->cell_order);
-	if (!page)
+
+	spin_lock(&cp->lock);
+
+	/* Re-check: someone may have made a cell while we allocated */
+	c = cp->active;
+	if (c && c->next_free + len <= cell_size) {
+		if (page)
+			__free_pages(page, cp->cell_order);
+		return c;
+	}
+
+	if (!page) {
+		spin_unlock(&cp->lock);
 		return NULL;
+	}
+
+	/* Find a free directory slot (GC returns cells for reuse) */
+	c = NULL;
+	{
+		u16 slot;
+
+		for (slot = 0; slot < cp->max_cells; slot++) {
+			if (!cp->cells[slot].pages[0]) {
+				c = &cp->cells[slot];
+				break;
+			}
+		}
+		if (c)
+			c->cellid = slot;
+	}
+	if (!c) {
+		__free_pages(page, cp->cell_order);
+		spin_unlock(&cp->lock);
+		return NULL;
+	}
 
 	c->pages[0] = page;
 	c->base = page_address(page);
 	c->next_free = 0;
 	c->live_bytes = 0;
 	c->live_objects = 0;
-	c->cellid = id;
 	c->order = cp->cell_order;
 	c->active = true;
-	init_rwsem(&c->lock);
 	INIT_LIST_HEAD(&c->node);
+	/* rwsem initialised once at pool create — slots are reused */
 
-	cp->nr_cells++;
+	if (c->cellid >= cp->nr_cells)
+		cp->nr_cells = c->cellid + 1;
 	cp->active = c;
 	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
 
 	cell_dbg("new cell %u: base=%p order=%u (%lu KiB)",
-		 id, c->base, cp->cell_order,
+		 c->cellid, c->base, cp->cell_order,
 		 (PAGE_SIZE << cp->cell_order) / 1024);
 
 	return c;
@@ -181,12 +254,12 @@ int cell_store(struct cell_pool *cp, const void *data,
 	spin_lock(&cp->lock);
 
 	c = cp->active;
-	if (!c || c->next_free + len > (1UL << c->order) * PAGE_SIZE) {
-		c = cell_pool_new_cell(cp);
-		if (!c) {
-			spin_unlock(&cp->lock);
+	if (!c || c->next_free + len > cell_size) {
+		spin_unlock(&cp->lock);
+		c = cell_make_active(cp, len);
+		if (!c)
 			return -ENOMEM;
-		}
+		/* cell_make_active returns with cp->lock held */
 	}
 
 	off = c->next_free;
@@ -219,10 +292,11 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	       unsigned int len)
 {
 	struct cell *c;
+	bool empty;
 
 	spin_lock(&cp->lock);
 
-	if (cellid >= cp->nr_cells) {
+	if (cellid >= cp->max_cells) {
 		spin_unlock(&cp->lock);
 		return;
 	}
@@ -235,18 +309,49 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 
 	c->live_bytes -= len;
 	c->live_objects--;
+	empty = (c->live_bytes == 0);
 
-	cell_dbg("free: cell=%u offset=%u len=%u (live_bytes=%u, objects=%u)",
-		 cellid, offset, len, c->live_bytes, c->live_objects);
+	cell_dbg("free: cell=%u offset=%u len=%u (live_bytes=%u, objects=%u)%s",
+		 cellid, offset, len, c->live_bytes, c->live_objects,
+		 empty ? " -> empty" :
+		 CELL_IS_SPARSE(c->live_bytes, 1UL << c->order << PAGE_SHIFT) ?
+		 " -> sparse" : "");
 
-	if (c->live_bytes == 0) {
-		cell_pool_return(cp, c);
-	} else if (c->live_objects < CELL_SPARSE_THRESHOLD) {
+	if (!empty &&
+	    CELL_IS_SPARSE(c->live_bytes, 1UL << c->order << PAGE_SHIFT)) {
+		/*
+		 * Sparse: hand to the async GC.  Evacuation never runs in
+		 * the freeing thread's context — one GC pass batches many
+		 * cells into a single entry-table scan and a single
+		 * active-cell fill, which is strictly cheaper per cell
+		 * than per-free synchronous evacuation.
+		 */
 		if (list_empty(&c->node))
 			list_add(&c->node, &cp->sparse);
+		spin_unlock(&cp->lock);
+		return;
 	}
 
 	spin_unlock(&cp->lock);
+
+	if (!empty)
+		return;
+
+	/*
+	 * Tier 1: the cell is empty — nothing to move, so the pages go
+	 * back to the buddy inline.  This is what makes MemFree track
+	 * tmpfs usage without waiting for a shrinker.  down_read excludes
+	 * a concurrent GC holding this cell as victim; without it we
+	 * could __free_pages() memory a GC reader is memcpy'ing from.
+	 * The recheck under both locks closes the window where GC
+	 * relocated the last objects and returned the cell itself.
+	 */
+	down_read(&c->lock);
+	spin_lock(&cp->lock);
+	if (c->pages[0] && c->live_bytes == 0)
+		cell_pool_return(cp, c);
+	spin_unlock(&cp->lock);
+	up_read(&c->lock);
 }
 
 int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
@@ -255,16 +360,30 @@ int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 	struct cell *c;
 	u32 cell_size;
 
-	if (cellid >= cp->nr_cells)
+	if (cellid >= cp->max_cells)
 		return -EINVAL;
 
 	c = &cp->cells[cellid];
-	if (!c->pages[0] || !c->base)
+
+	/*
+	 * Take the read side of the cell rwsem so a GC evacuation
+	 * (down_write on the same cell) cannot return the pages to
+	 * the buddy while we memcpy from them.  Uncontended in the
+	 * common case: readers run in parallel; only eviction of
+	 * THIS cell excludes them.
+	 */
+	down_read(&c->lock);
+
+	if (!c->pages[0] || !c->base) {
+		up_read(&c->lock);
 		return -EINVAL;
+	}
 
 	cell_size = (1UL << c->order) * PAGE_SIZE;
-	if (offset >= cell_size)
+	if (offset >= cell_size) {
+		up_read(&c->lock);
 		return -EINVAL;
+	}
 
 	if (offset + *len > cell_size)
 		*len = cell_size - offset;
@@ -276,8 +395,121 @@ int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 	 * boundary within the cell is still a single memcpy.
 	 */
 	memcpy(dst, c->base + offset, *len);
+	up_read(&c->lock);
 
 	cell_dbg("load: cell=%u offset=%u len=%u", cellid, offset, *len);
 
 	return 0;
+}
+
+/*
+ * Async GC primitives.  The evacuation algorithm lives in
+ * shmem_compress.c — finding which objects reside in a victim cell
+ * requires scanning the entry table, which is private to the
+ * compression layer.  These helpers implement the allocator side
+ * under a strict protocol:
+ *
+ *   pick_victim(): harvests the first cell from cp->sparse and
+ *     takes down_write on it.  No reader can be inside cell_load()
+ *     for this cell, and cell_free()'s empty-return path blocks on
+ *     the same lock, so the victim is quiescent for relocation.
+ *
+ *   relocate_one(): bump-allocates space in the active cell and
+ *     copies one block out of the victim.  Adjusts both cells'
+ *     accounting under cp->lock.  Returns -ENOMEM when no cell can
+ *     back the copy; the caller then leaves remaining objects in
+ *     place and the victim is re-linked as sparse.
+ *
+ *   release_victim(): rechecks under cp->lock — if the victim came
+ *     empty (objects relocated or freed concurrently), return it to
+ *     the buddy; otherwise re-link it as sparse for a later pass.
+ *     Always drops down_write.
+ */
+struct cell *cell_pool_pick_victim(struct cell_pool *cp)
+{
+	struct cell *c = NULL, *tmp;
+
+	spin_lock(&cp->lock);
+	list_for_each_entry_safe(c, tmp, &cp->sparse, node) {
+		/*
+		 * Never harvest the active cell: relocating its
+		 * objects would target itself, leaking bump space on
+		 * every pass without ever emptying the cell.
+		 */
+		if (c == cp->active)
+			continue;
+		list_del_init(&c->node);
+		spin_unlock(&cp->lock);
+		down_write(&c->lock);
+		return c;
+	}
+	spin_unlock(&cp->lock);
+	return NULL;
+}
+
+int cell_relocate_one(struct cell_pool *cp, struct cell *victim,
+		      const void *data, unsigned int len,
+		      u16 *new_cellid, u32 *new_offset)
+{
+	struct cell *a;
+	u32 off;
+	u32 cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
+
+	if (len == 0 || len > cell_size)
+		return -E2BIG;
+
+	spin_lock(&cp->lock);
+
+	a = cp->active;
+	if (!a || a->next_free + len > cell_size) {
+		spin_unlock(&cp->lock);
+		a = cell_make_active(cp, len);
+		if (!a)
+			return -ENOMEM;
+		/* cell_make_active returns with cp->lock held */
+	}
+
+	off = a->next_free;
+	a->next_free += len;
+	a->live_bytes += len;
+	a->live_objects++;
+
+	/*
+	 * The victim's counters move with the block.  The victim's
+	 * rwsem is held for write by the caller, so no reader can
+	 * observe intermediate state; cp->lock serialises against
+	 * cell_free() of OTHER cells.
+	 */
+	victim->live_bytes -= len;
+	victim->live_objects--;
+
+	spin_unlock(&cp->lock);
+
+	memcpy(a->base + off, data, len);
+
+	cell_dbg("relocate: %u bytes cell=%u->%u offset=%u",
+		 len, victim->cellid, a->cellid, off);
+
+	*new_cellid = a->cellid;
+	*new_offset = off;
+	return 0;
+}
+
+void cell_pool_release_victim(struct cell_pool *cp, struct cell *victim)
+{
+	bool empty;
+
+	spin_lock(&cp->lock);
+	empty = (victim->live_bytes == 0 && victim->pages[0]);
+	if (empty) {
+		cell_pool_return(cp, victim);
+	} else if (victim->pages[0] &&
+		   CELL_IS_SPARSE(victim->live_bytes,
+				  1UL << victim->order << PAGE_SHIFT)) {
+		if (list_empty(&victim->node))
+			list_add(&victim->node, &cp->sparse);
+	}
+	spin_unlock(&cp->lock);
+
+	up_write(&victim->lock);
 }
