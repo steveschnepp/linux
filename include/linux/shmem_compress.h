@@ -44,6 +44,18 @@
 
 #include <linux/types.h>
 #include <linux/fs.h>
+
+/*
+ * Maximum pages per merge group (merge_pages mount option / sysfs).
+ *
+ * Merged groups live in a kmalloc(N * PAGE_SIZE) buffer (zsmalloc caps
+ * objects at PAGE_SIZE), so N * PAGE_SIZE must not exceed KMALLOC_MAX_SIZE
+ * (1 << (MAX_PAGE_ORDER + PAGE_SHIFT) = 4MiB on x86_64 with the default
+ * MAX_PAGE_ORDER of 10). 1024 pages = 4MiB is therefore the hard ceiling:
+ * larger values would make every group buffer allocation fail and silently
+ * disable compression for the mount.
+ */
+#define SHMEM_COMP_MERGE_MAX	1024
 #include <linux/xarray.h>
 #include <linux/zsmalloc.h>
 #include <crypto/acompress.h>
@@ -86,6 +98,19 @@ struct shmem_comp_entry {
  * @decompress_fails: Failed decompression attempts
  * @avg_compress_time_ns: Average compression time (nanoseconds)
  * @avg_decompress_time_ns: Average decompression time (nanoseconds)
+ * @ram_pool_bytes: RAM held by zsmalloc pools (live zspage pages)
+ * @ram_merged_bytes: RAM held by merged-group kmalloc buffers
+ * @ram_entry_bytes: RAM held by live ID-table entries (slab sizes)
+ * @ram_entries: Number of live ID-table entries
+ * @ram_total_bytes: Sum of pool + merged + entry RAM
+ *
+ * The ram_* fields report what the compression subsystem currently
+ * occupies in RAM, as opposed to total_*_bytes which track cumulative
+ * data flow. ram_total_bytes vs the uncompressed size of the same data
+ * is the honest measure of whether compression saves RAM: for merged
+ * groups the kmalloc buffer is allocated at full group size and never
+ * shrunk to comp_len, so ram_merged_bytes can approach the uncompressed
+ * size even when the compressed data is small.
  *
  * Statistics structure for reporting compression metrics via sysfs.
  */
@@ -99,6 +124,12 @@ struct shmem_comp_stats {
 	unsigned long decompress_fails;
 	unsigned long avg_compress_time_ns;
 	unsigned long avg_decompress_time_ns;
+	/* Live RAM footprint (see kerneldoc above) */
+	unsigned long ram_pool_bytes;
+	unsigned long ram_merged_bytes;
+	unsigned long ram_entry_bytes;
+	unsigned long ram_entries;
+	unsigned long ram_total_bytes;
 };
 
 /*

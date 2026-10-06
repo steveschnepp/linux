@@ -113,6 +113,16 @@ static struct shmem_comp_stats shmem_comp_global_stats = {
 static DEFINE_SPINLOCK(shmem_comp_stats_lock);
 
 /*
+ * Live RAM footprint accounting for the ram_* fields of
+ * struct shmem_comp_stats. Byte counters use ksize() so they reflect
+ * what the allocator actually handed out (slab buckets, page-order
+ * rounding for large kmallocs), not the requested size.
+ */
+static atomic_long_t shmem_comp_ram_merged_bytes = ATOMIC_INIT(0);
+static atomic_long_t shmem_comp_ram_entry_bytes = ATOMIC_INIT(0);
+static atomic_t shmem_comp_ram_entries = ATOMIC_INIT(0);
+
+/*
  * Per-CPU context management.
  */
 
@@ -682,6 +692,12 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
 		return 0;
 	}
 
+	/* Live RAM footprint: slab-rounded entry + merged buffer size */
+	atomic_inc(&shmem_comp_ram_entries);
+	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
+	if (data)
+		atomic_long_add(ksize(data), &shmem_comp_ram_merged_bytes);
+
 	return id;
 }
 
@@ -712,6 +728,13 @@ bool shmem_comp_entry_release(unsigned int id)
 	/* xa_erase() takes the xarray lock internally */
 	ent = xa_erase(&shmem_comp_entries, id);
 	if (ent) {
+		/* Un-account live RAM before freeing (ksize needs a live
+		 * object; do it before kfree/kfree_rcu). */
+		atomic_dec(&shmem_comp_ram_entries);
+		atomic_long_sub(ksize(ent), &shmem_comp_ram_entry_bytes);
+		if (ent->data)
+			atomic_long_sub(ksize(ent->data),
+					 &shmem_comp_ram_merged_bytes);
 		kfree(ent->data);	/* merged group block, if any */
 		kfree_rcu(ent, rcu);
 	}
@@ -732,6 +755,9 @@ bool shmem_comp_entry_release(unsigned int id)
  */
 void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 {
+	struct shmem_comp_pool *pool;
+	unsigned long pool_pages = 0;
+
 	if (!stats)
 		return;
 
@@ -747,7 +773,27 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 		stats->ratio = 0;
 	}
 
+	stats->ram_entry_bytes = atomic_long_read(&shmem_comp_ram_entry_bytes);
+	stats->ram_merged_bytes =
+		atomic_long_read(&shmem_comp_ram_merged_bytes);
+	stats->ram_entries = atomic_read(&shmem_comp_ram_entries);
+
 	spin_unlock(&shmem_comp_stats_lock);
+
+	/*
+	 * zsmalloc footprint: sum live zspage pages over all pools.
+	 * zs_get_total_pages() reports pages currently held by the pool;
+	 * empty zspages may be retained for reuse (released by the pool
+	 * shrinker under pressure), so this is RAM *held*, not RAM in use.
+	 */
+	spin_lock(&shmem_comp_pools_lock);
+	list_for_each_entry(pool, &shmem_comp_pools, list)
+		pool_pages += zs_get_total_pages(pool->zs_pool);
+	spin_unlock(&shmem_comp_pools_lock);
+
+	stats->ram_pool_bytes = pool_pages << PAGE_SHIFT;
+	stats->ram_total_bytes = stats->ram_pool_bytes +
+		stats->ram_merged_bytes + stats->ram_entry_bytes;
 }
 
 /**
