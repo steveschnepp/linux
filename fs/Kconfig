@@ -230,7 +230,7 @@ config TMPFS_COMPRESSION
 	  If unsure, say N.
 
 config TMPFS_COMPRESSOR_DEFAULT
-	string "Default tmpfs compressor"
+	string
 	depends on TMPFS_COMPRESSION
 	default "lz4"
 	help

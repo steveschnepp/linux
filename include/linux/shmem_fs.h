@@ -12,7 +12,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/bits.h>
 #ifdef CONFIG_TMPFS_COMPRESSION
-#include <linux/shmem_compress.h>
+struct shmem_comp_pool;
 #endif
 
 /* inode in-kernel data */

@@ -6309,8 +6309,6 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		"ratio: %lu.%02lu%%\n"
 		"compress_fails: %lu\n"
 		"decompress_fails: %lu\n"
-		"avg_compress_time_ns: %lu\n"
-		"avg_decompress_time_ns: %lu\n"
 		"ram_pool_bytes: %lu\n"
 		"ram_merged_bytes: %lu\n"
 		"ram_entry_bytes: %lu\n"
@@ -6324,8 +6322,6 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		stats.ratio % 100,
 		stats.compress_fails,
 		stats.decompress_fails,
-		stats.avg_compress_time_ns,
-		stats.avg_decompress_time_ns,
 		stats.ram_pool_bytes,
 		stats.ram_merged_bytes,
 		stats.ram_entry_bytes,

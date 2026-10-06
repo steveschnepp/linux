@@ -64,8 +64,7 @@ struct shmem_comp_pcpu {
 	struct crypto_acomp *acomp;	/* crypto compression tfm */
 	struct acomp_req *req;		/* compression request */
 	struct crypto_wait wait;	/* async wait queue */
-	char *buffer;			/* PAGE_SIZE scratch buffer */
-	struct mutex lock;		/* protects req/buffer usage */
+	struct mutex lock;		/* protects req usage */
 };
 
 /*
@@ -105,8 +104,6 @@ static struct shmem_comp_stats shmem_comp_global_stats = {
 	.ratio = 0,
 	.compress_fails = 0,
 	.decompress_fails = 0,
-	.avg_compress_time_ns = 0,
-	.avg_decompress_time_ns = 0,
 };
 
 /* Spinlock protecting statistics updates */
@@ -163,16 +160,6 @@ static int shmem_comp_pcpu_init(struct shmem_comp_pcpu *pcpu,
 	/* Initialize crypto wait queue */
 	crypto_init_wait(&pcpu->wait);
 
-	/* Allocate scratch buffer for compression output */
-	pcpu->buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!pcpu->buffer) {
-		acomp_request_free(pcpu->req);
-		crypto_free_acomp(pcpu->acomp);
-		pcpu->req = NULL;
-		pcpu->acomp = NULL;
-		return -ENOMEM;
-	}
-
 	return 0;
 }
 
@@ -184,11 +171,6 @@ static int shmem_comp_pcpu_init(struct shmem_comp_pcpu *pcpu,
  */
 static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
 {
-	if (pcpu->buffer) {
-		kfree(pcpu->buffer);
-		pcpu->buffer = NULL;
-	}
-
 	if (pcpu->req) {
 		acomp_request_free(pcpu->req);
 		pcpu->req = NULL;
@@ -333,19 +315,6 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 }
 
 /**
- * shmem_comp_pool_get - Get reference to a pool
- * @pool: Pool to reference
- *
- * Increments the pool refcount. Callers must call shmem_comp_pool_put()
- * when done with the pool.
- */
-void shmem_comp_pool_get(struct shmem_comp_pool *pool)
-{
-	if (pool)
-		atomic_inc(&pool->refcount);
-}
-
-/**
  * shmem_comp_pool_put - Release reference to a pool
  * @pool: Pool to release
  *
@@ -458,13 +427,6 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 		/* Check if compression actually reduced size */
 		if (dlen >= slen) {
 			ret = -ENOSPC;
-		} else {
-			/* Update statistics */
-			spin_lock(&shmem_comp_stats_lock);
-			shmem_comp_global_stats.avg_compress_time_ns =
-				(shmem_comp_global_stats.avg_compress_time_ns +
-				 duration) / 2;
-			spin_unlock(&shmem_comp_stats_lock);
 		}
 	} else {
 		/* Update failure statistics */
@@ -530,12 +492,6 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 
 	if (!ret) {
 		*dst_len = pcpu->req->dlen;
-		/* Update statistics */
-		spin_lock(&shmem_comp_stats_lock);
-		shmem_comp_global_stats.avg_decompress_time_ns =
-			(shmem_comp_global_stats.avg_decompress_time_ns +
-			 duration) / 2;
-		spin_unlock(&shmem_comp_stats_lock);
 	} else {
 		/* Update failure statistics */
 		spin_lock(&shmem_comp_stats_lock);

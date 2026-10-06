@@ -133,25 +133,6 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
 	return xa_mk_value(entry.val);
 }
 
-/*
- * tmpfs transparent compression entry helpers.
- *
- * Compressed pages in tmpfs are stored in the page cache xarray as
- * special swap-like entries using SWP_SHMEM_COMPRESS type. The entry
- * encodes both the zsmalloc handle and the compressed length.
- */
-
-/**
- * make_shmem_comp_entry - Create a swap entry for compressed page
- * @handle: zsmalloc handle for compressed data
- * @length: Compressed data length in bytes
- *
- * Return: swp_entry_t encoding the compression entry
- *
- * Packs the zsmalloc handle and compressed length into a swap entry
- * using the SWP_SHMEM_COMPRESS type. The handle occupies the upper
- * bits and length the lower bits of the offset field.
- */
 #ifdef CONFIG_TMPFS_COMPRESSION
 /**
  * make_shmem_comp_entry - Create a compression xarray entry from an ID

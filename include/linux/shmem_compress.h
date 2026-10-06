@@ -105,8 +105,6 @@ struct shmem_comp_entry {
  * @ratio: Compression ratio (percentage * 100)
  * @compress_fails: Failed compression attempts
  * @decompress_fails: Failed decompression attempts
- * @avg_compress_time_ns: Average compression time (nanoseconds)
- * @avg_decompress_time_ns: Average decompression time (nanoseconds)
  * @ram_pool_bytes: RAM held by zsmalloc pools (live zspage pages)
  * @ram_merged_bytes: RAM held by merged-group kmalloc buffers
  * @ram_entry_bytes: RAM held by live ID-table entries (slab sizes)
@@ -131,8 +129,6 @@ struct shmem_comp_stats {
 	unsigned long ratio;		/* percentage * 100 */
 	unsigned long compress_fails;
 	unsigned long decompress_fails;
-	unsigned long avg_compress_time_ns;
-	unsigned long avg_decompress_time_ns;
 	/* Live RAM footprint (see kerneldoc above) */
 	unsigned long ram_pool_bytes;
 	unsigned long ram_merged_bytes;
@@ -396,15 +392,6 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats);
  */
 void shmem_comp_update_stats(bool compressed, unsigned int orig_size,
 			      unsigned int comp_size);
-
-/**
- * shmem_comp_pool_get - Get reference to a pool
- * @pool: Pool to reference
- *
- * Increments the pool refcount. Callers must call shmem_comp_pool_put()
- * when done with the pool.
- */
-void shmem_comp_pool_get(struct shmem_comp_pool *pool);
 
 /**
  * shmem_comp_pool_put - Release reference to a pool
