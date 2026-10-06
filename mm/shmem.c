@@ -2439,6 +2439,9 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 
 		folio_add_lru(sib);
 
+		/* Pair with the per-slice recalc in the compress path. */
+		shmem_recalc_inode(inode, 0, -1);
+
 		if (shmem_comp_entry_release(id))
 			shmem_comp_free(sbinfo->comp_pool, handle);
 
@@ -2570,6 +2573,16 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 		goto cleanup;	/* cbuf freed below */
 	}
 	cbuf = NULL;	/* owned by the entry now */
+
+	/*
+	 * Compressed slots are accounted like swap pages: raise
+	 * swapped before the slot swap lowers nrpages, so a racing
+	 * shmem_recalc_inode() never sees the pages as freed (the
+	 * same ordering shmem_writeout() relies on). Pairs with the
+	 * -nr_swaps_freed recalc at the end of shmem_undo_range(),
+	 * which restores the charge when the slots are truncated.
+	 */
+	shmem_recalc_inode(inode, 0, nr);
 
 	/* Swap every folio of the group for the replicated ID entry */
 	for (i = 0; i < nr; i++) {
@@ -2717,6 +2730,12 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return ret;
 	}
 
+	/*
+	 * nrpages rose with the folio install; drop the swap-style
+	 * charge the compression raised (see shmem_compress_folio()).
+	 */
+	shmem_recalc_inode(inode, 0, -1);
+
 	folio_add_lru(folio);
 
 	/* Last slot referencing the entry frees the compressed copy */
@@ -2850,6 +2869,16 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 		return -ENOMEM;
 	}
 	comp_entry = make_shmem_comp_entry(id);
+
+	/*
+	 * Compressed slots are accounted like swap pages: raise
+	 * swapped before the slot swap lowers nrpages, so a racing
+	 * shmem_recalc_inode() never sees the page as freed (the
+	 * same ordering shmem_writeout() relies on). Pairs with the
+	 * -nr_swaps_freed recalc at the end of shmem_undo_range(),
+	 * which restores the charge when the slot is truncated.
+	 */
+	shmem_recalc_inode(inode, 0, 1);
 
 	/*
 	 * Atomically swap the folio for the compression entry in the
