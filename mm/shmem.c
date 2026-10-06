@@ -2402,17 +2402,25 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		pgoff_t sidx = head + slice;
 		struct folio *sib;
 
-		sib = filemap_alloc_folio(gfp, 0, NULL);
+		/*
+		 * A decompressed slice is a regular shmem page: it must be
+		 * swapbacked (shmem_add_to_page_cache() asserts it) and on
+		 * the LRU once installed (reclaim sees only LRU pages). The
+		 * folio is private until it is stored, so the locked and
+		 * swapbacked bits are set directly.
+		 */
+		sib = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), sidx);
 		if (!sib) {
 			ret = -ENOMEM;
 			break;
 		}
+		__folio_set_locked(sib);
+		__folio_set_swapbacked(sib);
 
 		dst = kmap_local_folio(sib, 0);
 		memcpy(dst, dbuf + (size_t)slice * PAGE_SIZE, PAGE_SIZE);
 		kunmap_local(dst);
 		folio_mark_uptodate(sib);
-		folio_lock(sib);
 
 		ret = shmem_add_to_page_cache(sib, mapping, sidx,
 					       swp_to_radix_entry(
@@ -2428,6 +2436,8 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			}
 			continue;
 		}
+
+		folio_add_lru(sib);
 
 		if (shmem_comp_entry_release(id))
 			shmem_comp_free(sbinfo->comp_pool, handle);
@@ -2645,13 +2655,20 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		return ret;
 	}
 
-	/* Allocate a folio that is not part of any mapping yet */
-	folio = filemap_alloc_folio(gfp, 0, NULL);
+	/*
+	 * A decompressed page is a regular shmem page: it must be
+	 * swapbacked (shmem_add_to_page_cache() asserts it) and on the
+	 * LRU once installed (reclaim sees only LRU pages). The folio is
+	 * private until it is stored, so the locked and swapbacked bits
+	 * are set directly.
+	 */
+	folio = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), index);
 	if (!folio) {
 		kfree(src);
 		return -ENOMEM;
 	}
-	folio_lock(folio);
+	__folio_set_locked(folio);
+	__folio_set_swapbacked(folio);
 
 	/* Decompress into the folio */
 	dst = kmap_local_folio(folio, 0);
@@ -2680,6 +2697,8 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		folio_put(folio);
 		return ret;
 	}
+
+	folio_add_lru(folio);
 
 	/* Last slot referencing the entry frees the compressed copy */
 	if (shmem_comp_entry_release(id))
