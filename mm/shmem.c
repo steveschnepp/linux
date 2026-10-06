@@ -5788,9 +5788,11 @@ static void shmem_free_fc(struct fs_context *fc)
 	if (ctx) {
 		mpol_put(ctx->mpol);
 #ifdef CONFIG_TMPFS_COMPRESSION
-		kfree(ctx->comp_compressor);
-#endif
-#ifdef CONFIG_TMPFS_COMPRESSION
+		/*
+		 * ctx owns the compressor string: shmem_parse_one() took it
+		 * from param->string (which it NULLs), so free it exactly
+		 * once, here.
+		 */
 		kfree(ctx->comp_compressor);
 #endif
 		kfree(ctx);
