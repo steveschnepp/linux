@@ -1022,15 +1022,32 @@ static long shmem_free_swap(struct address_space *mapping,
 			swp_entry_t se = radix_to_swp_entry(radswap);
 			struct shmem_sb_info *sbinfo =
 				SHMEM_SB(mapping->host->i_sb);
-			struct shmem_comp_entry *ent;
 			unsigned long handle = 0;
 			unsigned int id = shmem_comp_entry_id(se);
+			unsigned int length = 0, nr_pages = 1;
+			bool last;
 
-			ent = shmem_comp_entry_get(id);
-			if (ent)
-				handle = ent->handle;
-			if (handle && shmem_comp_entry_release(id))
-				shmem_comp_free(sbinfo->comp_pool, handle);
+			shmem_comp_entry_query(id, &handle, &length,
+						&nr_pages, NULL);
+
+			/*
+			 * Release must run even when handle == 0 (merged groups
+			 * carry no zsmalloc handle); only the zsmalloc free is
+			 * handle-gated.
+			 */
+			last = shmem_comp_entry_release(id);
+			if (last) {
+				if (handle)
+					shmem_comp_free(sbinfo->comp_pool,
+							handle);
+				atomic_long_dec(&sbinfo->comp_pages);
+				atomic_long_sub((unsigned long)nr_pages *
+						PAGE_SIZE,
+						&sbinfo->comp_bytes);
+				shmem_comp_update_stats(false,
+							nr_pages * PAGE_SIZE,
+							length);
+			}
 		} else
 #endif
 			swap_put_entries_direct(radix_to_swp_entry(radswap),
@@ -2363,24 +2380,15 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
-	 * Merged blocks live in a kmalloc buffer owned by the entry
-	 * (zsmalloc caps objects at PAGE_SIZE). The buffer is freed
-	 * when the last slot releases the entry.
+	 * cbuf is entry-owned (freed by shmem_comp_entry_release() on the
+	 * last slot release); error paths here must not free it.
 	 */
-	{
-		struct shmem_comp_entry *ent2;
-
-		ent2 = shmem_comp_entry_get(id);
-		if (!ent2 || !ent2->data)
-			return -ENOENT;
-		cbuf = ent2->data;
-	}
+	if (!shmem_comp_entry_query(id, NULL, NULL, NULL, &cbuf) || !cbuf)
+		return -ENOENT;
 
 	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
-	if (!dbuf) {
-		kfree(cbuf);
+	if (!dbuf)
 		return -ENOMEM;
-	}
 
 	dlen = (unsigned int)nr_pages * PAGE_SIZE;
 	ret = shmem_comp_decompress(sbinfo->comp_pool, cbuf, comp_len,
@@ -2591,11 +2599,11 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
-	struct shmem_comp_entry *ent;
 	struct folio *folio;
 	unsigned long handle;
 	unsigned int comp_len;
 	unsigned int id;
+	unsigned int nr_pages;
 	unsigned int dlen;
 	void *src, *dst;
 	int ret;
@@ -2605,22 +2613,23 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (!sbinfo->comp_pool)
 		return -ENOENT;
 
-	/* Look up the compressed data via its entry ID */
+	/* Look up the compressed data via its entry ID. Query copies the
+	 * fields out under RCU: the entry can be freed (kfree_rcu) as
+	 * soon as its last slot reference drops, and
+	 * shmem_comp_entry_release() below may be exactly that reference. */
 	id = shmem_comp_entry_id(comp_entry);
-	ent = shmem_comp_entry_get(id);
-	if (!ent)
+	if (!shmem_comp_entry_query(id, &handle, &comp_len, &nr_pages,
+				    NULL))
 		return -ENOENT;
-	handle = ent->handle;
-	comp_len = ent->length;
 
 	/*
 	 * Merged group (merge_pages > 1): the ID is replicated in all
 	 * nr_pages slots of the group. Decompress the whole block and
 	 * install one folio per slice; the requested slice is returned.
 	 */
-	if (ent->nr_pages > 1)
+	if (nr_pages > 1)
 		return shmem_decompress_group(inode, index, id, handle,
-					       comp_len, ent->nr_pages,
+					       comp_len, nr_pages,
 					       gfp, foliop);
 
 	/* Read the compressed bytes out of the pool first.

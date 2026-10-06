@@ -686,11 +686,18 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
 	 * XA_FLAGS_ALLOC reserves index 0, so id is never 0 here.
 	 */
 	ret = xa_alloc(&shmem_comp_entries, &id, ent,
-			xa_limit_32b, GFP_KERNEL | __GFP_NOWARN);
+			XA_LIMIT(1, UINT_MAX), GFP_KERNEL | __GFP_NOWARN);
 	if (ret) {
 		kfree(ent);
 		return 0;
 	}
+
+	/*
+	 * ID 0 is the failure sentinel for both callers (a 0 return means
+	 * "allocation failed"), so the xarray limit must exclude it:
+	 * xa_limit_32b starts at 0 and XA_FLAGS_ALLOC does not reserve
+	 * index 0 in this tree.
+	 */
 
 	/* Live RAM footprint: slab-rounded entry + merged buffer size */
 	atomic_inc(&shmem_comp_ram_entries);
@@ -701,15 +708,52 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
 	return id;
 }
 
-struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id)
+/*
+ * Entry lookup: callers must not hold a raw entry pointer across any
+ * point where its last reference can drop -- entries are freed via
+ * kfree_rcu() from shmem_comp_entry_release(). Use the query helper
+ * below to copy the needed fields out under RCU instead.
+ */
+
+/**
+ * shmem_comp_entry_query - Copy an entry's fields out under RCU
+ * @id: entry ID
+ * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
+ * @length: output, compressed length in bytes, may be NULL
+ * @nr_pages: output, pages merged into this block (1 = single), may be NULL
+ * @data: output, entry-owned merged-group buffer, may be NULL
+ *
+ * Return: true if the entry exists
+ *
+ * Entries are freed via kfree_rcu() from shmem_comp_entry_release(),
+ * so a raw entry pointer must not be dereferenced outside an RCU
+ * read-side critical section. xa_erase() + kfree_rcu() guarantees the
+ * entry stays allocated until the current read-side section ends, so
+ * copying the fields out here is safe.
+ */
+bool shmem_comp_entry_query(unsigned int id, unsigned long *handle,
+			    unsigned int *length, unsigned int *nr_pages,
+			    void **data)
 {
 	struct shmem_comp_entry *ent;
+	bool found = false;
 
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
+	if (ent) {
+		if (handle)
+			*handle = ent->handle;
+		if (length)
+			*length = ent->length;
+		if (nr_pages)
+			*nr_pages = ent->nr_pages;
+		if (data)
+			*data = ent->data;
+		found = true;
+	}
 	rcu_read_unlock();
 
-	return ent;
+	return found;
 }
 
 bool shmem_comp_entry_release(unsigned int id)

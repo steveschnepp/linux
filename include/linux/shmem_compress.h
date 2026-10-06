@@ -316,17 +316,22 @@ unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
 				    unsigned short nr_pages, void *data);
 
 /**
- * shmem_comp_entry_get - Look up an entry by ID
+ * shmem_comp_entry_query - Copy an entry's fields out under RCU
  * @id: entry ID
+ * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
+ * @length: output, compressed length in bytes, may be NULL
+ * @nr_pages: output, pages merged into this block (1 = single), may be NULL
+ * @data: output, entry-owned merged-group buffer, may be NULL
  *
- * Return: entry pointer under RCU, or NULL if unknown
+ * Return: true if the entry exists
  *
- * The caller must not dereference the pointer after the current RCU
- * read-side critical section. Each page cache slot must be released
- * with shmem_comp_entry_release() when it no longer references the
- * entry.
+ * Entries are freed via kfree_rcu() from shmem_comp_entry_release(),
+ * so callers must not dereference a raw entry pointer outside an RCU
+ * read-side critical section; copy the fields out with this helper.
  */
-struct shmem_comp_entry *shmem_comp_entry_get(unsigned int id);
+bool shmem_comp_entry_query(unsigned int id, unsigned long *handle,
+			    unsigned int *length, unsigned int *nr_pages,
+			    void **data);
 
 /**
  * shmem_comp_entry_release - Drop one reference to an entry

@@ -172,7 +172,8 @@ static inline swp_entry_t make_shmem_comp_entry(unsigned int id)
  * shmem_comp_entry_id - Extract entry ID from a compression entry
  * @entry: swp_entry_t from page cache xarray
  *
- * Return: entry ID for shmem_comp_entry_get()
+ * Return: entry ID of the shmem compression entry (0 is never allocated;
+ *         it is the failure sentinel of shmem_comp_entry_alloc())
  */
 static inline unsigned int shmem_comp_entry_id(swp_entry_t entry)
 {
