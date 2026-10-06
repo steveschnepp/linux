@@ -2516,6 +2516,25 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 			ret = -EIO;
 			goto cleanup;
 		}
+		/*
+		 * The replicated-ID swap below removes every group
+		 * member from the page cache. A member with live PTEs
+		 * (shared mmap, forked children) must not be swapped:
+		 * stores would land in the orphan while read() serves
+		 * the compressed copy. Folio locks exclude new faults,
+		 * so folio_mapped() is stable. Order-0 only, like the
+		 * single-page path. Members are not required to be
+		 * dirty: a decompressed group is clean by construction
+		 * and recompressing it is safe. Skip the whole group;
+		 * members stay uncompressed.
+		 */
+		if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+		    folio_order(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			ret = 0;
+			goto cleanup;
+		}
 		src = kmap_local_folio(folio, 0);
 		memcpy(kbuf + (size_t)i * PAGE_SIZE, src, PAGE_SIZE);
 		kunmap_local(src);
@@ -2766,6 +2785,24 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	if (folio->mapping != mapping || !folio_test_uptodate(folio)) {
 		folio_unlock(folio);
 		return -ENOENT;
+	}
+
+	/*
+	 * The slot swap below removes the folio from the page cache.
+	 * That is only safe while nothing else can observe the folio:
+	 * live PTEs (shared mmap, forked children) keep writing to the
+	 * orphaned folio while read() serves the compressed copy. Folio
+	 * locks exclude new faults (shmem_get_folio() takes the lock
+	 * before mapping), so folio_mapped() is stable here. A pinned
+	 * folio may be under DMA. Order-0 only: the compress and
+	 * replace paths below assume a single page. write_end just
+	 * dirtied this folio; clean means the state changed under us.
+	 * Skipping is not an error: the page simply stays uncompressed.
+	 */
+	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+	    folio_order(folio) || !folio_test_dirty(folio)) {
+		folio_unlock(folio);
+		return 0;
 	}
 
 	/* Get source data from folio */
