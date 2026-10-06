@@ -37,6 +37,7 @@
 #include <linux/swap.h>
 #ifdef CONFIG_TMPFS_COMPRESSION
 #include <linux/shmem_compress.h>
+#include <linux/cell_store.h>
 #endif
 #include <linux/uio.h>
 #include <linux/hugetlb.h>
@@ -133,6 +134,7 @@ struct shmem_options {
 	char *comp_compressor;       /* Algorithm name (NULL = default) */
 	unsigned int comp_threshold; /* Min file size to compress */
 	unsigned int comp_merge;     /* pages per compression group */
+	unsigned int comp_cell_order; /* cell storage: alloc_pages order, 0=zsmalloc */
 #endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
@@ -5229,6 +5231,7 @@ enum shmem_param {
 	Opt_compress_algo,
 	Opt_compress_threshold,
 	Opt_compress_merge,
+	Opt_cell,
 #endif
 	Opt_casefold_version,
 	Opt_casefold,
@@ -5271,6 +5274,7 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
 	fsparam_u32   ("compress_merge", Opt_compress_merge),
 	fsparam_u32   ("merge_pages", Opt_compress_merge), /* alias */
+	fsparam_string("cell", Opt_cell),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -5512,6 +5516,19 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->comp_merge = result.uint_32;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
+	case Opt_cell: {
+		unsigned long bytes = memparse(param->string, NULL);
+		unsigned int order;
+
+		if (bytes == 0 || !is_power_of_2(bytes) ||
+		    bytes < (PAGE_SIZE << CELL_ORDER_MIN) ||
+		    bytes > (PAGE_SIZE << CELL_ORDER_MAX))
+			goto bad_value;
+		order = ilog2(bytes / PAGE_SIZE);
+		ctx->comp_cell_order = order;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	}
 #endif
 	case Opt_casefold_version:
 		return shmem_parse_opt_casefold(fc, param, false);
@@ -5925,7 +5942,8 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 		/* Validate algorithm and create pool */
 		if (strcmp(algo, "none") != 0) {
-			sbinfo->comp_pool = shmem_comp_pool_create(algo);
+			sbinfo->comp_pool = shmem_comp_pool_create(algo,
+							 ctx->comp_cell_order);
 			if (IS_ERR(sbinfo->comp_pool)) {
 				pr_warn("tmpfs: failed to create compression pool, "
 					"running uncompressed\n");
@@ -5937,14 +5955,16 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 				algo = NULL;
 				sbinfo->comp_threshold =
 					ctx->comp_threshold ?: 65536;
+				sbinfo->comp_cell_order = ctx->comp_cell_order;
 				mutex_lock(&shmem_comp_defaults_lock);
 				sbinfo->comp_merge = ctx->comp_merge ?:
 						     (shmem_comp_default_merge ?: 1);
 				mutex_unlock(&shmem_comp_defaults_lock);
-				pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%lu\n",
+				pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%lu cell_order=%u\n",
 					sbinfo->comp_compressor,
 					sbinfo->comp_merge,
-					sbinfo->comp_threshold);
+					sbinfo->comp_threshold,
+					sbinfo->comp_cell_order);
 				atomic_long_set(&sbinfo->comp_pages, 0);
 				atomic_long_set(&sbinfo->comp_bytes, 0);
 			}

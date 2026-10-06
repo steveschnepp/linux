@@ -100,6 +100,7 @@ struct shmem_sb_info {
 	atomic_long_t comp_pages;    /* Number of compressed pages */
 	atomic_long_t comp_bytes;    /* Total compressed bytes stored */
 	unsigned int comp_merge;     /* pages per compression group */
+	unsigned int comp_cell_order; /* cell storage order, 0=zsmalloc */
 #endif
 };
 

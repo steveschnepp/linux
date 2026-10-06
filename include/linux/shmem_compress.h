@@ -210,7 +210,8 @@ static inline bool xa_is_shmem_comp(const void *entry)
  *
  * The caller must hold no locks that could conflict with allocation.
  */
-struct shmem_comp_pool *shmem_comp_pool_create(const char *algo);
+struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
+						unsigned int cell_order);
 
 /**
  * shmem_comp_pool_destroy - Destroy a compression pool

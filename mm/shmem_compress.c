@@ -50,6 +50,7 @@
 #include <linux/swapops.h>
 #include <crypto/acompress.h>
 #include <linux/shmem_compress.h>
+#include <linux/cell_store.h>
 
 /*
  * Per-CPU compression context.
@@ -83,6 +84,8 @@ struct shmem_comp_pcpu {
  */
 struct shmem_comp_pool {
 	struct zs_pool *zs_pool;		/* zsmalloc storage pool */
+	struct cell_pool *cells;		/* cell storage pool (NULL if zsmalloc) */
+	bool use_cells;			/* true = cell storage, false = zsmalloc */
 	struct shmem_comp_pcpu __percpu *pcpu;	/* per-CPU contexts */
 	char algo_name[CRYPTO_MAX_ALG_NAME];	/* algorithm name */
 	atomic_t refcount;			/* reference count */
@@ -201,7 +204,8 @@ static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
  * The pool is added to the global list for tracking.
  * Callers must call shmem_comp_pool_put() when done.
  */
-struct shmem_comp_pool *shmem_comp_pool_create(const char *algo)
+struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
+						unsigned int cell_order)
 {
 	struct shmem_comp_pool *pool;
 	int cpu;
@@ -225,13 +229,29 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo)
 	/* Initialize refcount */
 	atomic_set(&pool->refcount, 1);
 
-	/* Create zsmalloc pool for compressed data storage */
-	pool_id = atomic_inc_return(&shmem_comp_pools_count);
-	pool->zs_pool = zs_create_pool(algo);
-	if (!pool->zs_pool) {
-		pr_warn("shmem_comp: failed to create zsmalloc pool\n");
-		kfree(pool);
-		return ERR_PTR(-ENOMEM);
+	/* Cell storage: no zsmalloc pool needed */
+	if (cell_order > 0) {
+		pool->cells = cell_pool_create(cell_order, cell_order >= 4);
+		if (!pool->cells) {
+			pr_warn("shmem_comp: failed to create cell pool\n");
+			kfree(pool);
+			return ERR_PTR(-ENOMEM);
+		}
+		pool->use_cells = true;
+		pool->zs_pool = NULL;
+		pr_info("shmem_comp: cell storage enabled, order=%u (%lu KiB/cell)\n",
+			cell_order, (PAGE_SIZE << cell_order) / 1024);
+	} else {
+		/* Create zsmalloc pool for compressed data storage */
+		pool_id = atomic_inc_return(&shmem_comp_pools_count);
+		pool->zs_pool = zs_create_pool(algo);
+		if (!pool->zs_pool) {
+			pr_warn("shmem_comp: failed to create zsmalloc pool\n");
+			kfree(pool);
+			return ERR_PTR(-ENOMEM);
+		}
+		pool->use_cells = false;
+		pool->cells = NULL;
 	}
 
 	/* Allocate per-CPU contexts */
@@ -305,7 +325,9 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 		free_percpu(pool->pcpu);
 	}
 
-	/* Destroy zsmalloc pool */
+	/* Destroy storage pool */
+	if (pool->cells)
+		cell_pool_destroy(pool->cells);
 	if (pool->zs_pool)
 		zs_destroy_pool(pool->zs_pool);
 
