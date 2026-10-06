@@ -1953,3 +1953,196 @@ config TMPFS_COMPRESSOR_DEFAULT
 - zsmalloc API: `include/linux/zsmalloc.h`
 - crypto acomp API: `include/crypto/acompress.h`
 - Existing compression: `crypto/lz4.c`, `crypto/lzo.c`
+
+---
+
+# Cell-Based Storage (FTL-inspired) — Transient Plan
+
+## Motivation
+
+zsmalloc works but pays ~24-40B per object in metadata (8B handle header
+inside every slot + size-class rounding slack + zspage struct + handle from
+handle_cachep). For our workload (144 pages, ~2.8KB compressed each) that
+measured as 479KB pool usage for 410KB of data — 14% overhead.
+
+The cell allocator stores compressed blocks at **exact sizes** in
+bump-allocated cells. Zero per-object overhead. Whole cells return to the
+buddy allocator the instant they empty.
+
+## Design
+
+### Data structures
+
+```c
+#define CELL_ORDER_MIN   2       /* 16KB */
+#define CELL_ORDER_MAX   10      /* 4MB  */
+#define CELL_ORDER_DEF   4       /* 64KB */
+
+struct cell {
+    struct page *pages[1 << CELL_ORDER_MAX]; /* actual count = 1<<order */
+    void         *base;          /* page_address(pages[0]) */
+    u32          next_free;      /* bump pointer, monotonically increasing */
+    u32          live_bytes;     /* decremented on free */
+    u16          live_objects;
+    u16          cellid;
+    u8           order;          /* alloc_pages order */
+    bool         active;         /* current allocation target */
+    struct rw_semaphore lock;    /* readers vs compaction */
+    struct list_head node;       /* in pool's sparse list */
+};
+
+struct cell_pool {
+    spinlock_t        lock;      /* protects active + directory */
+    struct cell       *active;
+    struct cell       *cells;    /* array, indexed by cellid */
+    u16               nr_cells;
+    u16               max_cells;
+    u8                cell_order;
+    bool              use_thp;   /* GFP_TRANSHUGE | __GFP_COMP */
+    struct list_head  sparse;    /* cells eligible for compaction */
+    atomic_long_t     pages_used; /* for stats */
+};
+```
+
+### Location encoding
+
+Each compressed block is addressed by `{cellid, offset, length}`.
+Packed into the entry struct alongside the existing zsmalloc fields:
+
+```c
+struct shmem_comp_entry {
+    /* zsmalloc path */
+    unsigned long handle;
+    unsigned long *handles;
+    unsigned short nchunks;
+    /* cell path */
+    u16 cellid;
+    u32 offset;
+    /* common */
+    unsigned int length;
+    unsigned short nr_pages;
+    atomic_t refs;
+    atomic_t slots;
+    struct shmem_comp_pool *pool;
+    struct rcu_head rcu;
+};
+```
+
+The pool struct gains a `struct cell_pool *cells` field and a
+`bool use_cells` flag. Mount option `cell=N` sets use_cells=true.
+
+### Allocation (bump)
+
+```
+cell_store(pool, data, len) -> {cellid, offset}
+  spin_lock(&cell_pool->lock)
+  if (active->next_free + len > CELL_SIZE)
+      active = cell_pool_new_cell()     /* alloc_pages or THP */
+  off = active->next_free
+  active->next_free += len
+  active->live_bytes += len
+  active->live_objects++
+  spin_unlock
+  memcpy(active->base + off, data, len)
+  return {active->cellid, off}
+```
+
+### Free
+
+```
+cell_free(pool, cellid, offset, length)
+  cell = &cells[cellid]
+  spin_lock(&pool->lock)
+  cell->live_bytes -= length
+  cell->live_objects--
+  if (cell->live_bytes == 0)
+      cell_pool_return(cell)            /* __free_pages, 1<<order pages */
+  else if (cell->live_objects < SPARSE_THRESHOLD)
+      list_add(&cell->node, &pool->sparse)
+  spin_unlock
+```
+
+### Load
+
+```
+cell_load(pool, cellid, offset, dst, len)
+  cell = &cells[cellid]
+  memcpy(dst, cell->base + offset, len)
+```
+
+No bounce buffer. Cells are virtually contiguous (direct map on x86_64),
+so any offset is plain pointer arithmetic.
+
+### Compaction (phase 2, not in initial prototype)
+
+Triggered when active cell is full and no empty cell exists:
+1. Pick sparsest cell from pool->sparse
+2. down_write(&victim->lock) — block readers
+3. For each entry pointing into victim: read, write to active, update entry
+4. Return victim to buddy
+5. up_write(&victim->lock)
+
+## Mount options
+
+| Option | Values | Default | Notes |
+|--------|--------|---------|-------|
+| `compress=` | lz4,zstd,lzo,none | sysfs default | existing |
+| `merge_pages=` | 1..64 | 1 | existing |
+| `compress_threshold=` | bytes | 65536 | existing |
+| `cell=` | 64K,256K,1M,2M,4M | derived from merge | **new** |
+| `thp=` | yes,no | yes (if cell>=1M) | **new** |
+
+Cell size defaults when `cell=` not given:
+- merge=1 → 64K, merge=2 → 128K, merge=4 → 256K
+- merge=8 → 512K, merge=16 → 1M
+
+## Implementation phases
+
+Each phase is a separate git commit, buildable and testable.
+
+### P1: Cell data structures + pool lifecycle
+- Add `struct cell`, `struct cell_pool` to shmem_compress.c
+- `cell_pool_create(order, use_thp)` / `cell_pool_destroy()`
+- No wiring yet — compiles, existing tests pass
+
+### P2: Bump allocation + free
+- `cell_store(pool, data, len)` — bump alloc, memcpy
+- `cell_free(pool, cellid, offset, length)` — dec live_bytes, return empty cells
+- `cell_load(pool, cellid, offset, dst, len)` — memcpy
+- No wiring yet
+
+### P3: Wire into shmem_comp_store/load/free
+- Add `use_cells` flag to `shmem_comp_pool`
+- When true: cell_store/cell_load/cell_free instead of zs_malloc/zs_obj_read/zs_free
+- Entry gets cellid/offset instead of handle/handles
+- Mount option `cell=` enables this path
+
+### P4: Mount options cell= and thp=
+- Parse in shmem_parse_one
+- Store in shmem_options and shmem_sb_info
+- Pass to cell_pool_create
+
+### P5: Sweep verification
+- Run sweep_merge.sh with cell-based storage
+- Compare RAM numbers against zsmalloc baseline
+- Document in results/
+
+### P6: Compaction (if P5 numbers justify it)
+- Sparse cell detection
+- Compaction algorithm
+- Shrinker integration
+
+## Baseline (zsmalloc, current tree)
+
+From sweep_merge_20261006_183047.summary:
+
+| merge | ram_pool | ram_merged | ram_entry | ram_total | compressed_bytes |
+|-------|----------|------------|-----------|-----------|------------------|
+| 1     | 479,232  | 0          | 9,216     | 488,448   | 409,915          |
+| 2     | 606,208  | 1,152      | 4,608     | 611,968   | 407,987          |
+| 4     | 552,960  | 1,152      | 2,304     | 556,416   | 405,974          |
+| 8     | 565,248  | 1,152      | 1,152     | 567,552   | 405,468          |
+| 16    | 454,656  | 896        | 576       | 456,128   | 405,128          |
+
+Target: match or beat ram_total for every merge value, with the biggest
+gains expected at merge=2/4 where zsmalloc chunk overhead is worst.
