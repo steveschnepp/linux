@@ -91,8 +91,9 @@ struct shmem_comp_entry {
 	unsigned short nr_pages;	/* pages merged into this block */
 	atomic_t refs;			/* slots + reader pins; free at zero */
 	atomic_t slots;			/* page cache slots only */
-	void *data;			/* merged-group buffer, entry-owned */
-	struct shmem_comp_pool *pool;	/* owns @handle */
+	unsigned long *handles;		/* zsmalloc chunk handles (merge>1) */
+	unsigned short nchunks;		/* number of zsmalloc chunks */
+	struct shmem_comp_pool *pool;	/* owns @handle / @handles */
 	struct rcu_head rcu;
 };
 
@@ -286,6 +287,55 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 		    unsigned int *len);
 
 /**
+ * shmem_comp_store_merged - Store compressed data as zsmalloc chunks
+ * @pool: Compression pool
+ * @data: Compressed data to store
+ * @len: Data length in bytes (may exceed PAGE_SIZE)
+ * @handles_out: Output array of zsmalloc handles (caller frees)
+ * @nchunks_out: Output number of chunks
+ *
+ * Return: 0 on success, negative errno on failure.
+ *
+ * Splits @data into chunks of at most PAGE_SIZE bytes and stores each
+ * chunk as a separate zsmalloc object. Fills @handles_out (kmalloc'd
+ * array of nchunks handles) and @nchunks_out. On failure, frees any
+ * partially stored chunks and returns an error.
+ */
+int shmem_comp_store_merged(struct shmem_comp_pool *pool,
+			    const void *data, unsigned int len,
+			    unsigned long **handles_out,
+			    unsigned short *nchunks_out);
+
+/**
+ * shmem_comp_load_merged - Load compressed data from zsmalloc chunks
+ * @pool: Compression pool
+ * @handles: Array of zsmalloc handles
+ * @nchunks: Number of handles
+ * @dst: Destination buffer
+ * @len: [in,out] Buffer size on input, data size on output
+ *
+ * Return: 0 on success, negative errno on failure.
+ *
+ * Loads all chunks and concatenates them into @dst.
+ */
+int shmem_comp_load_merged(struct shmem_comp_pool *pool,
+			   const unsigned long *handles,
+			   unsigned short nchunks,
+			   void *dst, unsigned int *len);
+
+/**
+ * shmem_comp_free_merged - Free zsmalloc chunks
+ * @pool: Compression pool
+ * @handles: Array of zsmalloc handles
+ * @nchunks: Number of handles
+ *
+ * Frees all zsmalloc chunks and the handle array itself.
+ */
+void shmem_comp_free_merged(struct shmem_comp_pool *pool,
+			    unsigned long *handles,
+			    unsigned short nchunks);
+
+/**
  * shmem_comp_free - Free compressed data from pool
  * @pool: Compression pool
  * @handle: zsmalloc handle to free
@@ -321,7 +371,9 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
  */
 unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 				    unsigned long handle, unsigned int length,
-				    unsigned short nr_pages, void *data);
+				    unsigned short nr_pages,
+				    unsigned long *handles,
+				    unsigned short nchunks);
 
 /**
  * shmem_comp_entry_get - Pin an entry and copy its fields out
@@ -343,7 +395,8 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
  */
 bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 			  unsigned int *length, unsigned int *nr_pages,
-			  void **data);
+			  unsigned long **handles,
+			  unsigned short *nchunks);
 
 /**
  * shmem_comp_entry_put - Drop a reference taken by shmem_comp_entry_get()

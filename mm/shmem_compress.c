@@ -590,6 +590,90 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 	return 0;
 }
 
+int shmem_comp_store_merged(struct shmem_comp_pool *pool,
+			    const void *data, unsigned int len,
+			    unsigned long **handles_out,
+			    unsigned short *nchunks_out)
+{
+	unsigned short nchunks, i;
+	unsigned int offset;
+	unsigned long *handles;
+
+	if (!pool || !data || len == 0 || !handles_out || !nchunks_out)
+		return -EINVAL;
+
+	nchunks = DIV_ROUND_UP(len, PAGE_SIZE);
+	handles = kmalloc_array(nchunks, sizeof(*handles), GFP_KERNEL);
+	if (!handles)
+		return -ENOMEM;
+
+	offset = 0;
+	for (i = 0; i < nchunks; i++) {
+		unsigned int chunk = min_t(unsigned int, PAGE_SIZE,
+					   len - offset);
+
+		handles[i] = shmem_comp_store(pool,
+					      (const char *)data + offset,
+					      chunk);
+		if (!handles[i]) {
+			/* free already-stored chunks */
+			unsigned short j;
+
+			for (j = 0; j < i; j++)
+				shmem_comp_free(pool, handles[j]);
+			kfree(handles);
+			return -ENOMEM;
+		}
+		offset += chunk;
+	}
+
+	*handles_out = handles;
+	*nchunks_out = nchunks;
+	return 0;
+}
+
+int shmem_comp_load_merged(struct shmem_comp_pool *pool,
+			   const unsigned long *handles,
+			   unsigned short nchunks,
+			   void *dst, unsigned int *len)
+{
+	unsigned short i;
+	unsigned int offset;
+
+	if (!pool || !handles || !dst || !len || nchunks == 0)
+		return -EINVAL;
+
+	offset = 0;
+	for (i = 0; i < nchunks; i++) {
+		unsigned int chunk = min_t(unsigned int, PAGE_SIZE,
+					   *len - offset);
+		int ret;
+
+		ret = shmem_comp_load(pool, handles[i],
+				      (char *)dst + offset, &chunk);
+		if (ret)
+			return ret;
+		offset += chunk;
+	}
+
+	*len = offset;
+	return 0;
+}
+
+void shmem_comp_free_merged(struct shmem_comp_pool *pool,
+			    unsigned long *handles,
+			    unsigned short nchunks)
+{
+	unsigned short i;
+
+	if (!pool || !handles)
+		return;
+
+	for (i = 0; i < nchunks; i++)
+		shmem_comp_free(pool, handles[i]);
+	kfree(handles);
+}
+
 /**
  * shmem_comp_free - Free compressed data from pool
  * @pool: Compression pool
@@ -651,20 +735,23 @@ static void shmem_comp_entry_free(unsigned int id)
 	 * object; do it before kfree/kfree_rcu). */
 	atomic_dec(&shmem_comp_ram_entries);
 	atomic_long_sub(ksize(ent), &shmem_comp_ram_entry_bytes);
-	if (ent->data)
-		atomic_long_sub(ksize(ent->data),
+	if (ent->handles)
+		atomic_long_sub(ksize(ent->handles),
 				 &shmem_comp_ram_merged_bytes);
 
-	/* The entry owns its zsmalloc block and merged buffer. */
+	/* The entry owns its zsmalloc block(s) and handle array. */
 	if (ent->handle)
 		shmem_comp_free(ent->pool, ent->handle);
-	kfree(ent->data);
+	if (ent->handles)
+		shmem_comp_free_merged(ent->pool, ent->handles,
+				       ent->nchunks);
 	kfree_rcu(ent, rcu);
 }
 
 bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 			  unsigned int *length, unsigned int *nr_pages,
-			  void **data)
+			  unsigned long **handles,
+			  unsigned short *nchunks)
 {
 	struct shmem_comp_entry *ent;
 	bool found = false;
@@ -680,8 +767,10 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 			*length = ent->length;
 		if (nr_pages)
 			*nr_pages = ent->nr_pages;
-		if (data)
-			*data = ent->data;
+		if (handles)
+			*handles = ent->handles;
+		if (nchunks)
+			*nchunks = ent->nchunks;
 		found = true;
 	}
 	rcu_read_unlock();
@@ -736,7 +825,9 @@ bool shmem_comp_entry_release(unsigned int id)
 
 unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 				    unsigned long handle, unsigned int length,
-				    unsigned short nr_pages, void *data)
+				    unsigned short nr_pages,
+				    unsigned long *handles,
+				    unsigned short nchunks)
 {
 	struct shmem_comp_entry *ent;
 	unsigned int id;
@@ -749,7 +840,8 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 	ent->handle = handle;
 	ent->length = length;
 	ent->nr_pages = nr_pages;
-	ent->data = data;
+	ent->handles = handles;
+	ent->nchunks = nchunks;
 	ent->pool = pool;
 	atomic_set(&ent->refs, nr_pages);
 	atomic_set(&ent->slots, nr_pages);
@@ -771,11 +863,12 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 		return 0;
 	}
 
-	/* Live RAM footprint: slab-rounded entry + merged buffer size */
+	/* Live RAM footprint: slab-rounded entry + handle array size */
 	atomic_inc(&shmem_comp_ram_entries);
 	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
-	if (data)
-		atomic_long_add(ksize(data), &shmem_comp_ram_merged_bytes);
+	if (handles)
+		atomic_long_add(ksize(handles),
+				 &shmem_comp_ram_merged_bytes);
 
 	return id;
 }

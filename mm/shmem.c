@@ -1039,7 +1039,7 @@ static long shmem_free_swap(struct address_space *mapping,
 			 * when the last reference of any kind drops.
 			 */
 			got = shmem_comp_entry_get(id, NULL, &length,
-						   &entry_nr, NULL);
+						   &entry_nr, NULL, NULL);
 			last = shmem_comp_entry_release(id);
 			if (got)
 				shmem_comp_entry_put(id);
@@ -2381,18 +2381,40 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
-	 * Pin the entry: cbuf is entry-owned and stays valid until the
-	 * matching put() below, even if truncate erases every slot of
-	 * the group in between. Error paths must put, never free cbuf.
+	 * Pin the entry: the handle array is entry-owned and stays
+	 * valid until the matching put() below, even if truncate
+	 * erases every slot of the group in between.
 	 */
-	if (!shmem_comp_entry_get(id, NULL, NULL, NULL, &cbuf) || !cbuf) {
-		if (cbuf)
+	{
+		unsigned long *handles = NULL;
+		unsigned short nchunks = 0;
+
+		if (!shmem_comp_entry_get(id, NULL, NULL, NULL,
+					   &handles, &nchunks) ||
+		    !handles) {
+			if (handles)
+				shmem_comp_entry_put(id);
+			return -ENOENT;
+		}
+
+		cbuf = kmalloc(comp_len, GFP_KERNEL);
+		if (!cbuf) {
 			shmem_comp_entry_put(id);
-		return -ENOENT;
+			return -ENOMEM;
+		}
+
+		ret = shmem_comp_load_merged(sbinfo->comp_pool, handles,
+					      nchunks, cbuf, &comp_len);
+		if (ret) {
+			kfree(cbuf);
+			shmem_comp_entry_put(id);
+			return ret;
+		}
 	}
 
 	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
 	if (!dbuf) {
+		kfree(cbuf);
 		shmem_comp_entry_put(id);
 		return -ENOMEM;
 	}
@@ -2401,6 +2423,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	ret = shmem_comp_decompress(sbinfo->comp_pool, cbuf, comp_len,
 				    dbuf, &dlen);
 	if (ret) {
+		kfree(cbuf);
 		kfree(dbuf);
 		shmem_comp_entry_put(id);
 		return ret;
@@ -2471,10 +2494,12 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
 				comp_len);
 
-	/* Drop the pin: entry teardown (zsmalloc block + cbuf) runs
-	 * here if the slice loop consumed every slot reference. */
+	/* Drop the pin: entry teardown (zsmalloc chunks + handle
+	 * array) runs here if the slice loop consumed every slot
+	 * reference. */
 	shmem_comp_entry_put(id);
 
+	kfree(cbuf);
 	kfree(dbuf);
 	return *foliop ? 0 : ret;
 }
@@ -2576,17 +2601,31 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	}
 
 	/*
-	 * zsmalloc caps objects at PAGE_SIZE, so a merged block that
-	 * may exceed that lives in the kmalloc buffer itself; entry
-	 * ownership transfers here and the buffer is freed when the
-	 * last slot releases the entry.
+	 * Store the compressed group in zsmalloc as chunks of at most
+	 * PAGE_SIZE each. The handle array is kmalloc'd and owned by
+	 * the entry; it is freed when the last slot releases the entry.
 	 */
-	id = shmem_comp_entry_alloc(sbinfo->comp_pool, 0, comp_len, nr, cbuf);
-	if (!id) {
-		ret = 0;
-		goto cleanup;	/* cbuf freed below */
+	{
+		unsigned long *handles = NULL;
+		unsigned short nchunks = 0;
+
+		ret = shmem_comp_store_merged(sbinfo->comp_pool,
+					      cbuf, comp_len,
+					      &handles, &nchunks);
+		if (ret) {
+			ret = 0;
+			goto cleanup;	/* cbuf freed below */
+		}
+		id = shmem_comp_entry_alloc(sbinfo->comp_pool, 0,
+					     comp_len, nr,
+					     handles, nchunks);
+		if (!id) {
+			shmem_comp_free_merged(sbinfo->comp_pool,
+					       handles, nchunks);
+			ret = 0;
+			goto cleanup;	/* cbuf freed below */
+		}
 	}
-	cbuf = NULL;	/* owned by the entry now */
 
 	/*
 	 * Compressed slots are accounted like swap pages: raise
@@ -2677,7 +2716,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	 */
 	id = shmem_comp_entry_id(comp_entry);
 	if (!shmem_comp_entry_get(id, &handle, &comp_len, &nr_pages,
-				    NULL))
+				   NULL, NULL))
 		return -ENOENT;
 
 	/*
@@ -2893,7 +2932,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * The entry owns the handle from here (freed with the entry).
 	 */
 	id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle, comp_len,
-				    1, NULL);
+				    1, NULL, 0);
 	if (!id) {
 		shmem_comp_free(sbinfo->comp_pool, handle);
 		folio_unlock(folio);
