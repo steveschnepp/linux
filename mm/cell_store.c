@@ -1,14 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * cell_store.c - FTL-inspired bump allocator for tmpfs compression
+ * cell_store.c - Bump allocator for compressed data blocks
  *
- * Cells are bump-allocated arenas for compressed blocks.  Zero
- * per-object overhead.  Empty cells return to buddy immediately.
+ * See cell_store.h for the design invariants.  This file implements
+ * the pool lifecycle (create/destroy), the bump allocation path, and
+ * the free path that returns empty cells to the buddy allocator.
+ *
+ * Locking model:
+ *   - cp->lock (spinlock) protects the active pointer, the cell
+ *     directory, and per-cell counters.  It is never held across a
+ *     memcpy, a page allocator call, or any operation that might sleep.
+ *   - Per-cell rwsem (c->lock) is reserved for compaction.  Readers
+ *     take it for shared access; compaction takes it exclusively
+ *     before evacuating a cell.  It is not used on the hot store/load
+ *     paths — those rely on the entry reference pin to keep the cell
+ *     alive.
  */
 
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/cell_store.h>
+
+#define cell_dbg(fmt, ...) \
+	pr_debug("cell_store: " fmt "\n", ##__VA_ARGS__)
 
 static gfp_t cell_gfp(struct cell_pool *cp)
 {
@@ -17,15 +31,6 @@ static gfp_t cell_gfp(struct cell_pool *cp)
 	return GFP_KERNEL | __GFP_NOWARN;
 }
 
-/*
- * cell_pool_create - Allocate a cell pool with fixed-order cells
- * @order: alloc_pages order per cell (2..10)
- * @use_thp: allocate from THP zones when possible
- *
- * Returns NULL on allocation failure.  Caller must free with
- * cell_pool_destroy().  The pool starts with zero cells; the first
- * cell_pool_new_cell() call allocates the active cell on demand.
- */
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 {
 	struct cell_pool *cp;
@@ -41,7 +46,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 	INIT_LIST_HEAD(&cp->sparse);
 	cp->cell_order = order;
 	cp->use_thp = use_thp;
-	cp->max_cells = 256;	/* soft cap; grows on demand */
+	cp->max_cells = 256;
 	cp->cells = kvcalloc(cp->max_cells, sizeof(struct cell),
 			      GFP_KERNEL);
 	if (!cp->cells) {
@@ -49,22 +54,22 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 		return NULL;
 	}
 
+	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d",
+		 order, (PAGE_SIZE << order) / 1024, use_thp);
+
 	return cp;
 }
 
-/*
- * cell_pool_destroy - Free all cells and the pool itself
- * @cp: pool to destroy
- *
- * Returns every cell's pages to the buddy allocator and frees the
- * pool.  Must not be called while any entry still references a cell.
- */
 void cell_pool_destroy(struct cell_pool *cp)
 {
 	u16 i;
 
 	if (!cp)
 		return;
+
+	cell_dbg("destroy pool: %u cells, order=%u, %ld pages",
+		 cp->nr_cells, cp->cell_order,
+		 atomic_long_read(&cp->pages_used));
 
 	for (i = 0; i < cp->nr_cells; i++) {
 		struct cell *c = &cp->cells[i];
@@ -78,12 +83,12 @@ void cell_pool_destroy(struct cell_pool *cp)
 }
 
 /*
- * cell_pool_new_cell - Allocate a new cell and make it active
- * @cp: pool
+ * Allocate one cell of cell_order pages and install it as the active
+ * allocation target.  Must be called with cp->lock held.
  *
- * Called with cp->lock held.  Allocates one cell of cell_order pages
- * from the buddy allocator (THP-backed when use_thp is set).  Returns
- * the new active cell, or NULL on allocation failure.
+ * Returns NULL when the directory is full or the page allocator
+ * cannot satisfy the request.  The caller treats this as -ENOMEM;
+ * the compression path falls back to leaving pages uncompressed.
  */
 static struct cell *cell_pool_new_cell(struct cell_pool *cp)
 {
@@ -116,16 +121,22 @@ static struct cell *cell_pool_new_cell(struct cell_pool *cp)
 	cp->active = c;
 	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
 
+	cell_dbg("new cell %u: base=%p order=%u (%lu KiB)",
+		 id, c->base, cp->cell_order,
+		 (PAGE_SIZE << cp->cell_order) / 1024);
+
 	return c;
 }
 
 /*
- * cell_pool_return - Release a cell's pages to the buddy allocator
- * @cp: pool
- * @c: cell to release (must have live_bytes == 0)
+ * Release a cell's pages back to the buddy allocator.  Must be called
+ * with cp->lock held and only when the cell has zero live bytes.
  *
- * Called with cp->lock held.  Clears the cell slot so it can be
- * reused by the next cell_pool_new_cell().
+ * The pages are freed synchronously — no deferred work, no RCU grace
+ * period.  This is safe because the caller guarantees no entry still
+ * references the cell (live_bytes reached zero through the normal
+ * free path, which runs after the last entry is erased from the
+ * global entry table).
  */
 static void cell_pool_return(struct cell_pool *cp, struct cell *c)
 {
@@ -140,26 +151,14 @@ static void cell_pool_return(struct cell_pool *cp, struct cell *c)
 
 	atomic_long_sub(1UL << c->order, &cp->pages_used);
 
-	/* If the active cell was returned, the next alloc creates a new one */
+	cell_dbg("return cell %u: freed %lu KiB, %ld pages left",
+		 c->cellid, (PAGE_SIZE << c->order) / 1024,
+		 atomic_long_read(&cp->pages_used));
+
 	if (cp->active == c)
 		cp->active = NULL;
 }
 
-/*
- * cell_store - Bump-allocate space in the active cell and copy data
- * @cp: cell pool
- * @data: source buffer
- * @len: data length in bytes
- * @cellid_out: output cell ID
- * @offset_out: output offset within cell
- *
- * Return: 0 on success, -ENOMEM if no cell could be allocated.
- *
- * Called without cp->lock.  Takes the lock internally for the bump
- * allocation, releases it, then does the memcpy.  The caller must
- * ensure @data remains valid until the memcpy completes (the entry
- * pin guarantees this in the compression path).
- */
 int cell_store(struct cell_pool *cp, const void *data,
 	       unsigned int len, u16 *cellid_out, u32 *offset_out)
 {
@@ -184,27 +183,25 @@ int cell_store(struct cell_pool *cp, const void *data,
 
 	spin_unlock(&cp->lock);
 
+	/*
+	 * The lock is released before the memcpy to avoid holding a
+	 * spinlock across a potentially large copy.  The bump pointer
+	 * has already reserved the space, so no other CPU can write
+	 * into this region.  The caller must keep @data valid until
+	 * this memcpy completes.
+	 */
 	memcpy(c->base + off, data, len);
+
+	cell_dbg("store: cell=%u offset=%u len=%u (next_free=%u/%lu, %u objects)",
+		 c->cellid, off, len,
+		 c->next_free, (1UL << c->order) * PAGE_SIZE,
+		 c->live_objects);
 
 	*cellid_out = c->cellid;
 	*offset_out = off;
 	return 0;
 }
 
-/*
- * cell_free - Mark a block as freed within its cell
- * @cp: cell pool
- * @cellid: cell containing the block
- * @offset: offset within cell (unused for bookkeeping, kept for
- *          future per-block tracking and for compaction's use)
- * @len: block length in bytes
- *
- * Decrements live_bytes and live_objects.  When live_bytes drops to
- * zero the cell's pages are returned to the buddy allocator
- * immediately — the user sees MemFree increase without waiting for
- * compaction.  Sparse cells (few live objects) are added to the
- * pool's evacuation list.
- */
 void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	       unsigned int len)
 {
@@ -226,11 +223,12 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	c->live_bytes -= len;
 	c->live_objects--;
 
+	cell_dbg("free: cell=%u offset=%u len=%u (live_bytes=%u, objects=%u)",
+		 cellid, offset, len, c->live_bytes, c->live_objects);
+
 	if (c->live_bytes == 0) {
-		/* Cell fully empty — return to buddy immediately */
 		cell_pool_return(cp, c);
 	} else if (c->live_objects < CELL_SPARSE_THRESHOLD) {
-		/* Sparse — eligible for evacuation */
 		if (list_empty(&c->node))
 			list_add(&c->node, &cp->sparse);
 	}
@@ -238,21 +236,6 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	spin_unlock(&cp->lock);
 }
 
-/*
- * cell_load - Read a block from a cell into a destination buffer
- * @cp: cell pool
- * @cellid: cell containing the block
- * @offset: offset within cell
- * @dst: destination buffer
- * @len: [in,out] buffer size on input, data size on output
- *
- * Return: 0 on success, -EINVAL if the cell is not valid.
- *
- * Cells are virtually contiguous (direct map), so this is a plain
- * memcpy regardless of page boundaries within the cell.  No bounce
- * buffer, no kmap.  The caller must hold the entry pin to ensure
- * the cell has not been freed.
- */
 int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 	      void *dst, unsigned int *len)
 {
@@ -273,6 +256,15 @@ int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 	if (offset + *len > cell_size)
 		*len = cell_size - offset;
 
+	/*
+	 * No kmap or bounce buffer: the cell's pages are physically
+	 * contiguous (single alloc_pages call), so the direct map
+	 * gives us a single virtual range.  A block that spans a page
+	 * boundary within the cell is still a single memcpy.
+	 */
 	memcpy(dst, c->base + offset, *len);
+
+	cell_dbg("load: cell=%u offset=%u len=%u", cellid, offset, *len);
+
 	return 0;
 }

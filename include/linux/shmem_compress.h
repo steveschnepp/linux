@@ -3,6 +3,7 @@
 #define __LINUX_SHMEM_COMPRESS_H
 
 struct shmem_comp_pool;
+struct cell_pool;
 
 /*
  * shmem_compress.h - Internal interfaces for tmpfs transparent compression
@@ -86,16 +87,82 @@ struct shmem_comp_pool;
  * the small ID via make_shmem_comp_entry().
  */
 struct shmem_comp_entry {
-	unsigned long handle;		/* zsmalloc handle */
+	/*
+	 * Storage location.  For zsmalloc-backed pools this is a
+	 * zs_malloc() handle.  For cell-backed pools it encodes
+	 * {cellid, offset} — the two fields fit in one unsigned long
+	 * because cellid is 16 bits and offset is bounded by the cell
+	 * size (max 4 MiB = 22 bits).  Reusing the handle field avoids
+	 * growing every entry by the size of a second pointer, which
+	 * matters because the entry table is proportional to the number
+	 * of compressed blocks in the system.
+	 *
+	 * pool->use_cells determines which interpretation applies.  A
+	 * pool never switches backing store after creation, so the
+	 * interpretation is stable for the lifetime of the entry.
+	 */
+	unsigned long handle;
 	unsigned int length;		/* compressed size in bytes */
 	unsigned short nr_pages;	/* pages merged into this block */
-	atomic_t refs;			/* slots + reader pins; free at zero */
-	atomic_t slots;			/* page cache slots only */
-	unsigned long *handles;		/* zsmalloc chunk handles (merge>1) */
-	unsigned short nchunks;		/* number of zsmalloc chunks */
-	struct shmem_comp_pool *pool;	/* owns @handle / @handles */
+	/*
+	 * Two-counter reference scheme:
+	 *   slots  — page-cache xarray slots that point at this entry.
+	 *            Decrement when a slot is cleared (truncate,
+	 *            decompress-after-read, file deletion).
+	 *   refs   — slots plus temporary pins taken by readers during
+	 *            decompression.  The entry (and its storage) is
+	 *            freed when refs reaches zero.
+	 *
+	 * The separation exists because a reader must pin the entry
+	 * before loading from storage, but the page-cache slot may be
+	 * cleared concurrently by truncate.  If a single counter were
+	 * used, truncate could free the entry while a reader is mid-
+	 * decompress.  With two counters, truncate decrements only
+	 * slots; the reader's pin on refs keeps the entry alive until
+	 * the decompress completes.
+	 */
+	atomic_t refs;
+	atomic_t slots;
+	/*
+	 * Merged-group zsmalloc chunks.  When merge_pages > 1 and the
+	 * pool is zsmalloc-backed, the compressed group is split into
+	 * PAGE_SIZE chunks, each stored as a separate zs_malloc()
+	 * object.  @handles is a kmalloc'd array of those handles,
+	 * owned by the entry and freed with it.  Cell-backed pools
+	 * store merged groups as a single block, so handles/nchunks
+	 * are unused (NULL/0) in that case.
+	 */
+	unsigned long *handles;
+	unsigned short nchunks;
+	/*
+	 * The pool that owns the storage.  Needed at free time to
+	 * dispatch to the correct release function (zs_free vs
+	 * cell_free) and to look up the compression context for
+	 * decompression.
+	 */
+	struct shmem_comp_pool *pool;
 	struct rcu_head rcu;
 };
+
+/*
+ * Encode/decode a cell location into the handle field.
+ *
+ * The packing is lossless because cellid never exceeds 16 bits
+ * (max_cells is 256) and offset never exceeds 22 bits (max cell
+ * size is 4 MiB).  The shift constants are fixed, not derived from
+ * the struct layout, so they are stable across compiler versions.
+ */
+static inline unsigned long shmem_comp_pack_loc(u16 cellid, u32 offset)
+{
+	return ((unsigned long)cellid << 32) | offset;
+}
+
+static inline void shmem_comp_unpack_loc(unsigned long handle,
+					 u16 *cellid, u32 *offset)
+{
+	*cellid = handle >> 32;
+	*offset = handle & 0xFFFFFFFFUL;
+}
 
 /**
  * struct shmem_comp_stats - Compression statistics
@@ -223,6 +290,15 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
  * Note: The caller must ensure no other references exist to the pool.
  */
 void shmem_comp_pool_destroy(struct shmem_comp_pool *pool);
+
+/*
+ * Accessors for pool storage-backend queries.  The struct
+ * shmem_comp_pool definition is private to shmem_compress.c; these
+ * let callers dispatch without pulling zsmalloc/cell headers into
+ * every translation unit.
+ */
+bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
+struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
 
 /**
  * shmem_comp_compress - Compress a block of memory
@@ -434,6 +510,7 @@ bool shmem_comp_entry_release(unsigned int id);
  * Populates the stats structure with current compression metrics.
  */
 void shmem_comp_get_stats(struct shmem_comp_stats *stats);
+int shmem_comp_cell_stats_show(char *buf, size_t size);
 
 /**
  * shmem_comp_update_stats - Update compression statistics

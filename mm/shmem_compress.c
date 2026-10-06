@@ -83,12 +83,15 @@ struct shmem_comp_pcpu {
  * When refcount reaches zero, the pool is destroyed.
  */
 struct shmem_comp_pool {
-	struct zs_pool *zs_pool;		/* zsmalloc storage pool */
-	struct cell_pool *cells;		/* cell storage pool (NULL if zsmalloc) */
-	bool use_cells;			/* true = cell storage, false = zsmalloc */
-	struct shmem_comp_pcpu __percpu *pcpu;	/* per-CPU contexts */
+	/*
+	 * Storage backing.  Exactly one of zs_pool / cells is non-NULL;	 * use_cells selects which.  The choice is made at pool creation
+	 * time (driven by the cell= mount option) and never changes.	 * Both backends implement the same store/load/free contract:	 * store returns an opaque handle, load copies data out, free	 * releases the storage.  Callers dispatch on use_cells without	 * needing to know which backend is active.	 */
+	struct zs_pool *zs_pool;		/* zsmalloc storage, NULL if cell-backed */
+	struct cell_pool *cells;		/* cell storage, NULL if zsmalloc-backed */
+	bool use_cells;
+	struct shmem_comp_pcpu __percpu *pcpu;	/* per-CPU compression contexts */
 	char algo_name[CRYPTO_MAX_ALG_NAME];	/* algorithm name */
-	atomic_t refcount;			/* reference count */
+	atomic_t refcount;			/* shared across mounts using this pool */
 	struct list_head list;			/* global pools list */
 };
 
@@ -337,6 +340,16 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 	kfree(pool);
 }
 
+bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool)
+{
+	return pool && pool->use_cells;
+}
+
+struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool)
+{
+	return pool ? pool->cells : NULL;
+}
+
 /**
  * shmem_comp_pool_put - Release reference to a pool
  * @pool: Pool to release
@@ -554,9 +567,26 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	if (!pool || !data || len == 0 || len > PAGE_SIZE)
 		return 0;
 
-	/* Use non-blocking allocation to avoid sleeping */
-	gfp = GFP_NOWAIT | __GFP_NOWARN;
+	/*
+	 * Cell storage: the bump allocator returns a packed
+	 * {cellid, offset} location.  No bounce buffer, no zsmalloc
+	 * handle — the data lands directly in the cell at the exact
+	 * offset returned.
+	 *
+	 * Cell storage rejects len > PAGE_SIZE because a merged group
+	 * that exceeds a single page would need multi-cell allocation,	 * which the bump pointer cannot express.  Merged groups are	 * sized to fit (merge_pages * PAGE_SIZE is the upper bound on	 * compressed size), so this rejection is unreachable in	 * practice.
+	 */
+	if (pool->use_cells) {
+		u16 cellid;
+		u32 offset;
 
+		if (cell_store(pool->cells, data, len, &cellid, &offset))
+			return 0;
+		return shmem_comp_pack_loc(cellid, offset);
+	}
+
+	/* zsmalloc path: GFP_NOWAIT because the caller may hold locks */
+	gfp = GFP_NOWAIT | __GFP_NOWARN;
 	handle = zs_malloc(pool->zs_pool, len, gfp, NUMA_NO_NODE);
 	if (!handle)
 		return 0;
@@ -588,11 +618,25 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 		return -EINVAL;
 
 	/*
-	 * zs_obj_read_begin() writes into the caller-provided
-	 * @local_copy bounce buffer when the object spans two pages of
-	 * its zspage. Allocate one sized to the compressed length so
-	 * both the contained and spanning cases work. (Passing NULL
-	 * caused a NULL pointer dereference for spanning objects.)
+	 * Cell storage: the handle encodes {cellid, offset}.  The
+	 * entry reference pin held by the caller guarantees the cell
+	 * has not been returned to the buddy allocator.
+	 */
+	if (pool->use_cells) {
+		u16 cellid;
+		u32 offset;
+
+		shmem_comp_unpack_loc(handle, &cellid, &offset);
+		return cell_load(pool->cells, cellid, offset, dst, len);
+	}
+
+	/*
+	 * zsmalloc path.  zs_obj_read_begin() returns a direct pointer
+	 * when the object is contained within one page of its zspage,
+	 * or copies into a bounce buffer when it spans two pages.  The
+	 * bounce buffer is necessary because the two pages of a zspage
+	 * are not virtually contiguous — unlike cell storage, where
+	 * the pages come from a single alloc_pages() call.
 	 */
 	bounce = kmalloc(*len, GFP_KERNEL);
 	if (!bounce)
@@ -606,7 +650,6 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 
 	memcpy(dst, src, *len);
 
-	/* In the contained case src is a kmap address and gets unmapped */
 	zs_obj_read_end(pool->zs_pool, handle, *len, src);
 	kfree(bounce);
 
@@ -762,9 +805,23 @@ static void shmem_comp_entry_free(unsigned int id)
 		atomic_long_sub(ksize(ent->handles),
 				 &shmem_comp_ram_merged_bytes);
 
-	/* The entry owns its zsmalloc block(s) and handle array. */
-	if (ent->handle)
-		shmem_comp_free(ent->pool, ent->handle);
+	/*
+	 * Release the backing storage.  Cell storage needs the block
+	 * length to decrement live_bytes, which is why cell_free() is
+	 * called directly here rather than through shmem_comp_free().	 * The zsmalloc free path does not need the length — zs_free()	 * recovers it from the size class encoded in the handle.	 */
+	if (ent->handle) {
+		if (ent->pool->use_cells) {
+			u16 cellid;
+			u32 offset;
+
+			shmem_comp_unpack_loc(ent->handle,
+					      &cellid, &offset);
+			cell_free(ent->pool->cells, cellid, offset,
+				  ent->length);
+		} else {
+			shmem_comp_free(ent->pool, ent->handle);
+		}
+	}
 	if (ent->handles)
 		shmem_comp_free_merged(ent->pool, ent->handles,
 				       ent->nchunks);
@@ -941,13 +998,71 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 	 * shrinker under pressure), so this is RAM *held*, not RAM in use.
 	 */
 	spin_lock(&shmem_comp_pools_lock);
-	list_for_each_entry(pool, &shmem_comp_pools, list)
-		pool_pages += zs_get_total_pages(pool->zs_pool);
+	list_for_each_entry(pool, &shmem_comp_pools, list) {
+		if (pool->use_cells)
+			pool_pages += atomic_long_read(&pool->cells->pages_used);
+		else if (pool->zs_pool)
+			pool_pages += zs_get_total_pages(pool->zs_pool);
+	}
 	spin_unlock(&shmem_comp_pools_lock);
 
 	stats->ram_pool_bytes = pool_pages << PAGE_SHIFT;
 	stats->ram_total_bytes = stats->ram_pool_bytes +
 		stats->ram_merged_bytes + stats->ram_entry_bytes;
+}
+
+/**
+ * shmem_comp_cell_stats_show - Fill buffer with cell pool statistics
+ * @buf: output buffer
+ * @size: buffer size
+ *
+ * Return: number of bytes written (sysfs convention).
+ *
+ * Iterates all pools with cell storage and dumps per-cell state:
+ * cellid, offset, live_bytes, live_objects, active/sparse flags.
+ */
+int shmem_comp_cell_stats_show(char *buf, size_t size)
+{
+	struct shmem_comp_pool *pool;
+	size_t off = 0;
+	int pool_id = 0;
+
+	spin_lock(&shmem_comp_pools_lock);
+	list_for_each_entry(pool, &shmem_comp_pools, list) {
+		struct cell_pool *cp = pool->cells;
+		u16 i;
+
+		if (!pool->use_cells || !cp)
+			continue;
+
+		off += scnprintf(buf + off, size - off,
+			"pool %d: order=%u use_thp=%d nr_cells=%u pages_used=%ld\n",
+			pool_id, cp->cell_order, cp->use_thp,
+			cp->nr_cells, atomic_long_read(&cp->pages_used));
+
+		for (i = 0; i < cp->nr_cells; i++) {
+			struct cell *c = &cp->cells[i];
+
+			if (!c->pages[0])
+				continue;
+
+			off += scnprintf(buf + off, size - off,
+				"  cell %u: offset=%u/%lu live=%u/%u %s%s\n",
+				c->cellid, c->next_free,
+				(1UL << c->order) * PAGE_SIZE,
+				c->live_objects, c->live_bytes,
+				c->active ? "ACTIVE" : "",
+				list_empty(&c->node) ? "" : " SPARSE");
+
+			if (off >= size - 1)
+				break;
+		}
+
+		pool_id++;
+	}
+	spin_unlock(&shmem_comp_pools_lock);
+
+	return off;
 }
 
 /**

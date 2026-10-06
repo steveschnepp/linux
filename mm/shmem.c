@@ -2383,11 +2383,36 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
-	 * Pin the entry: the handle array is entry-owned and stays
-	 * valid until the matching put() below, even if truncate
-	 * erases every slot of the group in between.
+	 * Load the compressed data.  Cell storage reads the entire
+	 * group in one cell_load() call; zsmalloc loads chunk by
+	 * chunk through the handle array.
 	 */
-	{
+	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool)) {
+		unsigned long handle = 0;
+		u16 cellid;
+		u32 offset;
+
+		if (!shmem_comp_entry_get(id, &handle, NULL, NULL,
+					   NULL, NULL) || !handle) {
+			if (handle)
+				shmem_comp_entry_put(id);
+			return -ENOENT;
+		}
+		shmem_comp_unpack_loc(handle, &cellid, &offset);
+
+		cbuf = kmalloc(comp_len, GFP_KERNEL);
+		if (!cbuf) {
+			shmem_comp_entry_put(id);
+			return -ENOMEM;
+		}
+		ret = cell_load(shmem_comp_pool_cells(sbinfo->comp_pool),
+				cellid, offset, cbuf, &comp_len);
+		if (ret) {
+			kfree(cbuf);
+			shmem_comp_entry_put(id);
+			return ret;
+		}
+	} else {
 		unsigned long *handles = NULL;
 		unsigned short nchunks = 0;
 
@@ -2603,11 +2628,31 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	}
 
 	/*
-	 * Store the compressed group in zsmalloc as chunks of at most
-	 * PAGE_SIZE each. The handle array is kmalloc'd and owned by
-	 * the entry; it is freed when the last slot releases the entry.
+	 * Store the compressed group.  Cell storage uses a single
+	 * block allocation — the entire group fits in one cell region
+	 * and avoids the per-chunk handle array.  Zsmalloc chunks the
+	 * group because ZS_MAX_ALLOC_SIZE is PAGE_SIZE; cell storage
+	 * has no such limit (cells are up to 4 MiB).
 	 */
-	{
+	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool)) {
+		unsigned long handle;
+
+		handle = shmem_comp_store(sbinfo->comp_pool,
+					   cbuf, comp_len);
+		if (!handle) {
+			ret = 0;
+			goto cleanup;
+		}
+		id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle,
+					     comp_len, nr, NULL, 0);
+		if (!id) {
+			cell_free(shmem_comp_pool_cells(sbinfo->comp_pool),
+				  handle >> 32, handle & 0xFFFFFFFFUL,
+				  comp_len);
+			ret = 0;
+			goto cleanup;
+		}
+	} else {
 		unsigned long *handles = NULL;
 		unsigned short nchunks = 0;
 
@@ -2616,7 +2661,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 					      &handles, &nchunks);
 		if (ret) {
 			ret = 0;
-			goto cleanup;	/* cbuf freed below */
+			goto cleanup;
 		}
 		id = shmem_comp_entry_alloc(sbinfo->comp_pool, 0,
 					     comp_len, nr,
@@ -2625,7 +2670,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 			shmem_comp_free_merged(sbinfo->comp_pool,
 					       handles, nchunks);
 			ret = 0;
-			goto cleanup;	/* cbuf freed below */
+			goto cleanup;
 		}
 	}
 
@@ -6422,11 +6467,19 @@ static struct kobj_attribute merge_pages_attr = __ATTR(merge_pages, 0644,
 
 static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
 
+static ssize_t cell_stats_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return shmem_comp_cell_stats_show(buf, PAGE_SIZE);
+}
+static struct kobj_attribute cell_stats_attr = __ATTR_RO(cell_stats);
+
 static struct attribute *tmpfs_comp_attrs[] = {
 	&compression_attr.attr,
 	&compressor_attr.attr,
 	&merge_pages_attr.attr,
 	&comp_stats_attr.attr,
+	&cell_stats_attr.attr,
 	NULL,
 };
 
