@@ -1044,9 +1044,8 @@ static long shmem_free_swap(struct address_space *mapping,
 			if (got)
 				shmem_comp_entry_put(id);
 			if (last && got) {
-				atomic_long_dec(&sbinfo->comp_pages);
-				atomic_long_sub((unsigned long)entry_nr *
-						PAGE_SIZE,
+				atomic_long_sub(entry_nr, &sbinfo->comp_pages);
+				atomic_long_sub(length,
 						&sbinfo->comp_bytes);
 				shmem_comp_update_stats(false,
 							entry_nr * PAGE_SIZE,
@@ -2467,7 +2466,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	}
 
 	/* One group decompressed: update accounting once */
-	atomic_long_dec(&sbinfo->comp_pages);
+	atomic_long_sub(nr_pages, &sbinfo->comp_pages);
 	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
 	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
 				comp_len);
