@@ -135,6 +135,7 @@ struct shmem_options {
 	unsigned int comp_threshold; /* Min file size to compress */
 	unsigned int comp_merge;     /* pages per compression group */
 	unsigned int comp_cell_order; /* cell storage: alloc_pages order, 0=zsmalloc */
+	bool comp_cell_seen;        /* cell= was given (incl. cell=0 opt-out) */
 #endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
@@ -5626,6 +5627,7 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		/* cell=0 explicitly opts out of cell storage */
 		if (bytes == 0) {
 			ctx->comp_cell_order = 0;
+			ctx->comp_cell_seen = true;
 			ctx->seen |= SHMEM_SEEN_COMPRESS;
 			break;
 		}
@@ -5635,6 +5637,7 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 			goto bad_value;
 		order = ilog2(bytes / PAGE_SIZE);
 		ctx->comp_cell_order = order;
+		ctx->comp_cell_seen = true;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	}
@@ -6064,9 +6067,12 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 			 * to keep ~10-30 blocks per cell.
 			 *
 			 * Explicit cell= always wins.  cell=0 opts out of
-			 * cell storage entirely (zsmalloc backend).
+			 * cell storage entirely (zsmalloc backend) — the
+			 * seen-flag distinguishes that from "not given",
+			 * which triggers the size-based derivation below.
 			 */
-			if (cell_order == 0 && ctx->comp_compress) {
+			if (cell_order == 0 && !ctx->comp_cell_seen &&
+			    ctx->comp_compress) {
 				merge = ctx->comp_merge ?: 1;
 				tmpfs_bytes = (ctx->blocks ?:
 						 shmem_default_max_blocks()) << PAGE_SHIFT;
