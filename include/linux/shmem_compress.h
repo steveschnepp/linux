@@ -2,6 +2,8 @@
 #ifndef __LINUX_SHMEM_COMPRESS_H
 #define __LINUX_SHMEM_COMPRESS_H
 
+struct shmem_comp_pool;
+
 /*
  * shmem_compress.h - Internal interfaces for tmpfs transparent compression
  *
@@ -11,30 +13,31 @@
  * zsmalloc pools without requiring upfront RAM reservation.
  *
  * Design Overview:
- * - Pages are compressed using LZ4/LZO via the kernel crypto API
+ * - Pages are compressed via the kernel crypto acomp API (lz4 default,
+ *   any installed algorithm selectable per mount)
  * - Compressed data is stored in zsmalloc pools (grow on demand)
- * - Page cache xarray stores compressed entry handles instead of folios
+ * - The page cache xarray stores xa_value slots carrying a small entry
+ *   ID (SWP_SHMEM_COMPRESS type). zsmalloc handles are kernel pointers
+ *   and cannot be packed into xarray values, so a global ID table
+ *   (struct shmem_comp_entry in mm/shmem_compress.c) maps ID ->
+ *   {zsmalloc handle, compressed length, merge size, refcounts}
  * - Decompression happens transparently on page fault/read access
  *
- * Entry Encoding:
- * Compressed entries are stored in the page cache xarray as xa_value
- * entries, similar to how swap entries are stored. The encoding packs
- * the zsmalloc handle and compressed length into a single unsigned long:
- *
- *   Bit layout (64-bit):
- *   ┌─────────────────────────────────────────────────────────┐
- *   │ 63      40 │ 39                  12 │ 11       0      │
- *   │   unused   │     zs_handle (28)    │  length (12)     │
- *   └─────────────────────────────────────────────────────────┘
- *
- *   - zs_handle: zsmalloc allocation handle (supports up to 256MB pools)
- *   - length: compressed size in bytes (max 4095, fits in 12 bits)
- *
  * Compression Flow:
- *   write() → page dirty → compress_folio() → zs_malloc() → replace xarray
+ *   write() -> compress_folio() -> zs_malloc() -> entry_alloc() -> swap xarray slot
  *
  * Decompression Flow:
- *   read()/fault → xarray lookup → xa_is_shmem_comp() → decompress_folio()
+ *   read()/fault -> xa_is_shmem_comp() -> entry_get() -> decompress_folio()
+ *
+ * Entry lifetime:
+ *   Each page cache slot holding the ID owns one entry reference;
+ *   readers take an additional reference with shmem_comp_entry_get()
+ *   and must drop it with shmem_comp_entry_put() after their last use
+ *   of the entry-owned data. The entry -- and its zsmalloc block and
+ *   merged-group buffer -- is freed when the last reference of either
+ *   kind drops. Entries must not outlive their pool: inode eviction
+ *   drains every slot before put_super() destroys the pool, and a
+ *   reader pin cannot outlive its inode (the open file holds a ref).
  *
  * See also:
  * - mm/shmem.c (main tmpfs implementation)
@@ -67,9 +70,16 @@
  * @length: Compressed size in bytes
  * @nr_pages: number of consecutive pages merged into this block
  *            (1 = single page, >1 = merge_pages group)
- * @refs: number of page cache slots referencing this entry; for a
- *        merged group the ID is replicated in each slot, one ref per
- *        slot. The entry is released when refs drops to zero.
+ * @refs: liveness count = page cache slots + reader pins; the entry
+ *        (and its zsmalloc block / merged buffer) is freed when this
+ *        drops to zero, whichever reference kind drops it
+ * @slots: page cache slots only; gates the once-per-group accounting
+ *         in shmem_free_swap() (last slot, not last reference)
+ * @data: kmalloc'd block for merged groups: zsmalloc caps objects at
+ *        PAGE_SIZE, so blocks larger than that live here; freed with
+ *        the entry
+ * @pool: pool that owns @handle; the entry frees the zsmalloc block
+ *        itself when the last reference drops
  * @rcu: for kfree_rcu() after removal from the ID table
  *
  * Registered in a global ID table; the page cache xarray only stores
@@ -79,11 +89,10 @@ struct shmem_comp_entry {
 	unsigned long handle;		/* zsmalloc handle */
 	unsigned int length;		/* compressed size in bytes */
 	unsigned short nr_pages;	/* pages merged into this block */
-	atomic_t refs;			/* xarray slots referencing us */
-	void *data;			/* kmalloc'd block for merged groups:
-					 * zsmalloc caps objects at PAGE_SIZE, so
-					 * blocks larger than that live here;
-					 * freed when the last slot releases */
+	atomic_t refs;			/* slots + reader pins; free at zero */
+	atomic_t slots;			/* page cache slots only */
+	void *data;			/* merged-group buffer, entry-owned */
+	struct shmem_comp_pool *pool;	/* owns @handle */
 	struct rcu_head rcu;
 };
 
@@ -300,49 +309,67 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
 
 /**
  * shmem_comp_entry_alloc - Register compressed data, get an entry ID
+ * @pool: pool that owns @handle (the entry frees the zsmalloc block
+ *        itself when its last reference drops)
  * @handle: zsmalloc handle from shmem_comp_store() (0 for merged groups)
  * @length: compressed data length in bytes
  * @nr_pages: pages merged into this block (1 for single pages)
  * @data: kmalloc'd compressed block for merged groups (owned by the
- *        entry, freed on the last release); NULL for single pages
+ *        entry, freed with the entry); NULL for single pages
  *
  * Return: entry ID (>0) on success, 0 on allocation failure
  *
  * The ID is stored once per page cache slot of the group via
- * make_shmem_comp_entry(); refs is initialised to @nr_pages.
- * Release each slot with shmem_comp_entry_release().
+ * make_shmem_comp_entry(); refs and slots are both initialised to
+ * @nr_pages. Each slot is released with shmem_comp_entry_release().
  */
-unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
+unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
+				    unsigned long handle, unsigned int length,
 				    unsigned short nr_pages, void *data);
 
 /**
- * shmem_comp_entry_query - Copy an entry's fields out under RCU
+ * shmem_comp_entry_get - Pin an entry and copy its fields out
  * @id: entry ID
  * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
  * @length: output, compressed length in bytes, may be NULL
  * @nr_pages: output, pages merged into this block (1 = single), may be NULL
  * @data: output, entry-owned merged-group buffer, may be NULL
  *
- * Return: true if the entry exists
+ * Return: true if the entry was pinned
  *
- * Entries are freed via kfree_rcu() from shmem_comp_entry_release(),
- * so callers must not dereference a raw entry pointer outside an RCU
- * read-side critical section; copy the fields out with this helper.
+ * Takes a reference on the entry so the caller may use the returned
+ * handle/data outside RCU: truncate can erase the caller's page cache
+ * slot at any point, and the last slot release frees the entry (and
+ * its data) immediately. Every successful get() must be paired with
+ * exactly one shmem_comp_entry_put() after the caller's last use.
+ * Fails when the entry is already dying (refs == 0); the caller
+ * should treat that as "entry vanished" and retry its lookup.
  */
-bool shmem_comp_entry_query(unsigned int id, unsigned long *handle,
-			    unsigned int *length, unsigned int *nr_pages,
-			    void **data);
+bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
+			  unsigned int *length, unsigned int *nr_pages,
+			  void **data);
 
 /**
- * shmem_comp_entry_release - Drop one reference to an entry
+ * shmem_comp_entry_put - Drop a reference taken by shmem_comp_entry_get()
  * @id: entry ID
  *
- * Return: true if this was the last reference
+ * The entry (and its zsmalloc block / merged buffer) is freed when the
+ * last reference of any kind -- page cache slot or reader pin -- drops.
+ */
+void shmem_comp_entry_put(unsigned int id);
+
+/**
+ * shmem_comp_entry_release - Drop one page cache slot's reference
+ * @id: entry ID
  *
- * Each page cache slot holding the ID calls this once when the slot
- * is replaced by a decompressed folio. On the last reference the ID
- * is erased and the entry freed; the caller must then free the
- * zsmalloc block via shmem_comp_free().
+ * Return: true if this was the last slot
+ *
+ * Each page cache slot holding the ID calls this once when the slot is
+ * replaced by a decompressed folio or erased by truncate/eviction. The
+ * return value gates the once-per-group accounting in shmem_free_swap();
+ * the entry itself is freed only when the last reference of any kind
+ * (slot or reader pin) drops -- by whichever of release()/put() gets
+ * there first.
  */
 bool shmem_comp_entry_release(unsigned int id);
 

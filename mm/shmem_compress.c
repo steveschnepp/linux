@@ -661,86 +661,63 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 /* XA_FLAGS_ALLOC reserves index 0: the page cache uses 0 for "empty" */
 static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 
-unsigned int shmem_comp_entry_alloc(unsigned long handle, unsigned int length,
-				    unsigned short nr_pages, void *data)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int id;
-	int ret;
-
-	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
-	if (!ent)
-		return 0;
-
-	ent->handle = handle;
-	ent->length = length;
-	ent->nr_pages = nr_pages;
-	ent->data = data;
-	atomic_set(&ent->refs, nr_pages);
-
-	/*
-	 * xa_alloc() takes the xarray lock internally. Wrapping it in
-	 * xa_lock() deadlocks against itself (non-recursive spinlock,
-	 * observed as a soft lockup in QEMU).
-	 *
-	 * XA_FLAGS_ALLOC reserves index 0, so id is never 0 here.
-	 */
-	ret = xa_alloc(&shmem_comp_entries, &id, ent,
-			XA_LIMIT(1, UINT_MAX), GFP_KERNEL | __GFP_NOWARN);
-	if (ret) {
-		kfree(ent);
-		return 0;
-	}
-
-	/*
-	 * ID 0 is the failure sentinel for both callers (a 0 return means
-	 * "allocation failed"), so the xarray limit must exclude it:
-	 * xa_limit_32b starts at 0 and XA_FLAGS_ALLOC does not reserve
-	 * index 0 in this tree.
-	 */
-
-	/* Live RAM footprint: slab-rounded entry + merged buffer size */
-	atomic_inc(&shmem_comp_ram_entries);
-	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
-	if (data)
-		atomic_long_add(ksize(data), &shmem_comp_ram_merged_bytes);
-
-	return id;
-}
+/*
+ * Entry lookup and reference discipline.
+ *
+ * Every page cache slot holding the ID owns one entry reference
+ * (slots, initialised to nr_pages at alloc). Readers that need the
+ * entry-owned data outside RCU take an additional pin with get(); the
+ * entry -- and its zsmalloc block and merged buffer -- is freed when
+ * the total reference count (slots + pins) drops to zero, whichever
+ * kind of reference drops it. release() additionally tracks slots so
+ * shmem_free_swap() can fire its once-per-group accounting on the
+ * last slot even while a reader pin keeps the entry alive.
+ */
 
 /*
- * Entry lookup: callers must not hold a raw entry pointer across any
- * point where its last reference can drop -- entries are freed via
- * kfree_rcu() from shmem_comp_entry_release(). Use the query helper
- * below to copy the needed fields out under RCU instead.
+ * Teardown for the last reference of any kind. Runs outside RCU; the
+ * entry cannot be resurrected (get() fails on refs == 0) and no other
+ * thread can reach this path (atomic dec_and_test, xa_erase guard).
+ * The pool outlives every entry: inode eviction drains all slots
+ * before put_super() destroys the pool, and reader pins cannot
+ * outlive their inode.
  */
+static void shmem_comp_entry_free(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
 
-/**
- * shmem_comp_entry_query - Copy an entry's fields out under RCU
- * @id: entry ID
- * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
- * @length: output, compressed length in bytes, may be NULL
- * @nr_pages: output, pages merged into this block (1 = single), may be NULL
- * @data: output, entry-owned merged-group buffer, may be NULL
- *
- * Return: true if the entry exists
- *
- * Entries are freed via kfree_rcu() from shmem_comp_entry_release(),
- * so a raw entry pointer must not be dereferenced outside an RCU
- * read-side critical section. xa_erase() + kfree_rcu() guarantees the
- * entry stays allocated until the current read-side section ends, so
- * copying the fields out here is safe.
- */
-bool shmem_comp_entry_query(unsigned int id, unsigned long *handle,
-			    unsigned int *length, unsigned int *nr_pages,
-			    void **data)
+	/* xa_erase() takes the xarray lock internally */
+	ent = xa_erase(&shmem_comp_entries, id);
+	if (!ent)
+		return;
+
+	/* Un-account live RAM before freeing (ksize needs a live
+	 * object; do it before kfree/kfree_rcu). */
+	atomic_dec(&shmem_comp_ram_entries);
+	atomic_long_sub(ksize(ent), &shmem_comp_ram_entry_bytes);
+	if (ent->data)
+		atomic_long_sub(ksize(ent->data),
+				 &shmem_comp_ram_merged_bytes);
+
+	/* The entry owns its zsmalloc block and merged buffer. */
+	if (ent->handle)
+		shmem_comp_free(ent->pool, ent->handle);
+	kfree(ent->data);
+	kfree_rcu(ent, rcu);
+}
+
+bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
+			  unsigned int *length, unsigned int *nr_pages,
+			  void **data)
 {
 	struct shmem_comp_entry *ent;
 	bool found = false;
 
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
-	if (ent) {
+	/* inc_unless_zero: fail on a dying entry instead of pinning
+	 * memory that teardown is about to free. */
+	if (ent && atomic_inc_not_zero(&ent->refs)) {
 		if (handle)
 			*handle = ent->handle;
 		if (length)
@@ -756,34 +733,95 @@ bool shmem_comp_entry_query(unsigned int id, unsigned long *handle,
 	return found;
 }
 
-bool shmem_comp_entry_release(unsigned int id)
+void shmem_comp_entry_put(unsigned int id)
 {
 	struct shmem_comp_entry *ent;
 
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent || !atomic_dec_and_test(&ent->refs)) {
+	if (!ent) {
 		rcu_read_unlock();
-		return false;
+		return;
+	}
+	if (!atomic_dec_and_test(&ent->refs)) {
+		if (unlikely(atomic_read(&ent->refs) < 0))
+			WARN(1, "shmem_comp: entry %u refs underflow\n", id);
+		rcu_read_unlock();
+		return;
 	}
 	rcu_read_unlock();
 
-	/* Last reference: erase the ID and free the entry */
-	/* xa_erase() takes the xarray lock internally */
-	ent = xa_erase(&shmem_comp_entries, id);
-	if (ent) {
-		/* Un-account live RAM before freeing (ksize needs a live
-		 * object; do it before kfree/kfree_rcu). */
-		atomic_dec(&shmem_comp_ram_entries);
-		atomic_long_sub(ksize(ent), &shmem_comp_ram_entry_bytes);
-		if (ent->data)
-			atomic_long_sub(ksize(ent->data),
-					 &shmem_comp_ram_merged_bytes);
-		kfree(ent->data);	/* merged group block, if any */
-		kfree_rcu(ent, rcu);
+	shmem_comp_entry_free(id);
+}
+
+bool shmem_comp_entry_release(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
+	bool last_slot;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent) {
+		rcu_read_unlock();
+		return false;
+	}
+	last_slot = atomic_dec_and_test(&ent->slots);
+	if (!atomic_dec_and_test(&ent->refs)) {
+		if (unlikely(atomic_read(&ent->refs) < 0))
+			WARN(1, "shmem_comp: entry %u refs underflow\n", id);
+		rcu_read_unlock();
+		return last_slot;
+	}
+	rcu_read_unlock();
+
+	shmem_comp_entry_free(id);
+	return last_slot;
+}
+
+unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
+				    unsigned long handle, unsigned int length,
+				    unsigned short nr_pages, void *data)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int id;
+	int ret;
+
+	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
+	if (!ent)
+		return 0;
+
+	ent->handle = handle;
+	ent->length = length;
+	ent->nr_pages = nr_pages;
+	ent->data = data;
+	ent->pool = pool;
+	atomic_set(&ent->refs, nr_pages);
+	atomic_set(&ent->slots, nr_pages);
+
+	/*
+	 * xa_alloc() takes the xarray lock internally. Wrapping it in
+	 * xa_lock() deadlocks against itself (non-recursive spinlock,
+	 * observed as a soft lockup in QEMU).
+	 *
+	 * XA_FLAGS_ALLOC does not reserve index 0 in this tree, and the
+	 * xarray limit below excludes it explicitly: ID 0 is the failure
+	 * sentinel for both callers (a 0 return means "allocation
+	 * failed"), so id is never 0 here.
+	 */
+	ret = xa_alloc(&shmem_comp_entries, &id, ent,
+			XA_LIMIT(1, UINT_MAX), GFP_KERNEL | __GFP_NOWARN);
+	if (ret) {
+		kfree(ent);
+		return 0;
 	}
 
-	return true;
+	/* Live RAM footprint: slab-rounded entry + merged buffer size */
+	atomic_inc(&shmem_comp_ram_entries);
+	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
+	if (data)
+		atomic_long_add(ksize(data), &shmem_comp_ram_merged_bytes);
+
+	return id;
 }
 
 /*

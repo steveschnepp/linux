@@ -1022,30 +1022,29 @@ static long shmem_free_swap(struct address_space *mapping,
 			swp_entry_t se = radix_to_swp_entry(radswap);
 			struct shmem_sb_info *sbinfo =
 				SHMEM_SB(mapping->host->i_sb);
-			unsigned long handle = 0;
 			unsigned int id = shmem_comp_entry_id(se);
-			unsigned int length = 0, nr_pages = 1;
-			bool last;
-
-			shmem_comp_entry_query(id, &handle, &length,
-						&nr_pages, NULL);
+			unsigned int length = 0, entry_nr = 1;
+			bool got, last;
 
 			/*
-			 * Release must run even when handle == 0 (merged groups
-			 * carry no zsmalloc handle); only the zsmalloc free is
-			 * handle-gated.
+			 * Our slot still holds its entry reference at this
+			 * point (released below), so get() cannot fail; the
+			 * pin keeps the entry and its data alive across the
+			 * release. The entry frees its zsmalloc block itself
+			 * when the last reference of any kind drops.
 			 */
+			got = shmem_comp_entry_get(id, NULL, &length,
+						   &entry_nr, NULL);
 			last = shmem_comp_entry_release(id);
-			if (last) {
-				if (handle)
-					shmem_comp_free(sbinfo->comp_pool,
-							handle);
+			if (got)
+				shmem_comp_entry_put(id);
+			if (last && got) {
 				atomic_long_dec(&sbinfo->comp_pages);
-				atomic_long_sub((unsigned long)nr_pages *
+				atomic_long_sub((unsigned long)entry_nr *
 						PAGE_SIZE,
 						&sbinfo->comp_bytes);
 				shmem_comp_update_stats(false,
-							nr_pages * PAGE_SIZE,
+							entry_nr * PAGE_SIZE,
 							length);
 			}
 		} else
@@ -2322,8 +2321,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
 						  pgoff_t pgoff);
 static int shmem_decompress_group(struct inode *inode, pgoff_t index,
-				   unsigned int id, unsigned long handle,
-				   unsigned int comp_len,
+				   unsigned int id, unsigned int comp_len,
 				   unsigned short nr_pages,
 				   gfp_t gfp, struct folio **foliop);
 static int shmem_compress_group(struct inode *inode, pgoff_t last);
@@ -2364,8 +2362,7 @@ static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
  * the caller retries.
  */
 static int shmem_decompress_group(struct inode *inode, pgoff_t index,
-				   unsigned int id, unsigned long handle,
-				   unsigned int comp_len,
+				   unsigned int id, unsigned int comp_len,
 				   unsigned short nr_pages,
 				   gfp_t gfp, struct folio **foliop)
 {
@@ -2380,21 +2377,28 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
-	 * cbuf is entry-owned (freed by shmem_comp_entry_release() on the
-	 * last slot release); error paths here must not free it.
+	 * Pin the entry: cbuf is entry-owned and stays valid until the
+	 * matching put() below, even if truncate erases every slot of
+	 * the group in between. Error paths must put, never free cbuf.
 	 */
-	if (!shmem_comp_entry_query(id, NULL, NULL, NULL, &cbuf) || !cbuf)
+	if (!shmem_comp_entry_get(id, NULL, NULL, NULL, &cbuf) || !cbuf) {
+		if (cbuf)
+			shmem_comp_entry_put(id);
 		return -ENOENT;
+	}
 
 	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
-	if (!dbuf)
+	if (!dbuf) {
+		shmem_comp_entry_put(id);
 		return -ENOMEM;
+	}
 
 	dlen = (unsigned int)nr_pages * PAGE_SIZE;
 	ret = shmem_comp_decompress(sbinfo->comp_pool, cbuf, comp_len,
 				    dbuf, &dlen);
 	if (ret) {
 		kfree(dbuf);
+		shmem_comp_entry_put(id);
 		return ret;
 	}
 
@@ -2431,6 +2435,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			folio_put(sib);
 			if (sidx == index) {
 				/* requested slice lost the race: retry */
+				shmem_comp_entry_put(id);
 				kfree(dbuf);
 				return ret;
 			}
@@ -2442,8 +2447,9 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		/* Pair with the per-slice recalc in the compress path. */
 		shmem_recalc_inode(inode, 0, -1);
 
-		if (shmem_comp_entry_release(id))
-			shmem_comp_free(sbinfo->comp_pool, handle);
+		/* Consume this slice's slot reference; the pin taken
+		 * above keeps the entry (and cbuf) alive regardless. */
+		shmem_comp_entry_release(id);
 
 		if (sidx == index) {
 			folio_set_referenced(sib);
@@ -2460,6 +2466,10 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
 	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
 				comp_len);
+
+	/* Drop the pin: entry teardown (zsmalloc block + cbuf) runs
+	 * here if the slice loop consumed every slot reference. */
+	shmem_comp_entry_put(id);
 
 	kfree(dbuf);
 	return *foliop ? 0 : ret;
@@ -2567,7 +2577,7 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
 	 * ownership transfers here and the buffer is freed when the
 	 * last slot releases the entry.
 	 */
-	id = shmem_comp_entry_alloc(0, comp_len, nr, cbuf);
+	id = shmem_comp_entry_alloc(sbinfo->comp_pool, 0, comp_len, nr, cbuf);
 	if (!id) {
 		ret = 0;
 		goto cleanup;	/* cbuf freed below */
@@ -2653,14 +2663,16 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	if (!sbinfo->comp_pool)
-		return -ENOENT;
+		return -ENODEV;
 
-	/* Look up the compressed data via its entry ID. Query copies the
-	 * fields out under RCU: the entry can be freed (kfree_rcu) as
-	 * soon as its last slot reference drops, and
-	 * shmem_comp_entry_release() below may be exactly that reference. */
+	/*
+	 * Pin the entry: handle/comp_len are used below outside RCU,
+	 * and truncate can erase our slot (dropping the last slot
+	 * reference) at any point. Fails with -ENOENT when the entry is
+	 * already dying; the caller retries against the updated slot.
+	 */
 	id = shmem_comp_entry_id(comp_entry);
-	if (!shmem_comp_entry_query(id, &handle, &comp_len, &nr_pages,
+	if (!shmem_comp_entry_get(id, &handle, &comp_len, &nr_pages,
 				    NULL))
 		return -ENOENT;
 
@@ -2668,22 +2680,29 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	 * Merged group (merge_pages > 1): the ID is replicated in all
 	 * nr_pages slots of the group. Decompress the whole block and
 	 * install one folio per slice; the requested slice is returned.
+	 * The group path pins the entry itself; drop our pin first so
+	 * the reference accounting stays one-pin-per-get.
 	 */
-	if (nr_pages > 1)
-		return shmem_decompress_group(inode, index, id, handle,
+	if (nr_pages > 1) {
+		shmem_comp_entry_put(id);
+		return shmem_decompress_group(inode, index, id,
 					       comp_len, nr_pages,
 					       gfp, foliop);
+	}
 
 	/* Read the compressed bytes out of the pool first.
 	 * GFP_KERNEL: transient slab buffer, must not carry __GFP_HIGHMEM.
 	 */
 	src = kmalloc(comp_len, GFP_KERNEL);
-	if (!src)
+	if (!src) {
+		shmem_comp_entry_put(id);
 		return -ENOMEM;
+	}
 
 	ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
 	if (ret) {
 		kfree(src);
+		shmem_comp_entry_put(id);
 		return ret;
 	}
 
@@ -2697,6 +2716,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	folio = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), index);
 	if (!folio) {
 		kfree(src);
+		shmem_comp_entry_put(id);
 		return -ENOMEM;
 	}
 	__folio_set_locked(folio);
@@ -2713,6 +2733,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (ret) {
 		folio_unlock(folio);
 		folio_put(folio);
+		shmem_comp_entry_put(id);
 		return ret;
 	}
 
@@ -2727,6 +2748,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (ret) {
 		folio_unlock(folio);
 		folio_put(folio);
+		shmem_comp_entry_put(id);
 		return ret;
 	}
 
@@ -2738,14 +2760,17 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 
 	folio_add_lru(folio);
 
-	/* Last slot referencing the entry frees the compressed copy */
-	if (shmem_comp_entry_release(id))
-		shmem_comp_free(sbinfo->comp_pool, handle);
+	/* Consume the slot's reference; our pin keeps the entry (and
+	 * its zsmalloc block) alive until put() below, which runs the
+	 * teardown when no other reference remains. */
+	shmem_comp_entry_release(id);
 
 	/* Update accounting */
 	atomic_long_dec(&sbinfo->comp_pages);
 	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
 	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
+
+	shmem_comp_entry_put(id);
 
 	folio_set_referenced(folio);
 	/* Hand back the folio locked, with a reference for the caller */
@@ -2861,8 +2886,10 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * Register the compressed data in the entry ID table. The
 	 * zsmalloc handle is a kernel pointer and cannot be packed
 	 * into the xarray value, so the page cache stores only the ID.
+	 * The entry owns the handle from here (freed with the entry).
 	 */
-	id = shmem_comp_entry_alloc(handle, comp_len, 1, NULL);
+	id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle, comp_len,
+				    1, NULL);
 	if (!id) {
 		shmem_comp_free(sbinfo->comp_pool, handle);
 		folio_unlock(folio);
@@ -3126,7 +3153,12 @@ repeat:
 			error = shmem_decompress_folio(inode, index,
 							comp_entry, gfp,
 							&folio);
-			if (error == -EEXIST)
+			/* -EEXIST: slot changed under us (another
+			 * decompressor won). -ENOENT: the entry vanished
+			 * between xarray load and entry_get (truncate won
+			 * the race). Both are races, not errors: retry
+			 * against the updated slot. */
+			if (error == -EEXIST || error == -ENOENT)
 				goto repeat;
 
 			*foliop = folio;
