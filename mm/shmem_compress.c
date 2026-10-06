@@ -564,17 +564,16 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	unsigned long handle;
 	gfp_t gfp;
 
-	if (!pool || !data || len == 0 || len > PAGE_SIZE)
+	if (!pool || !data || len == 0)
 		return 0;
 
 	/*
 	 * Cell storage: the bump allocator returns a packed
 	 * {cellid, offset} location.  No bounce buffer, no zsmalloc
 	 * handle — the data lands directly in the cell at the exact
-	 * offset returned.
-	 *
-	 * Cell storage rejects len > PAGE_SIZE because a merged group
-	 * that exceeds a single page would need multi-cell allocation,	 * which the bump pointer cannot express.  Merged groups are	 * sized to fit (merge_pages * PAGE_SIZE is the upper bound on	 * compressed size), so this rejection is unreachable in	 * practice.
+	 * offset returned.  There is no per-object size cap beyond
+	 * the cell size itself (up to 4 MiB), so merged compression
+	 * groups are stored as a single block.
 	 */
 	if (pool->use_cells) {
 		u16 cellid;
@@ -585,7 +584,10 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 		return shmem_comp_pack_loc(cellid, offset);
 	}
 
-	/* zsmalloc path: GFP_NOWAIT because the caller may hold locks */
+	/* zsmalloc path: ZS_MAX_ALLOC_SIZE is PAGE_SIZE */
+	if (len > PAGE_SIZE)
+		return 0;
+
 	gfp = GFP_NOWAIT | __GFP_NOWARN;
 	handle = zs_malloc(pool->zs_pool, len, gfp, NUMA_NO_NODE);
 	if (!handle)
