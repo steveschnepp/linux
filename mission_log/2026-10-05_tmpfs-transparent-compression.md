@@ -283,3 +283,299 @@ raised lz4 write ~73 -> 120 MB/s but dropped merge-path reads ~84 -> 20 MB/s
 6. Try larger merge (32/64) with zstd and long-range-redundancy data.
 7. mmap() tests against compressed files (test_mmap exists but has not run
    since the entry-table redesign).
+
+---
+
+## Session 2: RAM accounting, the merge sweep, and the great bug hunt (2026-10-06)
+
+### What We Did
+
+Session 1 ended with an open oops ("xa-value bit pattern used as a slab
+pointer") and a suspicion that merge_pages might not save any RAM. Session 2
+answers both -- and the answers surprised us twice.
+
+1. **RAM usage stats** (`629af1361aee`). Session 1's ratio table measured
+   compressed *bytes*, not RAM -- merged groups store data in kmalloc buffers
+   that the byte counts never showed. Added live footprint accounting to
+   `struct shmem_comp_stats`, emitted as new `comp_stats` fields:
+   `ram_pool_bytes` (zsmalloc pages via `zs_get_total_pages()` summed over
+   the pool list), `ram_merged_bytes` and `ram_entry_bytes` (ksize-accurate,
+   inc/dec in `shmem_comp_entry_alloc/release`), `ram_entries`,
+   `ram_total_bytes`. `ram_total_bytes` vs the uncompressed size is the
+   honest savings measure.
+
+2. **merge cap 64 -> 1024** (`f77749acaaf3`). The cap existed only because
+   `shmem_compress_group()` kept `struct folio *folios[64]` on the stack;
+   1024 entries = 8KiB, so the array moved to `kcalloc()`. Cap enforced at
+   all three sites from one header constant (`SHMEM_COMP_MERGE_MAX`). 1024
+   is the hard ceiling: merged groups are `kmalloc(N * PAGE_SIZE)` and
+   `KMALLOC_MAX_SIZE = 4MiB` on x86_64 (MAX_PAGE_ORDER 10); larger values
+   would make every group buffer allocation fail silently.
+
+3. **The merge sweep** (new `scripts/sweep_merge.sh` + `test.merge=` cmdline
+   mode in the guest init). One QEMU boot per merge value (1,2,4,8,16) to
+   keep measurements uncontaminated -- we *believed* the oops fired on the
+   mount after a cycle, so single-cycle boots looked safe. Dataset:
+   `seq 1 100000` = 144 pages, which divides evenly by all five merge
+   values (no tail groups). Mount uses `compress_threshold=1`, not 0:
+   `fill_super` does `ctx->comp_threshold ?: 65536`, so 0 silently means
+   "default 64KiB" and the i_size gate would make coverage depend on merge
+   size. The gate also explained the old "128 of 144 pages" mystery from
+   session 1 -- it is by design, not a bug.
+
+4. **Sweep verdict on RAM** (the answer to "do we really save RAM or did we
+   lose it all to alignment"). Uncompressed baseline 589,824 B (144 pages):
+
+   | merge | compressed data | RAM after write | verdict |
+   |------:|----------------:|----------------:|---------|
+   | 1     | 409,915 B       | 488,448 B       | ~17% saved |
+   | 2     | 407,987 B       | 594,432 B       | net LOSS |
+   | 4     | 405,974 B       | 592,128 B       | net LOSS |
+   | 8     | 405,468 B       | 590,976 B       | net LOSS |
+   | 16    | 405,128 B       | 590,400 B       | net LOSS |
+
+   Merged kmalloc buffers total *exactly* the uncompressed size for every
+   power of two (`kmalloc(N * PAGE_SIZE)` is exact page multiples, every
+   group gets a full-size buffer, never shrunk to `comp_len`). Bigger groups
+   compress better (-12.8% data at merge=16) but it does not matter: the
+   data lives in buffers that always sum to the whole file. After a full
+   read, everything decompresses (savings exist only for cold pages) and --
+   pre-fix -- one entry + one full group buffer leaked per cycle.
+
+5. **The bug hunt**, in four acts:
+
+   a. *The +1 fingerprint.* Every sweep row showed
+      `ram_entries == update_stats_calls + 1`, with full buffers and a leak
+      surviving read+umount. `entry_alloc()` has exactly two callers, each
+      followed unconditionally by `update_stats(true)` -- so a phantom entry
+      should have been impossible.
+
+   b. *Trace build.* `pr_err("DBG ...")` at alloc/release/stats plus
+      `dump_stack()` in the `shmem_get_folio` decompress branch. The trace
+      showed the smoking gun in four lines: `alloc id=0 ... data=X`,
+      `alloc id=1 ... data=X` (same cbuf address -- freed and reused!), one
+      missing stats line. `xa_alloc` had handed out **ID 0**, which both
+      callers treat as "allocation failed": the group path freed the
+      entry-owned cbuf (dangling pointer), skipped stats and the slot swap,
+      and pinned the entry in the global table forever. Root cause:
+      `xa_limit_32b = XA_LIMIT(0, UINT_MAX)` and -- contrary to what
+      session 1's log recorded as fact -- `XA_FLAGS_ALLOC` does **not**
+      reserve index 0 in this tree. Fix: `XA_LIMIT(1, UINT_MAX)`. The sweep
+      went clean (entries == stats, zero drain after read).
+
+   c. *But the oops survived.* The full suite still died at the 4th mount
+      with the same `0xffff007366706d74` freelist garbage (= ASCII
+      `"tmpfs\0"`). The phantom was a real bug, not THE bug.
+
+   d. *KASAN.* Enabled on the test kernel -- which required
+      `--disable CONFIG_SLUB_TINY` first: `KASAN depends on SYSFS &&
+      !SLUB_TINY`. The suite then completed end-to-end (KASAN quarantine
+      keeps freelists intact, so the corruption never detonated) but
+      printed the verdict: **`BUG: KASAN: double-free in shmem_free_fc+0x84`**
+      -- `shmem_free_fc()` freed `ctx->comp_compressor` twice, a duplicated
+      `#ifdef/kfree()` pair from the session-1 hardening round. Every
+      umount of a compressed mount double-freed the kmalloc-8 compressor
+      string; the poisoned freelist detonated at the *next* mount's
+      option-string allocation. That is why single-cycle sweep boots never
+      crashed: nothing consumed the poisoned cache afterwards. The
+      compression entry lifecycle -- the suspect for a whole session -- was
+      innocent of the oops.
+
+6. **Fixes committed** (4 commits, narratives in the messages):
+   - `629af1361aee` RAM usage stats
+   - `f77749acaaf3` merge cap 1024 + heap folio array
+   - `5f0aca809a9d` the double-free in `shmem_free_fc` (the oops)
+   - `a2a924bc5e4d` entry ID allocation and release paths: ID-0 limit;
+     `shmem_free_swap()` released merged-group entries only when
+     `handle != 0` (leaking entry+buffer per truncated group slot, no
+     stats pairing); `shmem_decompress_group()` freed the entry-owned cbuf
+     on dbuf failure and kfree'd an *uninitialized* pointer when the entry
+     was gone; `shmem_comp_entry_get()` returned pointers outside RCU --
+     replaced by `shmem_comp_entry_query()` (fields copied under RCU; the
+     xarray stays private to shmem_compress.c)
+
+7. **Test-rig fixes** (outside kernel git): `build_kernel.sh` expanded its
+   ccache args unquoted (`CC="ccache gcc"` split into broken shell words ->
+   /bin/sh "Unterminated quoted string" inside kbuild); now a bash array.
+   `build_tests.sh` silently never rebuilt `test_seq_compress` (relative
+   path after `cd tests/`) -- wasted one cycle on a stale binary; build it
+   manually. `run_qemu.sh` gained `TEST_MERGE=` -> `test.merge=` cmdline.
+
+8. **Comment discipline** (user rule, applied retroactively): code comments
+   now state invariants only; the what-happened narratives (KASAN evidence,
+   symptom tables) live in the git commit messages where they belong. Four
+   narrative comments were rewritten before committing.
+
+9. **Review handoff**: `/home/snide/tmpfs-compress-review-prompt.md` (outside
+   the kernel tree) -- a self-contained prompt for a fresh session to review
+   the full 30-commit branch diff: base SHA, architecture summary, what was
+   fixed and why, the nine known-open issues, test-rig recipes (sweep, QEMU
+   + gdb via GDB_PORT, KASAN), expected invariants.
+
+### What We Learned
+
+#### Technical
+
+- `XA_FLAGS_ALLOC` does **not** reserve xarray index 0 in this tree.
+  `xa_limit_32b` starts at 0; "reserved" IDs must come from the limit the
+  caller passes (`XA_LIMIT(1, UINT_MAX)`). Session 1's log recorded the
+  opposite as fact -- upstream doc habits lie; read the tree.
+- `KASAN depends on !SLUB_TINY`. The tinyconfig debug recipe is:
+  `scripts/config --disable CONFIG_SLUB_TINY --enable CONFIG_KASAN`, then
+  rebuild. KASAN's quarantine lets a double-free-hobbled suite run to
+  completion -- the *reports* are the signal, not the crashes.
+- Cross-mount corruption hides in single-cycle test boots. Freelist
+  poisoning from mount A's umount detonates when mount B allocates from
+  the same cache. "Contamination-resistant" and "bug-revealing" test
+  designs compete; run both.
+- The oops site is not the bug site. A GPF in `___slab_alloc` during
+  mount-option parsing was blamed on the compression entry lifecycle for
+  an entire session; the cause was a duplicated kfree in fs_context
+  teardown two subsystems away. When corruption manifests far from its
+  cause, instrument the FREE paths (KASAN) before theorizing about the
+  crash path.
+- For lz4, merge_pages > 1 can **never** save RAM with the current design:
+  full-size group buffers + power-of-two page-order rounding for >8KiB
+  kmalloc eat the entire compression gain. Only zstd (12% ratio) would
+  benefit from shrinking buffers to comp_len -- and even krealloc cannot
+  help lz4 (680KiB rounds back up to a 1MiB order-8 block). The sweep
+  table is the regression baseline for the fix.
+- `ctx->comp_threshold ?: 65536` makes 0 indistinguishable from unset:
+  `compress_threshold=0` cannot disable the i_size gate; use 1.
+- `shmem_free_swap()` had `if (handle && release(id))` -- handle-gating
+  the wrong thing: merged-group entries carry handle 0, so truncate and
+  eviction never released them. Release must be unconditional; only the
+  zsmalloc free is handle-dependent.
+- `kfree(uninitialized_pointer)` is UB that looks like random freelist
+  corruption -- `shmem_decompress_group()` did exactly that on the
+  entry-gone path.
+- Zsmalloc packing measured: lz4 seq pages cost ~3.3KiB of pool per 2.8KiB
+  of data (mixed size classes -> partial zspages); still far better than
+  merged kmalloc buffers.
+
+#### Process
+
+- Trace-build methodology paid for itself: four `pr_err` sites + one
+  `dump_stack` -> one build cycle -> a four-line trace that named the bug
+  (id=0, reused cbuf address, missing stats line). But the trace explained
+  the *stats anomaly*, not the *oops* -- fixing the traced bug left the
+  original symptom standing. Keep the original symptom (here: zero oopses
+  in the full suite) as the acceptance criterion, always.
+- The suggestion to run QEMU under gdb was right in spirit; KASAN
+  answered first because it needs no breakpoint hypotheses. gdb
+  (`GDB_PORT=1 ./scripts/run_qemu.sh`, `-s -S`) stays wired for
+  stepping through whatever the review session turns up.
+- Hunk-level staging (`git diff | awk split | git apply --cached`) gave
+  bisectable commits when fixes interleaved in one file: the oops fix
+  (`5f0aca809a9d`) is reviewable independently of the entry fixes
+  (`a2a924bc5e4d`).
+- Measure RAM with allocator-truthful counters (ksize, zs_get_total_pages),
+  not requested sizes -- slab buckets and page-order rounding ARE the
+  story.
+
+### What We Decided
+
+- **ID 0 stays the failure sentinel**; the xarray limit is clamped to
+  `XA_LIMIT(1, UINT_MAX)` instead of restructuring the alloc API -- smallest
+  change that restores the documented invariant.
+- **`shmem_comp_entry_query()` replaces `shmem_comp_entry_get()`**; raw
+  entry pointers must not outlive an RCU read-side section, so the API now
+  copies fields out; the xarray itself is private to mm/shmem_compress.c.
+- **Release is unconditional in eviction paths**; handle-gating applies
+  only to the zsmalloc free; stats pair on the last release.
+- **RAM stats are global** (per-mount remains session-1 follow-up #5).
+- **merge cap = 1024 pages** as the kmalloc ceiling, single constant.
+- **The RAM-spoiling fix is the next task** (deferred by explicit user
+  decision): candidates are shrink-to-comp_len (helps zstd only),
+  zsmalloc-chunked storage for merged blocks (split comp_len into 4KiB
+  objects; page-granular, works for any ratio), or restricting merge to
+  high-ratio compressors. The sweep table above is the before-picture.
+- **Branch review goes to a fresh session** with the prepared prompt;
+  commit messages carry the evidence chains.
+
+### Rules Added
+
+- **Comments are invariants:** code comments state why the code is as it
+  is; what-happened narratives (bug stories, KASAN evidence) belong in git
+  commit messages.
+- **Cross-mount bugs need cross-mount tests:** single-cycle boots hide
+  freelist/double-free bugs; keep a multi-cycle suite in the rotation.
+- **KASAN recipe for this tree:** disable SLUB_TINY first, then enable
+  KASAN; reports land in results/serial_*.log even when the suite passes.
+- **Sweep invariants for the test rig:** every merge row must show
+  `ram_entries == compressed_pages` after write and all-zero `ram_*` after
+  a full read.
+- **Acceptance criteria name the original symptom:** "no oopses in the
+  full suite", not "the traced bug is fixed".
+
+### What We'd Do Differently
+
+- Session 1 recorded "XA_FLAGS_ALLOC reserves ID 0" without checking the
+  tree. Verify API semantics against the source of the tree you are
+  building, not against memory or upstream documentation.
+- The oops was misattributed for a full session. The mission log's own
+  next-step #1 ("audit release ordering") sent us hunting the wrong
+  subsystem; a single KASAN boot at the *start* of the hunt would have
+  named `shmem_free_fc` in two minutes. KASAN (or slub_debug=FZ) belongs
+  in the rig's default recipe for any crash investigation.
+- The sweep's single-cycle design -- chosen to avoid contamination -- is
+  also what hid the cross-mount double-free. Next time: sweep AND
+  a two-cycle canary boot.
+- `build_tests.sh` silently skipping `test_seq_compress` cost a build
+  cycle on a stale binary; rig scripts should fail loudly when a target
+  binary is not produced.
+- The header comment block in `include/linux/shmem_compress.h` still
+  documents the abandoned handle-packing encoding -- stale docs survived
+  two sessions because nothing forces doc review on redesign commits.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem.c` | comp_stats ram_* output; merge cap sites; heap folio array; free_fc double-free fix; free_swap release+stats pairing; decompress_group/folio fixes; query() call sites |
+| `mm/shmem_compress.c` | XA_LIMIT(1) id clamp; shmem_comp_entry_query(); RAM footprint counters; get_stats pool-page sum |
+| `include/linux/shmem_compress.h` | SHMEM_COMP_MERGE_MAX; ram_* stats fields; query() API; get() removed |
+| `include/linux/swapops.h` | stale comment fix (ID 0 is the sentinel) |
+| `/home/snide/tmpfs-compress-test/scripts/build_kernel.sh` | ccache args via bash array (quoting fix) |
+| `/home/snide/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_MERGE= -> test.merge= cmdline |
+| `/home/snide/tmpfs-compress-test/scripts/sweep_merge.sh` | new: one-boot-per-merge RAM sweep |
+| `/home/snide/tmpfs-compress-test/tests/test_seq_compress.c` | max_num + threshold args; MemFree snapshots |
+| `/home/snide/tmpfs-compress-test/initrd/init` | sweep mode (test.merge=); merge=256/1024 runs |
+| `/home/snide/tmpfs-compress-review-prompt.md` | fresh-session branch review prompt (outside kernel tree) |
+
+### Test Results / Benchmarks
+
+Post-fix verification on the committed tree (normal config, QEMU 1G):
+
+- **Sweep** (`results/sweep_merge_20261006_103747.summary`): merge
+  1/2/4/8/16 -- `ram_entries == compressed_pages` in every row (144/72/36/
+  18/9), all `ram_*` counters **0** after a full read, data verified
+  line-by-line, 0 oopses.
+- **Full suite** (merge 1/8/256/1024 + zstd + bench + multimount, single
+  boot): `Test exit code: 0`, zero `Oops:` lines. This is the sequence
+  that always died at the 4th mount before the fixes (kernels #17/#19).
+- **KASAN run** (debug kernel, SLUB_TINY off): suite completed; exactly
+  one report, `double-free in shmem_free_fc+0x84` -- which became commit
+  `5f0aca809a9d`.
+- The RAM verdict table in "What We Did" step 4 is the baseline for the
+  merge-buffers fix; note the post-fix rows compress *more* data (the
+  previously-skipped first group now participates).
+
+### Next Steps
+
+1. **Fix the RAM spoiling** (the deferred task): merged-group buffers are
+   never shrunk and kmalloc page-order rounding destroys lz4 merge savings.
+   Evaluate zsmalloc-chunked merged storage (split comp_len into 4KiB
+   objects -- page-granular, compressor-agnostic) vs shrink-to-comp_len
+   (zstd-only benefit) vs restricting merge to zstd. Use the sweep table
+   as the regression baseline; re-run `sweep_merge.sh` after the change.
+2. **Fresh-session branch review** with
+   `/home/snide/tmpfs-compress-review-prompt.md` (30 commits, base
+   `a90ee4305c4a`).
+3. Session-1 carry-overs still open: deferred compression + entropy probe;
+   faster merge read path (order-3 folio per group); per-mount stats;
+   threshold semantics (0 -> 65536); stale handle-packing doc block in
+   shmem_compress.h; mmap tests; zstd merge matrix at 1G.
+4. Optional hardening: refcount assertions in the entry table (session-1
+   ask; the query() API makes them cheap to add), and a two-cycle canary
+   boot in the rig's default rotation.
