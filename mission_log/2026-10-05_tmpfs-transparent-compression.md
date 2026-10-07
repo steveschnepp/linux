@@ -1644,3 +1644,183 @@ explained by slab caches + the 5.4 MB tar page cache.
    (fixed data volume, per-merge RAM accounting) would confirm the
    small-file tail hypothesis with hard RAM numbers instead of
    ratio-only evidence.
+
+---
+
+## Session 8: option surface v2 and the compression policy model (2026-10-07)
+
+### What We Did
+
+Design session (no kernel code; the spec landed as commit
+`49879bd0ddcb`, "docs: plan -- option surface v2 + compression policy
+v2"). Worked through the option surface that had grown organically
+across sessions, and the deferred-compression policy that started as
+"think about writeback" and sharpened into death-before-pop aging.
+
+**The organic-growth audit.** Enumerated the full surface: 7 mount
+option spellings (two of them pure aliases: compress=/compressor=,
+compress_merge=/merge_pages=), 6 sysfs knobs, 1 Kconfig string, plus
+silently-derived state (cell_order from tmpfs size, +1 when
+merge>=8). The grates, named honestly:
+
+1. Three "off" spellings that were not quite synonyms (nocompress,
+   compress=none, sysfs compressor=none) -- a fourth
+   (compress_ratio=100:100) was proposed and would have made it worse.
+2. compress_threshold=64K default silently disables compression for
+   small-file farm workloads -- the torture suite had to pass
+   threshold=1 to see ANY compression.
+3. Unit soup: cell= takes memparse syntax, compress_threshold= raw
+   bytes, merge_pages a count, ratio percent.
+4. /proc/mounts shows nothing about compression -- the cell256k
+   torture bug (a mount benchmarking as plain tmpfs) was invisible
+   exactly there.
+5. cell= conflates storage backend with geometry, and geometry
+   silently depends on ANOTHER option (merge) and on mount size.
+6. Naming landmine: "compress_ratio" collides with compression ratio
+   in comp_stats (35.00%). Rejected in favor of compress_watermark,
+   which also reads correctly to anyone who knows VM watermarks.
+
+**The coherent model -- three layers, one concept per knob, no
+aliases** (user decision: aliases dropped; this is a project branch,
+upstream can re-add spellings at posting time):
+
+- Layer 1 WHAT: compress=<algo> (none = off) | nocompress. All "off"
+  spellings normalize to one resolved state: no pool.
+- Layer 2 WHEN: compress_watermark=LOW:HIGH. Sentinels: 0:0 always
+  (eager), 100:100 never (= nocompress, no pool), 50:100 pure
+  deferral (maintenance-only aging), 50:70 default target.
+- Layer 3 GEOMETRY: merge_pages (documented large-file knob),
+  cell=SIZE|0, compress_threshold now memparse AND semantically
+  write-time-only (the aging pass compresses any eligible survivor
+  >= 1 page -- small survivors are worth their RAM; this single
+  clarification dissolves grate #2).
+- Global sysfs mirrors the defaults (compressor, compression bool,
+  merge_pages, new compress_watermark). Deliberately internal, no
+  knobs: cell_order derivation, GC/maintenance batch sizes, per-CPU
+  contexts, entry table.
+
+**The policy -- death-before-pop aging** (user's core idea):
+transient files are the point of tmpfs, so compressing them at write
+time spends CPU on data that dies unread. Writes land uncompressed
+in chill mode (cheap candidate marker: list_add under a spinlock);
+unlink/truncate purges the marker; hot mode (usage >= HIGH) compresses
+inline as today; one maintenance pass per mount (shrinker, gc_now,
+periodic delayed_work) MANDATORILY compresses eligible survivors and
+then evacuates sparse cells, budgets alternating ~4:1. Compression
+releases size= accounting (compressed entries are accounted like swap
+pages; shmem_recalc_inode unaccounts blocks), so hot-mode compression
+drops usage below the mark -- the70% high-water is a soft limit, and
+effective capacity for compressible data is size=/ratio. Mode flips
+happen in the maintenance pass only: the write path cost is one
+READ_ONCE(comp->hot), never a percpu_counter compare.
+
+**The per-mount vs global-defaults analysis** (the question this log
+entry exists to preserve):
+
+- Precedence, per option, resolved ONCE at mount:
+  `mount option > global sysfs default > built-in default`.
+  shmem_comp_opts_init() seeds opts from the current sysfs values
+  (copied out under shmem_comp_defaults_lock, never pointers -- the
+  session-2 UAF fix); parse_one overrides what the mount passed;
+  fill_sb resolves the rest and freezes the outcome into
+  sbinfo->comp. After fill_super the sysfs globals are never read on
+  any hot path. Sysfs changes affect only FUTURE mounts; remount
+  cannot change compression state at all (SHMEM_SEEN_COMPRESS guard)
+  -- policy is mount-lifetime by design.
+
+- Resolution matrix (the intended division of labor):
+  - `mount -t tmpfs /a` with sysfs compression=1 compressor=zstd
+    watermark=50:70 -> zstd, 50:70 (all defaults).
+  - `-o compress=lz4` -> lz4 (mount wins), 50:70 (default).
+  - `-o compress=lz4,compress_watermark=0:0` -> lz4 eager (mount
+    wins both).
+  - `-o nocompress` -> uncompressed (mount beats compression=1).
+  - plain mount with sysfs compression=0 -> uncompressed.
+  - `echo zstd > sysfs/compressor` afterwards -> affects only
+    future default-following mounts; the mounted ones are frozen.
+  The sysfs default is how an operator says "everything on this box
+  ages at 50:70 unless a mount opts out"; individual
+  latency-sensitive mounts pin 0:0 or 50:100.
+
+- **The subtlety that would have bitten: unset != explicit zero.**
+  compress_watermark=0:0 ("always") is a valid explicit value that
+  collides with zero-init ("not specified"). This is exactly why
+  shmem_comp_opts already carries cell_seen (cell=0 opt-out vs not
+  given). Watermark needs bool watermark_seen in the opts struct;
+  fill_sb takes the sysfs default only when !seen. Without it a mount
+  asking for 0:0 would silently receive the global default -- the
+  same bug class as cell256k.
+
+- Visibility is the operational half of coping with per-mount
+  config: the resolved-state line at mount prints the full outcome
+  AND why a mount is uncompressed ((nocompress) / (compress=none) /
+  (compress_watermark=100:100)); show_options prints the effective
+  per-mount config into /proc/mounts (compress=zstd,
+  compress_watermark=50:70,merge_pages=8) so any mount's resolved
+  state is auditable after the fact.
+
+- Layer 3 deliberately has NO global default: cell= derives from the
+  mount's own size= and threshold is workload-shaped -- per-mount by
+  nature. Global knobs for them would be additive later if a use
+  case appears.
+
+### What We Learned
+
+- Option surfaces accrete ABI faster than they accrete meaning;
+  an audit pass ("list every knob, unit, alias, and who reads it")
+  is cheap and finds the dead weight (aliases, unit soup, invisible
+  state) before it becomes upstream ABI.
+- The cell256k torture bug was not just a test bug -- it was an
+  option-model bug (participation following a default the operator
+  couldn't see). Fixing the model (resolved-state print +
+  show_options + watermark_seen) is what actually prevents the class.
+- Naming: never introduce a knob name that collides with an existing
+  metric name in the same feature ("ratio").
+- Policy knobs want sentinel values that map onto the existing
+  vocabulary (100:100 == nocompress, no pool) rather than a parallel
+  enum -- one mental model, no fourth way to say "off".
+
+### What We Decided
+
+- No aliases on mount options (project branch; upstream re-adds at
+  posting if desired). compress_watermark over policy-enum+band.
+- Stage 1 (next code commit): option surface v2 end-to-end with the
+  built-in default watermark 0:0 (eager = today's behavior), so the
+  surface is real before the machinery changes behavior; the never
+  sentinel works immediately (no pool).
+- Stage 2: marker list + maintenance pass + hot/cold flips; THEN the
+  default flips to 50:70 and the torture sweep becomes the policy
+  matrix (never / 0:0 / 50:70 / 50:100 configs, predicting T=1
+  toward plain 26 MB/s vs today's 17.1, skipped_dead absorbing
+  transient churn, survivor ratio ~48% unchanged, bounded Shmem
+  overshoot).
+- compress_threshold semantics split: write-time-only knob; aging
+  compresses survivors of any size >= 1 page.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `TMPFS_COMPRESSION_PLAN.md` | "Option Surface v2" + "Compression policy v2" sections (commit 49879bd0ddcb) |
+
+### Test Results
+
+None this session (design only). Stage 1 acceptance: build clean,
+rig suite green with aliases removed (test_mount_sem updated to
+canonical spellings), watermark sentinel mounts resolving as
+specified, show_options lines visible in /proc/mounts.
+
+### Next Steps
+
+1. Stage 1 code: drop aliases from shmem_fs_parameters, memparse for
+   compress_threshold, compress_watermark end-to-end (parse ->
+   opts + watermark_seen -> fill_sb sentinel handling -> sb fields ->
+   show_options helper -> sysfs default knob), built-in default 0:0,
+   resolved-state mount line including why-off. Update rig
+   test_mount_sem; add a 100:100 sentinel case.
+2. Stage 2: marker list + unlink/truncate purge + shmem_comp_maintain
+   (survivors mandatory, cells GC, 4:1 budget, hysteresis flips) +
+   shrinker/periodic triggers; flip default to 50:70; torture policy
+   matrix A/B.
+3. Keep the torture sweep as the standing regression gate for all of
+   it (TEST_TORTURE=1 QEMU_CPUS=4).
