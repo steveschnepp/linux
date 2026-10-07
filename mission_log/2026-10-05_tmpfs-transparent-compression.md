@@ -2445,3 +2445,148 @@ git-initialized on creation**.
   all four .gitkeep files), and a full guest boot on the
   repo-built initrd: fsx 2148 ops A-OK, fsx -e 500 xattr ops
   A-OK, fstorture clean, Test exit code 0.
+
+---
+
+## Addendum: the open-work expansion -- Stage 2 machinery and cellzram hardening
+
+Status of the tree at writing (verified by grep, not assumption): the
+watermark fields exist in mm/shmem_compress.c, but there is no marker
+list, no shmem_comp_maintain(), no stampede guard in mm/cell_store.c,
+and no per-mount stat readers in mm/shmem.c. Both items below are open.
+
+### #1: Stage 2 machinery -- death-before-pop aging, in detail
+
+The design (plan, "Compression policy v2") is settled; what is
+missing is the machinery. Stage 1 (sessions 8-9) landed the OPTION
+surface with the default still 0:0, i.e. eager = today's behavior.
+The write path consults the watermark only for the never sentinel
+(100:100 -> no pool). Stage 2 makes the knob mean something.
+
+What Stage 2 builds, in dependency order:
+
+1. **Candidate markers.** In chill mode (usage < LOW) writes land
+   uncompressed, and each eligible page gets a cheap marker (list_add
+   under a spinlock) so the maintenance pass can find it without a
+   full page-cache walk. Unlink and truncate purge the marker: the
+   counter skipped_dead is the design's payoff -- transient files
+   die unread, and death-before-pop means their bytes never pay a
+   single compression cycle. This is the reason deferred compression
+   beats "compress less eagerly": the cache of un-compressed
+   candidates is self-pruning.
+
+2. **shmem_comp_maintain() -- one pass per mount, three jobs in
+   order:** (a) MANDATORY compression of eligible survivors --
+   order-0, uptodate, unmapped, unpinned folios, clean pages
+   included, compress_threshold IGNORED (any survivor >= 1 page is
+   worth its RAM; this is the semantics split session 9 documented
+   in the knob); (b) sparse-cell evacuation (the session-3 GC pass,
+   utilization-based, batched); (c) hot/chill mode flips. Budgets
+   alternate ~4:1 compression:GC so crypto and GC memcpy do not
+   starve each other -- compression also RAISES cell density, which
+   makes later GC cheaper, so survivors-first is not just fairness.
+
+3. **Triggers:** the pool shrinker (memory pressure), gc_now
+   (deterministic tests), and a periodic delayed_work armed only
+   while candidates are pending.
+
+4. **Mode flips with hysteresis, in the maintenance pass only.**
+   The write path cost stays one READ_ONCE(comp->hot) -- never a
+   percpu_counter compare. Hot mode (usage >= HIGH) compresses
+   inline as today; the HIGH mark is a SOFT limit by design:
+   compression releases size= accounting (compressed entries are
+   accounted like swap pages; shmem_recalc_inode unaccounts blocks),
+   so compressing hot data drops used_blocks back below the mark.
+   Effective capacity for compressible data is size=/ratio.
+
+5. **Default flip 0:0 -> 50:70**, then validation: the torture sweep
+   becomes the policy matrix -- never / 0:0 / 50:70 / 50:100 against
+   the session-7 eager baseline. Predictions already on paper:
+   T=1 single-job throughput toward plain (~26 vs 17.1 MB/s -- writes
+   stop paying inline crypto), skipped_dead absorbing transient
+   churn, survivor ratio unchanged (~48% stored), bounded in-window
+   Shmem overshoot. Watch stale_value_retries in every matrix row:
+   it is the early-warning for the ID-recycling storms the panic
+   layer would otherwise answer with a stopped machine.
+
+Risks to design against while building: the stampede guard (session
+3, still open) is the maintenance pass's companion -- a free burst
+can link sparse cells faster than a lazy shrinker drains them, and
+Stage 2's deferred mode makes candidates MORE numerous, not fewer.
+Per-mount stat readers (comp_pages/comp_bytes, also still open) are
+how the policy matrix observes hot/chill behavior per mount; without
+them the matrix reads global stats only.
+
+### #3: cellzram hardening -- what "phase 3" means, in detail
+
+cellzram status (session 5): spec committed (8121630), device
+implemented (~740 lines, CONFIG_TMPFS_COMP_BLKDEV), 77-assertion rig
+test green, swap trial proven (MADV_PAGEOUT, ~127 MB swapped out,
+full drain after signature punch). What remains is the spec's own
+risk table coming due:
+
+1. **Bounded internal ENOMEM retry on write.** Today a compression
+   or store failure fails the bio with BLK_STS_IOERR (zram's
+   pattern). tmpfs degrades gracefully under pressure; a block
+   device cannot -- swap happens to retry because the failed page
+   stays in the swap cache, but raw device users see EIO. The
+   mitigation has a built-in synergy: cellzram's pools register the
+   same shrinker/GC as tmpfs, so a bounded retry can give cell
+   evacuation a chance to free the memory it needs, instead of
+   failing a write that a few microseconds of GC would have
+   absorbed. Bounded = a small retry count with backoff; this must
+   NOT become an unbounded sleep in the bio path.
+
+2. **Concurrent KASAN soak.** The 77-assertion suite exercises each
+   path -- write/read round-trips, discard drain, reset, algo
+   matrix, swap trial -- but never all at once on one device. The
+   soak: multiple dd writers + gc_now + discard storm simultaneously
+   on the KASAN kernel (SLUB_TINY off). The risk table's
+   "reset races in-flight I/O" item is covered by design
+   (blk_freeze_queue drains bios before the table erase) but this
+   soak is the proof, not the argument. Per the session-10 KASAN
+   scope rule: cell pages are buddy-backed, so the soak's real
+   signal is the panic layer + quiescent verify, not the KASAN log.
+
+3. **Swap slot-free -> discard dependence.** Swap reclamation of
+   freed slots depends on the discard path being honoured. The
+   session-5 trial proved swapout; the phase-3 test is the other
+   half -- swap-slot free moving MemFree via discard. If the swap
+   code needs SWP_DISCARDABLE hints wired for our entries, this is
+   where they go.
+
+4. **The v2 lever -- per-cell batched entries.** The metadata tax
+   per written block (~64 B slab per 4 KiB = 16 MiB per GiB, same
+   class as zram's per-page table) is the largest remaining RAM
+   overhead once data is compressed: at 8 GiB of written blocks it
+   is ~128 MiB of entries. One entry per N contiguous blocks (e.g.
+   32 blocks = 128 KiB per entry) cuts it ~32x. Costs, all of which
+   are design work before code: partial discard inside a batched
+   region needs decompress-split (cut the discarded block's bytes
+   out of the decompressed buffer, recompress the rest -- or
+   refcount sub-ranges); the read path becomes
+   offset-within-entry (machinery already exists from tmpfs merged
+   groups -- the divisor chunking and head recovery); and a
+   single-block write into a batched region invalidates the whole
+   batch (rewrite the region or split the entry). The plan calls
+   this "the single biggest optimization lever left; needs a
+   design pass before v2" -- do not start it inside a hardening
+   session.
+
+5. **Low-priority but named:** comp_algorithm=none still allocates
+   idle per-CPU acomp contexts (needs a pool_create variant);
+   the "cellzram" device name is a placeholder (upstream picks);
+   sysfs group placement (device pools appear under
+   /sys/fs/tmpfs/compression/ -- rename the group
+   compression-agnostically or give cellzram its own); global
+   shmem_comp_global_stats mixes tmpfs and cellzram numbers
+   (accepted for the prototype; per-device mm_stat is
+   authoritative).
+
+Sequencing note for future sessions: Stage 2 is the main line and
+item 4 (batched entries) explicitly waits for a design pass -- the
+honest split is Stage 2 machinery + its stampede/per-mount-stat
+companions first, cellzram hardening 1-3 as the parallel block-dev
+track, batched entries only once both are green and the design has
+been written down. Upstream posting (tmpfs.rst docs, help-text
+wording, sysfs-group naming) trails all of it.
