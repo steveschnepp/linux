@@ -49,6 +49,8 @@ struct cell_pool;
 #include <linux/types.h>
 #include <linux/fs.h>
 
+struct kobject;
+
 /*
  * Maximum pages per merge group (merge_pages mount option / sysfs).
  *
@@ -256,6 +258,38 @@ static inline bool xa_is_shmem_comp(const void *entry)
 		return false;
 	return shmem_comp_type_check(entry);
 }
+
+/*
+ * Global compression defaults and sysfs interface.
+ *
+ * The defaults (enabled, compressor, merge_pages) apply to tmpfs mounts
+ * that do not override them with mount options; storage and the sysfs
+ * attribute handlers live in mm/shmem_compress.c. The accessors exist so
+ * the mount path (mm/shmem.c) can read the defaults without knowing the
+ * internals; they take shmem_comp_defaults_lock because the sysfs
+ * handlers replace/free the values at any time.
+ */
+bool shmem_comp_default_enabled_get(void);
+unsigned int shmem_comp_default_merge_get(void);
+
+/**
+ * shmem_comp_resolve_algo - Resolve the compression algorithm at mount time
+ * @mount_algo: algorithm from the compress=/compressor= mount option,
+ *              may be NULL or empty (meaning "use the defaults")
+ *
+ * Return: kstrdup'd algorithm name (mount option, else sysfs default,
+ *         else the Kconfig default), or NULL on allocation failure.
+ *         Caller frees.
+ */
+char *shmem_comp_resolve_algo(const char *mount_algo);
+
+/*
+ * Sysfs registration: creates the "compression" attribute group under
+ * the parent kobject (the tmpfs kobject, from tmpfs_sysfs_init()).
+ * Registration is best-effort: tmpfs keeps working without the group.
+ */
+int shmem_comp_sysfs_register(struct kobject *parent);
+void shmem_comp_sysfs_unregister(void);
 
 /*
  * Compression pool management.

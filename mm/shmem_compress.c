@@ -45,6 +45,8 @@
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
+#include <linux/string.h>
+#include <linux/sysfs.h>
 #include <linux/zsmalloc.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -1388,6 +1390,276 @@ void shmem_comp_update_stats(bool compressed, unsigned int orig_size,
 
 	spin_unlock(&shmem_comp_stats_lock);
 }
+
+/*
+ * Global compression defaults.
+ *
+ * Overridable at runtime via the sysfs group "compression" under
+ * /sys/fs/tmpfs. Guarded by
+ * shmem_comp_defaults_lock: the mount path reads them while mounting,
+ * the sysfs handlers replace/free them at any time. Mount options
+ * always win over these defaults (see shmem_comp_resolve_algo()).
+ */
+static DEFINE_MUTEX(shmem_comp_defaults_lock);
+static bool shmem_comp_default_enabled;
+static char *shmem_comp_default_compressor;
+static unsigned int shmem_comp_default_merge = 1;
+
+bool shmem_comp_default_enabled_get(void)
+{
+	bool v;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	v = shmem_comp_default_enabled;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return v;
+}
+
+unsigned int shmem_comp_default_merge_get(void)
+{
+	unsigned int v;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	v = shmem_comp_default_merge;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return v;
+}
+
+char *shmem_comp_resolve_algo(const char *mount_algo)
+{
+	char *algo;
+
+	if (mount_algo && mount_algo[0])
+		return kstrdup(mount_algo, GFP_KERNEL);
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	if (shmem_comp_default_compressor)
+		algo = kstrdup(shmem_comp_default_compressor, GFP_KERNEL);
+	else
+		algo = kstrdup(CONFIG_TMPFS_COMPRESSOR_DEFAULT, GFP_KERNEL);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return algo;
+}
+
+#ifdef CONFIG_SYSFS
+/*
+ * Sysfs attributes under /sys/fs/tmpfs, group "compression".
+ *
+ * The "compression", "compressor" and "merge_pages" attributes are the
+ * global defaults for mounts that do not override them; "comp_stats",
+ * "cell_stats" and "gc_now" expose the live state of every pool.
+ * Registered by tmpfs_sysfs_init() in mm/shmem.c with the tmpfs
+ * kobject as parent.
+ */
+static ssize_t compression_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	ret = sysfs_emit(buf, "%d\n", shmem_comp_default_enabled);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return ret;
+}
+
+static ssize_t compression_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	int ret;
+	bool enabled;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	shmem_comp_default_enabled = enabled;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	pr_info("tmpfs: default compression %s\n",
+		enabled ? "enabled" : "disabled");
+	return count;
+}
+static struct kobj_attribute compression_attr = __ATTR(compression, 0644,
+					compression_show, compression_store);
+
+static ssize_t compressor_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	ret = sysfs_emit(buf, "%s\n",
+			 shmem_comp_default_compressor ?:
+			 CONFIG_TMPFS_COMPRESSOR_DEFAULT);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return ret;
+}
+
+static ssize_t compressor_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	char *algo;
+
+	algo = kstrdup(buf, GFP_KERNEL);
+	if (!algo)
+		return -ENOMEM;
+
+	/* Strip newline */
+	algo[strcspn(algo, "\n")] = '\0';
+
+	/* Validate: "none" disables, anything else must be an acomp algo */
+	if (strcmp(algo, "none") != 0 && !crypto_has_acomp(algo, 0, 0)) {
+		pr_warn("tmpfs: compressor '%s' not available\n", algo);
+		kfree(algo);
+		return -EINVAL;
+	}
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	/* Free old value; "none" clears the default (new mounts uncompressed).
+	 * Print the stored value, never a freed string. */
+	kfree(shmem_comp_default_compressor);
+	shmem_comp_default_compressor = strcmp(algo, "none") ? algo : NULL;
+	if (shmem_comp_default_compressor)
+		pr_info("tmpfs: default compressor set to %s\n", algo);
+	else {
+		pr_info("tmpfs: default compressor set to none\n");
+		kfree(algo);
+	}
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return count;
+}
+static struct kobj_attribute compressor_attr = __ATTR(compressor, 0644,
+					compressor_show, compressor_store);
+
+static ssize_t comp_stats_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	struct shmem_comp_stats stats;
+
+	shmem_comp_get_stats(&stats);
+
+	return sysfs_emit(buf,
+		"compressed_pages: %lu\n"
+		"uncompressed_pages: %lu\n"
+		"total_compressed_bytes: %lu\n"
+		"total_uncompressed_bytes: %lu\n"
+		"ratio: %lu.%02lu%%\n"
+		"compress_fails: %lu\n"
+		"decompress_fails: %lu\n"
+		"ram_pool_bytes: %lu\n"
+		"ram_merged_bytes: %lu\n"
+		"ram_entry_bytes: %lu\n"
+		"ram_entries: %lu\n"
+		"ram_total_bytes: %lu\n",
+		stats.compressed_pages,
+		stats.uncompressed_pages,
+		stats.total_compressed_bytes,
+		stats.total_uncompressed_bytes,
+		stats.ratio / 100,
+		stats.ratio % 100,
+		stats.compress_fails,
+		stats.decompress_fails,
+		stats.ram_pool_bytes,
+		stats.ram_merged_bytes,
+		stats.ram_entry_bytes,
+		stats.ram_entries,
+		stats.ram_total_bytes);
+}
+static ssize_t merge_pages_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	ret = sysfs_emit(buf, "%u\n", shmem_comp_default_merge);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return ret;
+}
+
+static ssize_t merge_pages_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned int v;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &v);
+	if (ret)
+		return ret;
+	if (v < 1 || v > SHMEM_COMP_MERGE_MAX)
+		return -EINVAL;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	shmem_comp_default_merge = v;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	pr_info("tmpfs: default merge_pages set to %u\n", v);
+	return count;
+}
+static struct kobj_attribute merge_pages_attr = __ATTR(merge_pages, 0644,
+					merge_pages_show, merge_pages_store);
+
+static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
+
+static ssize_t cell_stats_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return shmem_comp_cell_stats_show(buf, PAGE_SIZE);
+}
+static struct kobj_attribute cell_stats_attr = __ATTR_RO(cell_stats);
+
+/*
+ * Debug hook: run one async GC pass on all cell-backed pools.
+ * Lets tests exercise evacuation deterministically instead of
+ * waiting for memory pressure to hit the shrinker.
+ */
+static ssize_t gc_now_store(struct kobject *kobj,
+			    struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	bool v;
+	int ret;
+
+	ret = kstrtobool(buf, &v);
+	if (ret)
+		return ret;
+	if (v)
+		shmem_comp_cell_gc_all();
+	return count;
+}
+static struct kobj_attribute gc_now_attr = __ATTR(gc_now, 0200, NULL,
+						  gc_now_store);
+
+static struct attribute *tmpfs_comp_attrs[] = {
+	&compression_attr.attr,
+	&compressor_attr.attr,
+	&merge_pages_attr.attr,
+	&comp_stats_attr.attr,
+	&cell_stats_attr.attr,
+	&gc_now_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group tmpfs_comp_attribute_group = {
+	.attrs = tmpfs_comp_attrs,
+	.name = "compression",
+};
+
+int shmem_comp_sysfs_register(struct kobject *parent)
+{
+	return sysfs_create_group(parent, &tmpfs_comp_attribute_group);
+}
+
+void shmem_comp_sysfs_unregister(void)
+{
+	/*
+	 * tmpfs sysfs lives for the lifetime of the system (the tmpfs
+	 * filesystem is never unregistered), so there is no teardown
+	 * path yet. Kept for API symmetry with register().
+	 */
+}
+#endif /* CONFIG_SYSFS */
 
 /*
  * Module initialization.
