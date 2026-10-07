@@ -131,7 +131,9 @@ struct shmem_comp_pcpu {
 struct shmem_comp_sb {
 	bool enabled;
 	char *compressor;		/* owned; freed with the sb */
-	unsigned int threshold_bytes;		/* min file size to compress, bytes */
+	unsigned int threshold_bytes;		/* min file size to compress (write time), bytes */
+	unsigned int watermark_low;		/* chill return, percent usage (0:0 = eager) */
+	unsigned int watermark_high;		/* hot compress, percent usage */
 	unsigned int merge_pages;		/* pages per compression group */
 	unsigned int cell_order;	/* cell storage order, informational */
 	struct shmem_comp_pool *pool;	/* compression pool */
@@ -1449,6 +1451,23 @@ static DEFINE_MUTEX(shmem_comp_defaults_lock);
 static bool shmem_comp_default_enabled;
 static char *shmem_comp_default_compressor;
 static unsigned int shmem_comp_default_merge = 1;
+static unsigned int shmem_comp_default_wm_low;	/* built-in default 0:0 = eager */
+static unsigned int shmem_comp_default_wm_high;
+
+static const char *shmem_comp_off_reason_str(enum shmem_comp_off_reason reason)
+{
+	switch (reason) {
+	case SHMEM_COMP_OFF_NOFLAG:
+		return "nocompress";
+	case SHMEM_COMP_OFF_ALGO_NONE:
+		return "compress=none";
+	case SHMEM_COMP_OFF_WATERMARK:
+		return "compress_watermark=100:100";
+	case SHMEM_COMP_OFF_DEFAULT:
+	default:
+		return "not participating (default off)";
+	}
+}
 
 /*
  * shmem_comp_opts_init - Initialise parsed mount options to defaults
@@ -1461,7 +1480,9 @@ static unsigned int shmem_comp_default_merge = 1;
 void shmem_comp_opts_init(struct shmem_comp_opts *opts)
 {
 	memset(opts, 0, sizeof(*opts));
+	mutex_lock(&shmem_comp_defaults_lock);
 	opts->compress = shmem_comp_default_enabled;
+	mutex_unlock(&shmem_comp_defaults_lock);
 }
 
 void shmem_comp_opts_free(struct shmem_comp_opts *opts)
@@ -1493,6 +1514,7 @@ int shmem_comp_opts_set_algo(struct shmem_comp_opts *opts, char *algo)
 	}
 	if (!strcmp(algo, "none")) {
 		opts->compress = false;
+		opts->off_reason = SHMEM_COMP_OFF_ALGO_NONE;
 		kfree(algo);
 		return 0;
 	}
@@ -1533,6 +1555,36 @@ int shmem_comp_opts_set_cell(struct shmem_comp_opts *opts, const char *val)
 	return 0;
 }
 
+/*
+ * shmem_comp_opts_set_watermark - Parse the compress_watermark= mount option
+ * @opts: options to update
+ * @val: "LOW:HIGH" percents (decimal)
+ *
+ * Return: 0 on success, -EINVAL on a bad value (mount fails).
+ *
+ * Sentinels: 0:0 = always (eager), 100:100 = never (identical to
+ * nocompress, no pool), 50:100 = pure deferral. low <= high is
+ * required (hysteresis band, never inverted). The watermark_seen flag
+ * distinguishes an explicit "0:0" from "not given", which lets
+ * fill_sb() take the sysfs default only when the mount did not ask.
+ */
+int shmem_comp_opts_set_watermark(struct shmem_comp_opts *opts, const char *val)
+{
+	unsigned int low, high;
+	char *rest;
+
+	low = simple_strtoul(val, &rest, 10);
+	if (*rest != ':')
+		return -EINVAL;
+	high = simple_strtoul(rest + 1, &rest, 10);
+	if (*rest || low > 100 || high > 100 || low > high)
+		return -EINVAL;
+	opts->watermark_low = low;
+	opts->watermark_high = high;
+	opts->watermark_seen = true;
+	return 0;
+}
+
 static unsigned int shmem_comp_default_merge_get(void)
 {
 	unsigned int v;
@@ -1559,6 +1611,15 @@ static char *shmem_comp_resolve_algo(const char *mount_algo)
 	return algo;
 }
 
+static void shmem_comp_default_watermark_get(unsigned int *low,
+					      unsigned int *high)
+{
+	mutex_lock(&shmem_comp_defaults_lock);
+	*low = shmem_comp_default_wm_low;
+	*high = shmem_comp_default_wm_high;
+	mutex_unlock(&shmem_comp_defaults_lock);
+}
+
 static inline struct shmem_sb_info *shmem_comp_get_sb(struct super_block *sb)
 {
 	return sb->s_fs_info;
@@ -1578,19 +1639,38 @@ static inline struct shmem_sb_info *shmem_comp_get_sb(struct super_block *sb)
  * creation failure is graceful: a warning and an uncompressed mount,
  * never a failed mount. On success sbinfo->comp is non-NULL and owns
  * the pool and the compressor string (freed by put_super()).
+ *
+ * Watermark resolution (WHEN layer): explicit mount option, else the
+ * sysfs default, else the built-in default (0:0 = eager). The 100:100
+ * sentinel resolves to "never": no pool, no memory overhead --
+ * identical to nocompress, spelled out so a mount can be policy-forced
+ * off without the WHAT layer. After fill_sb() the sysfs globals are
+ * never read again for this mount.
  */
 int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 		       struct shmem_comp_opts *opts,
 		       unsigned long tmpfs_bytes)
 {
+	enum shmem_comp_off_reason reason = opts->off_reason;
 	struct shmem_comp_sb *comp;
+	unsigned int wm_low, wm_high;
 	char *algo;
 	unsigned int cell_order;
 
 	sbinfo->comp = NULL;
 
-	if (!opts->compress)
+	if (opts->watermark_seen) {
+		wm_low = opts->watermark_low;
+		wm_high = opts->watermark_high;
+	} else {
+		shmem_comp_default_watermark_get(&wm_low, &wm_high);
+	}
+
+	if (!opts->compress) {
+		pr_info("tmpfs: compression off (%s)\n",
+			shmem_comp_off_reason_str(reason));
 		return 0;
+	}
 
 	comp = kzalloc(sizeof(*comp), GFP_KERNEL);
 	if (!comp)
@@ -1604,6 +1684,22 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 
 	if (strcmp(algo, "none") == 0) {
 		/* "none": mount is uncompressed */
+		if (reason == SHMEM_COMP_OFF_DEFAULT)
+			reason = SHMEM_COMP_OFF_ALGO_NONE;
+		pr_info("tmpfs: compression off (%s)\n",
+			shmem_comp_off_reason_str(reason));
+		kfree(algo);
+		kfree(comp);
+		return 0;
+	}
+
+	/*
+	 * 100:100 sentinel: never compress. No pool, no memory
+	 * overhead -- identical resolved state to nocompress.
+	 */
+	if (wm_low == 100 && wm_high == 100) {
+		pr_info("tmpfs: compression off (%s)\n",
+			shmem_comp_off_reason_str(SHMEM_COMP_OFF_WATERMARK));
 		kfree(algo);
 		kfree(comp);
 		return 0;
@@ -1652,6 +1748,8 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 	/* ownership transfers */
 	comp->compressor = algo;
 	comp->threshold_bytes = opts->threshold_bytes ?: 65536;
+	comp->watermark_low = wm_low;
+	comp->watermark_high = wm_high;
 	comp->cell_order = cell_order;
 	comp->merge_pages = opts->merge_pages ?:
 		      (shmem_comp_default_merge_get() ?: 1);
@@ -1659,9 +1757,10 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 	atomic_long_set(&comp->bytes, 0);
 	sbinfo->comp = comp;
 
-	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u cell_order=%u\n",
+	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u "
+		"cell_order=%u watermark=%u:%u\n",
 		comp->compressor, comp->merge_pages, comp->threshold_bytes,
-		comp->cell_order);
+		comp->cell_order, comp->watermark_low, comp->watermark_high);
 	return 0;
 }
 

@@ -4548,6 +4548,7 @@ enum shmem_param {
 	Opt_nocompress,
 	Opt_compress_algo,
 	Opt_compress_threshold,
+	Opt_compress_watermark,
 	Opt_compress_merge,
 	Opt_cell,
 #endif
@@ -4590,6 +4591,7 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_string("compress_threshold", Opt_compress_threshold),
 	fsparam_u32   ("merge_pages", Opt_compress_merge),
+	fsparam_string("compress_watermark", Opt_compress_watermark),
 	fsparam_string("cell", Opt_cell),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
@@ -4800,6 +4802,7 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 #ifdef CONFIG_TMPFS_COMPRESSION
 	case Opt_nocompress:
 		ctx->comp_opts.compress = false;
+		ctx->comp_opts.off_reason = SHMEM_COMP_OFF_NOFLAG;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_algo:
@@ -4817,6 +4820,12 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		if (*rest || size > UINT_MAX)
 			goto bad_value;
 		ctx->comp_opts.threshold_bytes = size;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_compress_watermark:
+		if (shmem_comp_opts_set_watermark(&ctx->comp_opts,
+						   param->string))
+			goto bad_value;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_merge:

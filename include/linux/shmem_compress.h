@@ -285,19 +285,41 @@ static inline bool xa_is_shmem_comp(const void *entry)
 struct shmem_comp_sb;
 
 /*
+ * Why a mount runs uncompressed (option surface v2): the resolved-state
+ * line at mount must say WHY, not just that compression is off.
+ */
+enum shmem_comp_off_reason {
+	SHMEM_COMP_OFF_DEFAULT = 0,	/* participation default off (sysfs) */
+	SHMEM_COMP_OFF_NOFLAG,		/* nocompress */
+	SHMEM_COMP_OFF_ALGO_NONE,	/* compress=none (or default algo none) */
+	SHMEM_COMP_OFF_WATERMARK,	/* compress_watermark=100:100 */
+};
+
+/*
  * Parsed compression mount options: compress=, nocompress,
- * compress_threshold=, merge_pages=, cell=. "Unset" means zero/NULL;
- * shmem_comp_fill_sb() substitutes the sysfs/Kconfig defaults for
- * those. threshold_bytes takes memparse syntax at mount ("64K"); 0
- * means "use the default" -- there is no way to ask for "compress
- * everything" other than threshold_bytes=1. The threshold applies to
- * WRITE-TIME compression only; the aging pass (Stage 2) compresses
- * any eligible survivor >= 1 page.
+ * compress_threshold=, compress_watermark=, merge_pages=, cell=.
+ * "Unset" means zero/NULL; shmem_comp_fill_sb() substitutes the
+ * sysfs/Kconfig defaults for those. threshold_bytes takes memparse
+ * syntax at mount ("64K"); 0 means "use the default" -- there is no
+ * way to ask for "compress everything" other than
+ * threshold_bytes=1. The threshold applies to WRITE-TIME compression
+ * only; the aging pass (Stage 2) compresses any eligible survivor
+ * >= 1 page.
+ *
+ * watermark_{low,high} is the WHEN layer (compress_watermark=LOW:HIGH,
+ * percents, low <= high; 0:0 = always/eager, 100:100 = never).
+ * watermark_seen distinguishes "explicit 0:0" from "not given":
+ * fill_sb() takes the sysfs default only when !seen, so a mount
+ * asking for 0:0 never silently receives the global default.
  */
 struct shmem_comp_opts {
 	bool compress;			/* false = nocompress / compress=none */
+	enum shmem_comp_off_reason off_reason;	/* why compress is false */
 	char *compressor;		/* algorithm, NULL = default */
 	unsigned int threshold_bytes;		/* write-time min file size, bytes; 0 = default */
+	unsigned int watermark_low;		/* WHEN: chill return, percent usage */
+	unsigned int watermark_high;		/* WHEN: hot compress, percent usage */
+	bool watermark_seen;			/* compress_watermark= given */
 	unsigned int merge_pages;		/* pages; 0 = sysfs default */
 	unsigned int cell_order;	/* 0 = derive from tmpfs size */
 	bool cell_seen;			/* cell= given (incl. cell=0 opt-out) */
@@ -315,6 +337,13 @@ void shmem_comp_opts_free(struct shmem_comp_opts *opts);
  */
 int shmem_comp_opts_set_algo(struct shmem_comp_opts *opts, char *algo);
 int shmem_comp_opts_set_cell(struct shmem_comp_opts *opts, const char *val);
+
+/*
+ * Parse the compress_watermark=LOW:HIGH mount option (percents,
+ * low <= high). Return: 0 on success, -EINVAL on a bad value (mount
+ * fails).
+ */
+int shmem_comp_opts_set_watermark(struct shmem_comp_opts *opts, const char *val);
 
 /*
  * fill_sb: resolve the algorithm (mount option, else sysfs default,
