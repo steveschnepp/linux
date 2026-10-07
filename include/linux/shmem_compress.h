@@ -4,6 +4,7 @@
 
 struct shmem_comp_pool;
 struct cell_pool;
+struct shmem_sb_info;
 
 /*
  * shmem_compress.h - Internal interfaces for tmpfs transparent compression
@@ -260,28 +261,106 @@ static inline bool xa_is_shmem_comp(const void *entry)
 }
 
 /*
+ * Per-mount compression state and parsed mount options (carve C3/C4).
+ *
+ * shmem_comp_fill_sb() creates a struct shmem_comp_sb for mounts with
+ * compression enabled; shmem_comp_put_super() frees it. It hangs off
+ * the single pointer shmem_sb_info.comp (NULL = uncompressed mount),
+ * so mm/shmem.c never touches compression internals directly.
+ *
+ * Ownership rules:
+ *  - opts->compressor is owned by the opts (freed by opts_free());
+ *    fill_sb() copies it out with shmem_comp_resolve_algo(), so the
+ *    fs_context can outlive a failed mount.
+ *  - comp->compressor is owned by the comp and freed by put_super().
+ *  - fill_sb() failure before pool creation fails the mount (-ENOMEM);
+ *    pool-creation failure is graceful: the mount runs uncompressed.
+ *
+ * The shmem_comp_sb definition is visible here only while the
+ * compression implementation block still lives in mm/shmem.c (carve
+ * C1). Once it moves into mm/shmem_compress.c the definition becomes
+ * private to that file.
+ */
+struct shmem_comp_sb {
+	bool enabled;
+	char *compressor;		/* owned; freed with the sb */
+	unsigned int threshold;		/* min file size to compress, bytes */
+	unsigned int merge;		/* pages per compression group */
+	unsigned int cell_order;	/* cell storage order, informational */
+	struct shmem_comp_pool *pool;	/* compression pool */
+	atomic_long_t pages;		/* compressed pages (this mount) */
+	atomic_long_t bytes;		/* compressed bytes stored (this mount) */
+};
+
+/*
+ * Parsed compression mount options: compress=, nocompress,
+ * compress_threshold=, merge_pages=, cell=. "Unset" means zero/NULL;
+ * shmem_comp_fill_sb() substitutes the sysfs/Kconfig defaults for
+ * those. threshold-0-means-default is the one quirk: there is no way
+ * to ask for "compress everything" other than threshold=1.
+ */
+struct shmem_comp_opts {
+	bool compress;			/* false = nocompress / compress=none */
+	char *compressor;		/* algorithm, NULL = default */
+	unsigned int threshold;		/* bytes; 0 = default */
+	unsigned int merge;		/* pages; 0 = sysfs default */
+	unsigned int cell_order;	/* 0 = derive from tmpfs size */
+	bool cell_seen;			/* cell= given (incl. cell=0 opt-out) */
+};
+
+void shmem_comp_opts_init(struct shmem_comp_opts *opts);
+void shmem_comp_opts_free(struct shmem_comp_opts *opts);
+
+/*
+ * Mount-option parsing helpers, called from shmem_parse_one() so the
+ * option ABI stays greppable in shmem_fs_parameters while the logic
+ * lives here. set_algo() consumes @algo on success (stores it, or
+ * frees it for "none"/empty); on -EINVAL @algo is untouched and the
+ * caller frees it.
+ */
+int shmem_comp_opts_set_algo(struct shmem_comp_opts *opts, char *algo);
+int shmem_comp_opts_set_cell(struct shmem_comp_opts *opts, const char *val);
+
+/*
+ * fill_sb: resolve the algorithm (mount option, else sysfs default,
+ * else Kconfig default), derive the cell order from @tmpfs_bytes when
+ * cell= was not given, and create the pool. Returns 0 on success (also
+ * when the mount runs uncompressed), -ENOMEM when the algorithm string
+ * cannot be allocated (mount fails).
+ *
+ * put_super: release the pool and free the comp; safe to call on a
+ * partially initialized or NULL comp (mount-failure path).
+ */
+int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
+		       struct shmem_comp_opts *opts,
+		       unsigned long tmpfs_bytes);
+void shmem_comp_put_super(struct shmem_sb_info *sbinfo);
+
+/*
+ * Write-path hook (shmem_write_end): true when this inode's mount has
+ * an enabled pool and the file is at/over the compression threshold.
+ */
+bool shmem_comp_should_compress(struct inode *inode);
+
+/*
+ * Eviction hook (shmem_free_swap): release one compressed page-cache
+ * slot through the entry ID table. Compression entries are not swap
+ * entries; routing them through the swap code WARNs and leaks the
+ * compressed block. The xarray erase itself stays in shmem_free_swap()
+ * (under the xas lock); this only drops the slot reference and updates
+ * per-mount accounting.
+ */
+void shmem_comp_free_swap(struct address_space *mapping, void *radswap);
+
+/*
  * Global compression defaults and sysfs interface.
  *
  * The defaults (enabled, compressor, merge_pages) apply to tmpfs mounts
  * that do not override them with mount options; storage and the sysfs
- * attribute handlers live in mm/shmem_compress.c. The accessors exist so
- * the mount path (mm/shmem.c) can read the defaults without knowing the
- * internals; they take shmem_comp_defaults_lock because the sysfs
- * handlers replace/free the values at any time.
+ * attribute handlers live in mm/shmem_compress.c. Guarded by
+ * shmem_comp_defaults_lock because the sysfs handlers replace/free the
+ * values at any time.
  */
-bool shmem_comp_default_enabled_get(void);
-unsigned int shmem_comp_default_merge_get(void);
-
-/**
- * shmem_comp_resolve_algo - Resolve the compression algorithm at mount time
- * @mount_algo: algorithm from the compress=/compressor= mount option,
- *              may be NULL or empty (meaning "use the defaults")
- *
- * Return: kstrdup'd algorithm name (mount option, else sysfs default,
- *         else the Kconfig default), or NULL on allocation failure.
- *         Caller frees.
- */
-char *shmem_comp_resolve_algo(const char *mount_algo);
 
 /*
  * Sysfs registration: creates the "compression" attribute group under

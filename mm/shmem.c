@@ -129,13 +129,8 @@ struct shmem_options {
 	unsigned short quota_types;
 	struct shmem_quota_limits qlimits;
 #ifdef CONFIG_TMPFS_COMPRESSION
-	/* Transparent compression options */
-	bool comp_compress;          /* true=compress, false=nocompress */
-	char *comp_compressor;       /* Algorithm name (NULL = default) */
-	unsigned int comp_threshold; /* Min file size to compress */
-	unsigned int comp_merge;     /* pages per compression group */
-	unsigned int comp_cell_order; /* cell storage: alloc_pages order, 0=zsmalloc */
-	bool comp_cell_seen;        /* cell= was given (incl. cell=0 opt-out) */
+	/* Transparent compression options (parsed, see shmem_compress.c) */
+	struct shmem_comp_opts comp_opts;
 #endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
@@ -1009,40 +1004,13 @@ static long shmem_free_swap(struct address_space *mapping,
 	if (nr_pages) {
 #ifdef CONFIG_TMPFS_COMPRESSION
 		/*
-		 * Compression entries are not swap entries: release them
-		 * via the entry ID table instead of the swap code (which
-		 * WARNs "Bad swap file entry" and leaks the compressed
-		 * block on truncate/eviction).
+		 * Compression entries are not swap entries: release the
+		 * slot via the entry ID table, not the swap code (which
+		 * WARNs "Bad swap file entry" and leaks the block).
 		 */
-		if (is_shmem_comp_entry(radix_to_swp_entry(radswap))) {
-			swp_entry_t se = radix_to_swp_entry(radswap);
-			struct shmem_sb_info *sbinfo =
-				SHMEM_SB(mapping->host->i_sb);
-			unsigned int id = shmem_comp_entry_id(se);
-			unsigned int length = 0, entry_nr = 1;
-			bool got, last;
-
-			/*
-			 * Our slot still holds its entry reference at this
-			 * point (released below), so get() cannot fail; the
-			 * pin keeps the entry and its data alive across the
-			 * release. The entry frees its zsmalloc block itself
-			 * when the last reference of any kind drops.
-			 */
-			got = shmem_comp_entry_get(id, NULL, &length,
-						   &entry_nr, NULL, NULL);
-			last = shmem_comp_entry_release(id);
-			if (got)
-				shmem_comp_entry_put(id);
-			if (last && got) {
-				atomic_long_sub(entry_nr, &sbinfo->comp_pages);
-				atomic_long_sub(length,
-						&sbinfo->comp_bytes);
-				shmem_comp_update_stats(false,
-							entry_nr * PAGE_SIZE,
-							length);
-			}
-		} else
+		if (is_shmem_comp_entry(radix_to_swp_entry(radswap)))
+			shmem_comp_free_swap(mapping, radswap);
+		else
 #endif
 			swap_put_entries_direct(radix_to_swp_entry(radswap),
 						nr_pages);
@@ -2378,7 +2346,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	 * memcpy from a cell already returned to the buddy.  Zsmalloc
 	 * loads chunk by chunk through the handle array.
 	 */
-	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool)) {
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
 		cbuf = kmalloc(comp_len, GFP_KERNEL);
 		if (!cbuf) {
 			shmem_comp_entry_put(id);
@@ -2408,7 +2376,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			return -ENOMEM;
 		}
 
-		ret = shmem_comp_load_merged(sbinfo->comp_pool, handles,
+		ret = shmem_comp_load_merged(sbinfo->comp->pool, handles,
 					      nchunks, cbuf, &comp_len);
 		if (ret) {
 			kfree(cbuf);
@@ -2425,7 +2393,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	}
 
 	dlen = (unsigned int)nr_pages * PAGE_SIZE;
-	ret = shmem_comp_decompress(sbinfo->comp_pool, cbuf, comp_len,
+	ret = shmem_comp_decompress(sbinfo->comp->pool, cbuf, comp_len,
 				    dbuf, &dlen);
 	if (ret) {
 		kfree(cbuf);
@@ -2494,8 +2462,8 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	}
 
 	/* One group decompressed: update accounting once */
-	atomic_long_sub(nr_pages, &sbinfo->comp_pages);
-	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
+	atomic_long_sub(nr_pages, &sbinfo->comp->pages);
+	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
 	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
 				comp_len);
 
@@ -2595,7 +2563,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 
 	/* One crypto call covers the whole group */
 	comp_len = (unsigned int)nr * PAGE_SIZE;
-	ret = shmem_comp_compress(sbinfo->comp_pool, kbuf,
+	ret = shmem_comp_compress(sbinfo->comp->pool, kbuf,
 				  (unsigned int)nr * PAGE_SIZE,
 				  cbuf, &comp_len);
 	if (ret || comp_len >= nr * PAGE_SIZE) {
@@ -2611,23 +2579,23 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 	 * group because ZS_MAX_ALLOC_SIZE is PAGE_SIZE; cell storage
 	 * has no such limit (cells are up to 4 MiB).
 	 */
-	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool)) {
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
 		unsigned long handle;
 
-		handle = shmem_comp_store(sbinfo->comp_pool,
+		handle = shmem_comp_store(sbinfo->comp->pool,
 					   cbuf, comp_len);
 		if (!handle) {
 			ret = 0;
 			goto cleanup;
 		}
-		id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle,
+		id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle,
 					     comp_len, nr, NULL, 0);
 		if (!id) {
 			u16 cellid;
 			u32 offset;
 
 			shmem_comp_unpack_loc(handle, &cellid, &offset);
-			cell_free(shmem_comp_pool_cells(sbinfo->comp_pool),
+			cell_free(shmem_comp_pool_cells(sbinfo->comp->pool),
 				  cellid, offset, comp_len);
 			ret = 0;
 			goto cleanup;
@@ -2636,18 +2604,18 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 		unsigned long *handles = NULL;
 		unsigned short nchunks = 0;
 
-		ret = shmem_comp_store_merged(sbinfo->comp_pool,
+		ret = shmem_comp_store_merged(sbinfo->comp->pool,
 					      cbuf, comp_len,
 					      &handles, &nchunks);
 		if (ret) {
 			ret = 0;
 			goto cleanup;
 		}
-		id = shmem_comp_entry_alloc(sbinfo->comp_pool, 0,
+		id = shmem_comp_entry_alloc(sbinfo->comp->pool, 0,
 					     comp_len, nr,
 					     handles, nchunks);
 		if (!id) {
-			shmem_comp_free_merged(sbinfo->comp_pool,
+			shmem_comp_free_merged(sbinfo->comp->pool,
 					       handles, nchunks);
 			ret = 0;
 			goto cleanup;
@@ -2672,8 +2640,8 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 		folio_put(folios[i]);
 	}
 
-	atomic_long_add(nr, &sbinfo->comp_pages);
-	atomic_long_add(comp_len, &sbinfo->comp_bytes);
+	atomic_long_add(nr, &sbinfo->comp->pages);
+	atomic_long_add(comp_len, &sbinfo->comp->bytes);
 	shmem_comp_update_stats(true, (unsigned int)nr * PAGE_SIZE,
 				comp_len);
 
@@ -2717,7 +2685,7 @@ cleanup:
 static unsigned int shmem_comp_chunk_nr(struct shmem_sb_info *sbinfo,
 					unsigned int nr)
 {
-	unsigned int cell_pages = shmem_comp_pool_cell_pages(sbinfo->comp_pool);
+	unsigned int cell_pages = shmem_comp_pool_cell_pages(sbinfo->comp->pool);
 	unsigned int d;
 
 	if (!cell_pages || nr <= cell_pages)
@@ -2732,7 +2700,7 @@ static unsigned int shmem_comp_chunk_nr(struct shmem_sb_info *sbinfo,
 static int shmem_compress_group(struct inode *inode, pgoff_t last)
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
-	unsigned int nr = sbinfo->comp_merge;
+	unsigned int nr = sbinfo->comp->merge;
 	unsigned int chunk, off;
 	pgoff_t head;
 
@@ -2788,7 +2756,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 
 	*foliop = NULL;
 
-	if (!sbinfo->comp_pool)
+	if (!sbinfo->comp)
 		return -ENODEV;
 
 	/*
@@ -2833,10 +2801,10 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	 * move under us (objects stay put until zs_free), so the plain
 	 * load is safe there.
 	 */
-	if (shmem_comp_pool_uses_cells(sbinfo->comp_pool))
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool))
 		ret = shmem_comp_load_entry(id, src, &comp_len);
 	else
-		ret = shmem_comp_load(sbinfo->comp_pool, handle, src, &comp_len);
+		ret = shmem_comp_load(sbinfo->comp->pool, handle, src, &comp_len);
 	if (ret) {
 		kfree(src);
 		shmem_comp_entry_put(id);
@@ -2862,7 +2830,7 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	/* Decompress into the folio */
 	dst = kmap_local_folio(folio, 0);
 	dlen = PAGE_SIZE;
-	ret = shmem_comp_decompress(sbinfo->comp_pool, src, comp_len,
+	ret = shmem_comp_decompress(sbinfo->comp->pool, src, comp_len,
 				    dst, &dlen);
 	kunmap_local(dst);
 	kfree(src);
@@ -2903,8 +2871,8 @@ static int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	shmem_comp_entry_release(id);
 
 	/* Update accounting */
-	atomic_long_dec(&sbinfo->comp_pages);
-	atomic_long_sub(comp_len, &sbinfo->comp_bytes);
+	atomic_long_dec(&sbinfo->comp->pages);
+	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
 	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
 
 	shmem_comp_entry_put(id);
@@ -2945,7 +2913,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	unsigned long handle;
 	int ret;
 
-	if (!sbinfo->comp_pool || !sbinfo->comp_enabled)
+	if (!sbinfo->comp)
 		return -ENOTSUPP;
 
 	/*
@@ -2953,8 +2921,8 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * been written (index is the last page of the group). Tail
 	 * pages that do not fill a group remain uncompressed.
 	 */
-	if (sbinfo->comp_merge > 1) {
-		if ((index + 1) % sbinfo->comp_merge == 0)
+	if (sbinfo->comp->merge > 1) {
+		if ((index + 1) % sbinfo->comp->merge == 0)
 			return shmem_compress_group(inode, index);
 		return 0;
 	}
@@ -2999,7 +2967,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 
 	/* Compress the page */
 	comp_len = PAGE_SIZE;
-	ret = shmem_comp_compress(sbinfo->comp_pool, src, PAGE_SIZE,
+	ret = shmem_comp_compress(sbinfo->comp->pool, src, PAGE_SIZE,
 				 comp_buf, &comp_len);
 	kunmap_local(src);
 
@@ -3011,7 +2979,7 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	}
 
 	/* Store compressed data in zsmalloc pool */
-	handle = shmem_comp_store(sbinfo->comp_pool, comp_buf, comp_len);
+	handle = shmem_comp_store(sbinfo->comp->pool, comp_buf, comp_len);
 	kfree(comp_buf);
 
 	if (!handle) {
@@ -3025,10 +2993,10 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * into the xarray value, so the page cache stores only the ID.
 	 * The entry owns the handle from here (freed with the entry).
 	 */
-	id = shmem_comp_entry_alloc(sbinfo->comp_pool, handle, comp_len,
+	id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle, comp_len,
 				    1, NULL, 0);
 	if (!id) {
-		shmem_comp_free(sbinfo->comp_pool, handle);
+		shmem_comp_free(sbinfo->comp->pool, handle);
 		folio_unlock(folio);
 		return -ENOMEM;
 	}
@@ -3053,8 +3021,8 @@ static int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	shmem_delete_from_page_cache(folio, swp_to_radix_entry(comp_entry));
 
 	/* Update accounting */
-	atomic_long_inc(&sbinfo->comp_pages);
-	atomic_long_add(comp_len, &sbinfo->comp_bytes);
+	atomic_long_inc(&sbinfo->comp->pages);
+	atomic_long_add(comp_len, &sbinfo->comp->bytes);
 	shmem_comp_update_stats(true, PAGE_SIZE, comp_len);
 
 	/*
@@ -4143,18 +4111,12 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 
 #ifdef CONFIG_TMPFS_COMPRESSION
 	/*
-	 * Attempt compression after dropping the folio lock:
-	 * shmem_compress_folio() takes the lock itself and folio_lock()
-	 * is not recursive. The caller still holds a reference until
-	 * the folio_put() below.
+	 * Compression runs after folio_unlock: shmem_compress_folio()
+	 * takes the lock itself and folio_lock() is not recursive.
+	 * The caller's reference keeps the folio alive.
 	 */
-	{
-		struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
-
-		if (sbinfo->comp_enabled && sbinfo->comp_pool &&
-		    i_size_read(inode) >= sbinfo->comp_threshold)
-			shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
-	}
+	if (shmem_comp_should_compress(inode))
+		shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
 #endif
 
 	folio_put(folio);
@@ -5575,60 +5537,34 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		break;
 #ifdef CONFIG_TMPFS_COMPRESSION
 	case Opt_nocompress:
-		ctx->comp_compress = false;
+		ctx->comp_opts.compress = false;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_algo:
-		if (param->string && strcmp(param->string, "none") == 0) {
-			ctx->comp_compress = false;
-			kfree(param->string);
-			param->string = NULL;
-		} else {
-			ctx->comp_compress = true;
-			if (param->string && param->string[0]) {
-				/* fail the mount early on typos/missing algorithms */
-				if (!crypto_has_acomp(param->string, 0, 0))
-					return invalfc(fc,
-						"tmpfs: compressor '%s' unavailable",
-						param->string);
-				kfree(ctx->comp_compressor);
-				ctx->comp_compressor = param->string;
-				param->string = NULL;
-			}
-		}
+		if (shmem_comp_opts_set_algo(&ctx->comp_opts,
+					     param->string))
+			return invalfc(fc,
+				"tmpfs: compressor '%s' unavailable",
+				param->string);
+		/* helper consumed the string on success */
+		param->string = NULL;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_threshold:
-		ctx->comp_threshold = result.uint_32;
+		ctx->comp_opts.threshold = result.uint_32;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_merge:
 		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_MERGE_MAX)
 			goto bad_value;
-		ctx->comp_merge = result.uint_32;
+		ctx->comp_opts.merge = result.uint_32;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
-	case Opt_cell: {
-		unsigned long bytes = memparse(param->string, NULL);
-		unsigned int order;
-
-		/* cell=0 explicitly opts out of cell storage */
-		if (bytes == 0) {
-			ctx->comp_cell_order = 0;
-			ctx->comp_cell_seen = true;
-			ctx->seen |= SHMEM_SEEN_COMPRESS;
-			break;
-		}
-		if (!is_power_of_2(bytes) ||
-		    bytes < (PAGE_SIZE << CELL_ORDER_MIN) ||
-		    bytes > (PAGE_SIZE << CELL_ORDER_MAX))
+	case Opt_cell:
+		if (shmem_comp_opts_set_cell(&ctx->comp_opts, param->string))
 			goto bad_value;
-		order = ilog2(bytes / PAGE_SIZE);
-		ctx->comp_cell_order = order;
-		ctx->comp_cell_seen = true;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
-	}
 #endif
 	case Opt_casefold_version:
 		return shmem_parse_opt_casefold(fc, param, false);
@@ -5876,12 +5812,7 @@ static void shmem_put_super(struct super_block *sb)
 	free_percpu(sbinfo->ino_batch);
 	percpu_counter_destroy(&sbinfo->used_blocks);
 #ifdef CONFIG_TMPFS_COMPRESSION
-	/* Clean up compression pool */
-	if (sbinfo->comp_pool) {
-		shmem_comp_pool_put(sbinfo->comp_pool);
-		sbinfo->comp_pool = NULL;
-	}
-	kfree(sbinfo->comp_compressor);
+	shmem_comp_put_super(sbinfo);
 #endif /* CONFIG_TMPFS_COMPRESSION */
 	mpol_put(sbinfo->mpol);
 #ifdef CONFIG_TMPFS_XATTR
@@ -6011,83 +5942,12 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 #endif /* CONFIG_TMPFS_QUOTA */
 
 #ifdef CONFIG_TMPFS_COMPRESSION
-	/* Initialize compression pool if enabled */
-	if (ctx->comp_compress) {
-		char *algo;
-
-		/*
-		 * use mount algo, else sysfs default, else Kconfig default;
-		 * empty strings and "none" all mean "no compression".
-		 */
-		algo = shmem_comp_resolve_algo(ctx->comp_compressor);
-		if (!algo) {
-			error = -ENOMEM;
-			goto failed;
-		}
-
-		/* Validate algorithm and create pool */
-		if (strcmp(algo, "none") != 0) {
-			unsigned int cell_order = ctx->comp_cell_order;
-			unsigned int merge;
-			unsigned long tmpfs_bytes;
-
-			/*
-			 * Default cell order when cell= is not given:
-			 * scale with the filesystem size so ~100-1000 cells
-			 * cover the tmpfs.  Larger tmpfs → larger cells →
-			 * fewer alloc_pages calls, less per-cell metadata.
-			 * Merged groups use larger blocks, so bump one order
-			 * to keep ~10-30 blocks per cell.
-			 *
-			 * Explicit cell= always wins.  cell=0 opts out of
-			 * cell storage entirely (zsmalloc backend) — the
-			 * seen-flag distinguishes that from "not given",
-			 * which triggers the size-based derivation below.
-			 */
-			if (cell_order == 0 && !ctx->comp_cell_seen &&
-			    ctx->comp_compress) {
-				merge = ctx->comp_merge ?: 1;
-				tmpfs_bytes = (ctx->blocks ?:
-						 shmem_default_max_blocks()) << PAGE_SHIFT;
-
-				if (tmpfs_bytes >= (256UL << 20))
-					cell_order = 8;	/* 1 MiB */
-				else if (tmpfs_bytes >= (32UL << 20))
-					cell_order = 6;	/* 256 KiB */
-				else
-					cell_order = 4;	/* 64 KiB */
-
-				if (merge >= 8 && cell_order < CELL_ORDER_MAX)
-					cell_order++;
-			}
-
-			sbinfo->comp_pool = shmem_comp_pool_create(algo,
-								 cell_order);
-			if (IS_ERR(sbinfo->comp_pool)) {
-				pr_warn("tmpfs: failed to create compression pool, "
-					"running uncompressed\n");
-				sbinfo->comp_pool = NULL;
-			} else {
-				sbinfo->comp_enabled = true;
-				/* ownership transfers */
-				sbinfo->comp_compressor = algo;
-				algo = NULL;
-				sbinfo->comp_threshold =
-					ctx->comp_threshold ?: 65536;
-				sbinfo->comp_cell_order = cell_order;
-				sbinfo->comp_merge = ctx->comp_merge ?:
-						     (shmem_comp_default_merge_get() ?: 1);
-				pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%lu cell_order=%u\n",
-					sbinfo->comp_compressor,
-					sbinfo->comp_merge,
-					sbinfo->comp_threshold,
-					sbinfo->comp_cell_order);
-				atomic_long_set(&sbinfo->comp_pages, 0);
-				atomic_long_set(&sbinfo->comp_bytes, 0);
-			}
-		}
-		kfree(algo);
-	}
+	/* Compression state for this mount is owned by mm/shmem_compress.c */
+	error = shmem_comp_fill_sb(sbinfo, &ctx->comp_opts,
+				   (ctx->blocks ?:
+				    shmem_default_max_blocks()) << PAGE_SHIFT);
+	if (error)
+		goto failed;
 #endif /* CONFIG_TMPFS_COMPRESSION */
 
 	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL,
@@ -6121,12 +5981,7 @@ static void shmem_free_fc(struct fs_context *fc)
 	if (ctx) {
 		mpol_put(ctx->mpol);
 #ifdef CONFIG_TMPFS_COMPRESSION
-		/*
-		 * ctx owns the compressor string: shmem_parse_one() took it
-		 * from param->string (which it NULLs), so free it exactly
-		 * once, here.
-		 */
-		kfree(ctx->comp_compressor);
+		shmem_comp_opts_free(&ctx->comp_opts);
 #endif
 		kfree(ctx);
 	}
@@ -6325,7 +6180,7 @@ int shmem_init_fs_context(struct fs_context *fc)
 	ctx->uid = current_fsuid();
 	ctx->gid = current_fsgid();
 #ifdef CONFIG_TMPFS_COMPRESSION
-	ctx->comp_compress = shmem_comp_default_enabled_get();
+	shmem_comp_opts_init(&ctx->comp_opts);
 #endif
 
 #if IS_ENABLED(CONFIG_UNICODE)

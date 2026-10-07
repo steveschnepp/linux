@@ -47,11 +47,14 @@
 #include <linux/list.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/kernel.h>
+#include <linux/log2.h>
 #include <linux/zsmalloc.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <crypto/acompress.h>
 #include <linux/shmem_compress.h>
+#include <linux/shmem_fs.h>
 #include <linux/cell_store.h>
 
 #define cell_dbg(fmt, ...) \
@@ -1405,17 +1408,90 @@ static bool shmem_comp_default_enabled;
 static char *shmem_comp_default_compressor;
 static unsigned int shmem_comp_default_merge = 1;
 
-bool shmem_comp_default_enabled_get(void)
+/*
+ * shmem_comp_opts_init - Initialise parsed mount options to defaults
+ * @opts: options to initialise
+ *
+ * "compress" inherits the global sysfs default (mounts that never
+ * mention a compression option follow it); everything else is unset
+ * (zero/NULL) until fill_sb() substitutes the defaults.
+ */
+void shmem_comp_opts_init(struct shmem_comp_opts *opts)
 {
-	bool v;
-
-	mutex_lock(&shmem_comp_defaults_lock);
-	v = shmem_comp_default_enabled;
-	mutex_unlock(&shmem_comp_defaults_lock);
-	return v;
+	memset(opts, 0, sizeof(*opts));
+	opts->compress = shmem_comp_default_enabled;
 }
 
-unsigned int shmem_comp_default_merge_get(void)
+void shmem_comp_opts_free(struct shmem_comp_opts *opts)
+{
+	kfree(opts->compressor);
+	opts->compressor = NULL;
+}
+
+/*
+ * shmem_comp_opts_set_algo - Parse the compress=/compressor= value
+ * @opts: options to update
+ * @algo: algorithm string from the mount option (may be NULL/empty)
+ *
+ * Return: 0 on success, -EINVAL when @algo names an unavailable
+ * algorithm (caller frees @algo and reports the mount error).
+ *
+ * Consumes @algo on success: stored in opts->compressor, or freed for
+ * "none"/empty (which merely toggle opts->compress). Empty and "none"
+ * both mean "no compression"; anything else must be an acomp algo or
+ * the mount fails early on typos.
+ */
+int shmem_comp_opts_set_algo(struct shmem_comp_opts *opts, char *algo)
+{
+	if (!algo || !algo[0]) {
+		/* compress with the default algorithm */
+		opts->compress = true;
+		kfree(algo);
+		return 0;
+	}
+	if (!strcmp(algo, "none")) {
+		opts->compress = false;
+		kfree(algo);
+		return 0;
+	}
+	if (!crypto_has_acomp(algo, 0, 0))
+		return -EINVAL;		/* not consumed */
+	kfree(opts->compressor);
+	opts->compressor = algo;
+	opts->compress = true;
+	return 0;
+}
+
+/*
+ * shmem_comp_opts_set_cell - Parse the cell= mount option
+ * @opts: options to update
+ * @val: cell size in bytes (memparse syntax)
+ *
+ * Return: 0 on success, -EINVAL on a bad value (mount fails).
+ *
+ * cell=0 explicitly opts out of cell storage (zsmalloc backend); the
+ * cell_seen flag distinguishes that from "not given", which lets
+ * fill_sb() derive an order from the filesystem size.
+ */
+int shmem_comp_opts_set_cell(struct shmem_comp_opts *opts, const char *val)
+{
+	unsigned long bytes = memparse(val, NULL);
+
+	if (bytes == 0) {
+		opts->cell_order = 0;
+		opts->cell_seen = true;
+		return 0;
+	}
+	if (!is_power_of_2(bytes) ||
+	    bytes < (PAGE_SIZE << CELL_ORDER_MIN) ||
+	    bytes > (PAGE_SIZE << CELL_ORDER_MAX))
+		return -EINVAL;
+	opts->cell_order = ilog2(bytes / PAGE_SIZE);
+	opts->cell_seen = true;
+	return 0;
+}
+
+static unsigned int shmem_comp_default_merge_get(void)
 {
 	unsigned int v;
 
@@ -1425,7 +1501,7 @@ unsigned int shmem_comp_default_merge_get(void)
 	return v;
 }
 
-char *shmem_comp_resolve_algo(const char *mount_algo)
+static char *shmem_comp_resolve_algo(const char *mount_algo)
 {
 	char *algo;
 
@@ -1439,6 +1515,170 @@ char *shmem_comp_resolve_algo(const char *mount_algo)
 		algo = kstrdup(CONFIG_TMPFS_COMPRESSOR_DEFAULT, GFP_KERNEL);
 	mutex_unlock(&shmem_comp_defaults_lock);
 	return algo;
+}
+
+static inline struct shmem_sb_info *shmem_comp_get_sb(struct super_block *sb)
+{
+	return sb->s_fs_info;
+}
+
+/*
+ * shmem_comp_fill_sb - Create the compression state for a new mount
+ * @sbinfo: superblock info of the mount being filled
+ * @opts: parsed mount options (never NULL)
+ * @tmpfs_bytes: filesystem size in bytes, for cell-order derivation
+ *
+ * Return: 0 on success (also when the mount runs uncompressed),
+ * -ENOMEM when the algorithm string cannot be allocated (mount fails).
+ *
+ * Algorithm resolution: mount option, else sysfs default, else Kconfig
+ * default; empty strings and "none" all mean "no compression". Pool
+ * creation failure is graceful: a warning and an uncompressed mount,
+ * never a failed mount. On success sbinfo->comp is non-NULL and owns
+ * the pool and the compressor string (freed by put_super()).
+ */
+int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
+		       struct shmem_comp_opts *opts,
+		       unsigned long tmpfs_bytes)
+{
+	struct shmem_comp_sb *comp;
+	char *algo;
+	unsigned int cell_order;
+
+	sbinfo->comp = NULL;
+
+	if (!opts->compress)
+		return 0;
+
+	comp = kzalloc(sizeof(*comp), GFP_KERNEL);
+	if (!comp)
+		return -ENOMEM;
+
+	algo = shmem_comp_resolve_algo(opts->compressor);
+	if (!algo) {
+		kfree(comp);
+		return -ENOMEM;
+	}
+
+	if (strcmp(algo, "none") == 0) {
+		/* "none": mount is uncompressed */
+		kfree(algo);
+		kfree(comp);
+		return 0;
+	}
+
+	cell_order = opts->cell_order;
+
+	/*
+	 * Default cell order when cell= is not given:
+	 * scale with the filesystem size so ~100-1000 cells
+	 * cover the tmpfs.  Larger tmpfs -> larger cells ->
+	 * fewer alloc_pages calls, less per-cell metadata.
+	 * Merged groups use larger blocks, so bump one order
+	 * to keep ~10-30 blocks per cell.
+	 *
+	 * Explicit cell= always wins.  cell=0 opts out of
+	 * cell storage entirely (zsmalloc backend) -- the
+	 * cell_seen flag distinguishes that from "not given",
+	 * which triggers the size-based derivation below.
+	 */
+	if (cell_order == 0 && !opts->cell_seen) {
+		unsigned int merge = opts->merge ?: 1;
+
+		if (tmpfs_bytes >= (256UL << 20))
+			cell_order = 8;	/* 1 MiB */
+		else if (tmpfs_bytes >= (32UL << 20))
+			cell_order = 6;	/* 256 KiB */
+		else
+			cell_order = 4;	/* 64 KiB */
+
+		if (merge >= 8 && cell_order < CELL_ORDER_MAX)
+			cell_order++;
+	}
+
+	comp->pool = shmem_comp_pool_create(algo, cell_order);
+	if (IS_ERR(comp->pool)) {
+		pr_warn("tmpfs: failed to create compression pool, "
+			"running uncompressed\n");
+		comp->pool = NULL;
+		kfree(algo);
+		kfree(comp);
+		return 0;
+	}
+
+	comp->enabled = true;
+	/* ownership transfers */
+	comp->compressor = algo;
+	comp->threshold = opts->threshold ?: 65536;
+	comp->cell_order = cell_order;
+	comp->merge = opts->merge ?:
+		      (shmem_comp_default_merge_get() ?: 1);
+	atomic_long_set(&comp->pages, 0);
+	atomic_long_set(&comp->bytes, 0);
+	sbinfo->comp = comp;
+
+	pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%u cell_order=%u\n",
+		comp->compressor, comp->merge, comp->threshold,
+		comp->cell_order);
+	return 0;
+}
+
+/*
+ * shmem_comp_put_super - Release the compression state of a mount
+ * @sbinfo: superblock info being torn down
+ *
+ * Safe on a partially initialized or NULL comp: the mount-failure path
+ * in shmem_fill_super() calls this after any failure following
+ * sbinfo allocation.
+ */
+void shmem_comp_put_super(struct shmem_sb_info *sbinfo)
+{
+	if (sbinfo->comp) {
+		if (sbinfo->comp->pool)
+			shmem_comp_pool_put(sbinfo->comp->pool);
+		kfree(sbinfo->comp->compressor);
+		kfree(sbinfo->comp);
+		sbinfo->comp = NULL;
+	}
+}
+
+bool shmem_comp_should_compress(struct inode *inode)
+{
+	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
+
+	return comp && comp->enabled && comp->pool &&
+		i_size_read(inode) >= comp->threshold;
+}
+
+/*
+ * shmem_comp_free_swap - Release one compressed page-cache slot
+ * @mapping: mapping whose mount owns the entry
+ * @radswap: the radix entry holding the compression ID
+ *
+ * Called from shmem_free_swap() for compression entries only. The slot
+ * erase happens there under the xas lock; here we drop the slot's
+ * entry reference and update the once-per-group accounting. get()
+ * cannot fail while the slot is being erased (it still holds its
+ * reference); the pin keeps the entry and its data alive across the
+ * release.
+ */
+void shmem_comp_free_swap(struct address_space *mapping, void *radswap)
+{
+	struct shmem_comp_sb *comp =
+		shmem_comp_get_sb(mapping->host->i_sb)->comp;
+	unsigned int id = shmem_comp_entry_id(radix_to_swp_entry(radswap));
+	unsigned int length = 0, entry_nr = 1;
+	bool got, last;
+
+	got = shmem_comp_entry_get(id, NULL, &length, &entry_nr, NULL, NULL);
+	last = shmem_comp_entry_release(id);
+	if (got)
+		shmem_comp_entry_put(id);
+	if (comp && last && got) {
+		atomic_long_sub(entry_nr, &comp->pages);
+		atomic_long_sub(length, &comp->bytes);
+		shmem_comp_update_stats(false, entry_nr * PAGE_SIZE, length);
+	}
 }
 
 #ifdef CONFIG_SYSFS

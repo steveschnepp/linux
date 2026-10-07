@@ -11,9 +11,6 @@
 #include <linux/fs_parser.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/bits.h>
-#ifdef CONFIG_TMPFS_COMPRESSION
-struct shmem_comp_pool;
-#endif
 
 /* inode in-kernel data */
 
@@ -92,15 +89,11 @@ struct shmem_sb_info {
 	struct shmem_quota_limits qlimits; /* Default quota limits */
 	struct simple_xattr_cache xa_cache;
 #ifdef CONFIG_TMPFS_COMPRESSION
-	/* Transparent compression support */
-	bool comp_enabled;           /* Compression enabled for this mount */
-	char *comp_compressor;       /* Algorithm name (NULL = global default) */
-	unsigned long comp_threshold; /* Min file size to compress (bytes) */
-	struct shmem_comp_pool *comp_pool; /* Compression pool */
-	atomic_long_t comp_pages;    /* Number of compressed pages */
-	atomic_long_t comp_bytes;    /* Total compressed bytes stored */
-	unsigned int comp_merge;     /* pages per compression group */
-	unsigned int comp_cell_order; /* cell storage order, 0=zsmalloc */
+	/*
+	 * Compression state for this mount; private to mm/shmem_compress.c.
+	 * NULL = uncompressed mount.
+	 */
+	struct shmem_comp_sb *comp;
 #endif
 };
 
