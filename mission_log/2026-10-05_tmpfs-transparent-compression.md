@@ -579,3 +579,373 @@ Post-fix verification on the committed tree (normal config, QEMU 1G):
 4. Optional hardening: refcount assertions in the entry table (session-1
    ask; the query() API makes them cheap to add), and a two-cycle canary
    boot in the rig's default rotation.
+
+---
+
+## Session 3: review-driven correctness sweep, then the cell allocator (2026-10-06)
+
+### What We Did
+
+Picking up after session 2: a parallel review session had produced
+`/home/snide/tmpfs-compress-review.md` (outside the kernel tree) listing
+P0/P1 findings on the branch. Directive from the user: correctness is
+paramount, one fix per bisectable commit, prove each on the rig before
+moving on. Then — once the sand was firm — build the next thing on top.
+
+**Part 1: the correctness sweep (C6–C9).** C1–C5 were already committed
+before the compaction point (swapbacked decompressed folios, no
+compression of mapped/pinned/large folios, recalc_inode pairing, entry
+pinning get/put, sysfs-defaults UAF + mutex). This session finished the
+review list:
+
+- **C6 — mount semantics** (`fd4438d02882`). `compressor=none` silently
+  fell through to the sysfs default compressor: the "none" string was
+  skipped but `comp_compress` stayed true, so a zstd pool was created
+  for a mount that asked for no compression. `nocompress` created a
+  wasted pool the same way. Remounts accepted compression options and
+  silently ignored them. And the sysfs `compression=1` default had no
+  effect because plain mounts never read it. Fixed by gating pool
+  creation on `comp_compress`, wiring the sysfs default as the mount
+  default, adding a `SHMEM_SEEN_COMPRESS` seen-bit so
+  `shmem_reconfigure()` rejects comp options with "Cannot
+  retroactively change compression options", and deleting the dead
+  bare-form `Opt_compress`. Wrote `test_mount_sem` (8 cases) to lock
+  all of it down.
+- **C7 — accounting drift** (`ea42c21d09e0`). `shmem_decompress_group`
+  subtracted 1 from `comp_pages` where compression added `nr`; with
+  merge=8 every decompressed group left 7 phantom pages.
+  `shmem_free_swap` subtracted the *uncompressed* size from
+  `comp_bytes` where compression added the *compressed* size —
+  driving the counter negative on swapoff of a merged group. Both
+  counters were latent (no readers yet) but would have poisoned any
+  reclaim policy built on them.
+- **C8 — tail sweep** (`118fe6aab1a5`). Removed dead
+  `shmem_comp_pool_get()`, an allocated-but-never-touched per-CPU
+  PAGE_SIZE buffer, a broken "average" formula (`(old+new)/2` is not
+  an average), a stale swapops.h doc block describing a handle-packing
+  scheme that was abandoned in session 1, the user-visible
+  `TMPFS_COMPRESSOR_DEFAULT` Kconfig prompt, and — the one with
+  teeth — replaced `#include <linux/shmem_compress.h>` in
+  `shmem_fs.h` with a forward declaration. That header was dragging
+  `crypto/acompress.h` and `zsmalloc.h` into every TU that touched
+  shmem_fs.h.
+- **C9 — chunked zsmalloc for merged groups** (`1251cb2589b3`).
+  Session 2's deferred task: merged groups were stored in kmalloc
+  buffers whose slab rounding ate the merge savings (merge=2 measured
+  611,968 B total vs 488,448 for merge=1 — merging *cost* RAM).
+  Now split into PAGE_SIZE zsmalloc chunks. merge=16 came out ahead
+  of merge=1 (456,128 vs 488,448) but merge=2 regressed further:
+  zsmalloc metadata for 144 small chunks exceeds kmalloc's for 72
+  medium buffers. That regression is what motivated part 2.
+
+**Part 2: the cell allocator.** The user proposed an FTL-inspired
+design mid-session — pool of fixed-size cells, exact-size bump
+allocation inside each, a linked index of `{cellid, offset}`, whole
+cells returned to the buddy when empty. The insight that made it
+click: *there is no per-object waste at all*. A 7,123-byte block
+consumes exactly 7,123 bytes; the next block starts right after. My
+initial "tail waste" objection was wrong — the tail is free space
+waiting for the next allocation, not loss. And because cells come from
+one `alloc_pages()` call, the direct map gives a single virtual range:
+reads spanning page boundaries are plain memcpy, no bounce buffer,
+no kmap — where zsmalloc always bounce-buffers its spanning case.
+
+Implemented in bisectable phases, plan appended to
+`TMPFS_COMPRESSION_PLAN.md` first:
+
+- **P1** (`18fc684409aa`, `6ae124797983`): `struct cell` /
+  `struct cell_pool`, pool lifecycle, then split into
+  `mm/cell_store.{h,c}` — the allocator is self-contained and
+  deserves its own TU.
+- **P3a/b** (`3de5b0b77622`, `38b47202752c`): `cell=64K..4M` mount
+  option (memparse'd, power-of-2 validated), pool wired into
+  `shmem_comp_pool` behind `use_cells`, store/load/free dispatch on
+  the flag, `{cellid, offset}` packed into the entry's handle field.
+  Accessor functions (`shmem_comp_pool_uses_cells()` etc.) keep the
+  pool struct private — a direct consequence of C8's forward
+  declaration.
+- **Three bugs the rig found, one commit each**
+  (`82d99dd9d58f`, `f72d85b89110`): (1) `shmem_comp_pack_loc(0, 0)`
+  encoded to handle 0, the universal "storage failed" sentinel — the
+  first block of every fresh pool was silently dropped (sweep showed
+  143/144 pages; the mount-semantics sysfs test failed because its
+  single eligible page landed there). Fixed by biasing cellid +1.
+  (2) KASAN: `Write of size 2194882` — a merge=1024 group compressed
+  to 2.1MB was memcpy'd into a 2MB cell because `cell_store` had no
+  size guard. Added `-E2BIG` rejection. (3) With the guard, large
+  merge values compressed *nothing* under cell storage — the guard
+  rejected every group. Fixed with fixed-size chunking: the group is
+  split at the largest divisor of merge_pages that fits one cell.
+  Divisibility matters because `shmem_decompress_group` recovers the
+  group head as `index - (index % nr_pages)`, which is only correct
+  when every chunk starts on a multiple of its own size.
+- **P6 — async batched GC** (`c95e6491dab5`): the user's correction
+  mid-implementation: *free()-induced GC should always be async, so
+  we can merge GC cheaply*. Sync evacuation per free cannot amortise
+  the entry-table scan across cells; a batched pass can. Final model:
+  tier 1 stays sync (`live_bytes == 0` → `__free_pages()` inline —
+  nothing to move, and it is what makes MemFree track tmpfs usage
+  without a shrinker); every *evacuation* is async. `cell_free()`
+  only links sparse cells; a GC pass harvests up to 8 victims under
+  their write locks, runs ONE entry-table scan relocating every live
+  block from all of them, then returns the emptied cells. Shrinker
+  per pool for memory pressure; `gc_now` sysfs hook for deterministic
+  testing. Two latent hazards fixed on the way: `alloc_pages(GFP_
+  KERNEL)` ran under `cp->lock` (sleeping in atomic context —
+  `cell_make_active()` now allocates outside the lock and rechecks),
+  and `init_rwsem` ran on every `new_cell()` (with directory slot
+  reuse a stale reader could hold the old incarnation's rwsem while
+  it reinitialised — rwsems now init once at pool create). Also:
+  sparse detection switched from object-count to *utilization*
+  (`live_bytes * 2 <= cell_size`) after the GC test showed boundary
+  cells at 28%/39% full were invisible to a count threshold but are
+  exactly what evacuation should reclaim.
+- **`cell=0` opt-out fix** (`80555ca6bb3f`): the size-based
+  auto-derivation treated order 0 as "not specified" and overrode
+  the explicit zsmalloc opt-out. Caught by the untar test's baseline
+  row logging "cell storage enabled, order=8".
+
+**Part 3: the 256M untar test.** User ask: a 256 MiB untar with a
+checksum of every extracted file. `tests/test_untar256.c` generates a
+mixed-compressibility dataset in-guest (text / 8-byte cycle / xorshift
+noise, 256 × 1 MiB), tars it, records FNV-1a-64 golden checksums, then
+untars into five backend/cell/merge configurations verifying every file.
+Gated behind `test.untar=1` on the kernel cmdline because it is heavy;
+needs `QEMU_MEMORY=2G` for the full-size dataset (it adapts down to
+128 MiB under 1.5 GiB).
+
+### What We Learned
+
+#### Technical
+
+- **zsmalloc's real overhead is measurable and large for small
+  objects**: 479,232 B of pool for 409,915 B of compressed data
+  (14%) at merge=1 — an 8B handle header in every slot plus
+  size-class rounding plus zspage structs plus handle-slab objects.
+  The cell allocator pays none of it.
+- **The handle-zero sentinel swallowed real data.** Every compression
+  path treats 0 as "storage failed". Our location packing produced 0
+  for the first object of the first cell. One biased bit fixed it,
+  but the general lesson: when a value domain doubles as an error
+  sentinel, the valid domain must be biased off zero — and the sweep
+  immediately showed 143/144 instead of 144/144, which is how we
+  noticed.
+- **Decompression's head recovery constrains the storage layout.**
+  `head = index - (index % nr_pages)` assumes group starts are
+  nr_pages-aligned. Any chunking scheme must therefore chunk at
+  divisors of merge_pages, not arbitrary sizes. This fell out of
+  reading the decompress path before writing the chunker.
+- **Sparse detection must be utilization, not count.** Twelve 2 KB
+  blocks in a 64 KiB cell is 75% waste whether you call it "a few
+  objects" or not. The first GC test passed vacuously because
+  lz4 compresses repeated chars to ~26 B — 200 objects fit one cell
+  and freeing 8 files left 40 objects, above any small count
+  threshold. Switched the test to half-noise data (~2 KB blocks) and
+  the threshold to `live_bytes * 2 <= cell_size`; evacuation then
+  fired exactly as designed.
+- **zsmalloc bounce-buffers every spanning read; cells never do.**
+  `zs_obj_read_begin` kmallocs a bounce buffer whenever an object
+  crosses a zspage page boundary. Cells are one `alloc_pages()` call
+  — physically and therefore virtually contiguous — so a block
+  spanning pages is a single memcpy. This is why cell storage's
+  verify path is 21.9 MB/s against zsmalloc's 14.7 on the same
+  dataset.
+- **Sync compression is defensible for tmpfs and its cost is now
+  quantified.** Untar with merge=1 runs ~12.9 MB/s against ~39 MB/s
+  read — that gap is inline lz4 on the writer's context. merge=8
+  amortises one crypto call across 8 pages: untar jumps to 21.7
+  MB/s, verify to 50.1. The deferred worker (tiered compression
+  design) remains the right lever for write-latency-sensitive
+  workloads, but sync is correct-by-construction for the
+  memory-pressure case: RAM is reclaimed before write() returns.
+- **KASAN found the overflow the normal kernel would have surfaced
+  as corruption.** The 2.1MB-into-2MB-cell write is exactly the
+  class of bug that passes functional tests for weeks. The debug
+  kernel in the rig (KASAN=y, SLUB_TINY off, DEBUG_VM=y) continues
+  to pay for itself.
+- **`alloc_pages(GFP_KERNEL)` under a spinlock never failed in QEMU
+  because memory was always available** — the bug is invisible until
+  the allocator actually needs to reclaim and sleep. Reading lock
+  context, not just testing, is what catches these.
+
+#### Process
+
+- **Write the plan before the code, and commit the plan.** The
+  transient plan in `TMPFS_COMPRESSION_PLAN.md` (design invariants,
+  mount options, phase list, baseline table) became the contract for
+  the whole implementation and made each phase independently
+  reviewable.
+- **Commit after every logical change, never batch.** Nine commits
+  for the cell work, each buildable and suite-green. When the
+  handle-zero bug appeared, the fix was one commit that bisects
+  cleanly against the chunking commit.
+- **The sweep script must learn new mount options.** `cell=` took
+  three touchpoints (test binary argv, init cmdline parse,
+  run_qemu.sh env passthrough) before `sweep_merge.sh 64K` produced
+  its first honest row. Rig scripts fail silently when a knob is
+  only half-wired.
+- **Mission log while the session is hot** (user rule, this entry):
+  writing it a session later costs more tokens for worse fidelity —
+  the exact bug narratives and number derivations are still in
+  context now.
+- **Comment discipline**: explain WHY, in wording agnostic to this
+  project's history. "cell->base is virtually contiguous because
+  alloc_pages returns physically contiguous pages and the direct
+  map preserves that" survives any future maintainer; "we did X
+  because the review found Y" does not.
+
+### What We Decided
+
+- **Compression stays opt-in.** A user directive mid-session
+  reversed my attempt to default it on: `mount -t tmpfs tmpfs /mnt`
+  must remain plain tmpfs. The sysfs default exists for administrators
+  who opt in globally; the mount option for everyone else.
+- **Cell storage is the default *backend* when compression is
+  enabled**, with the cell size derived from the filesystem size
+  (≥256 MB tmpfs → 1 MiB cells, ≥32 MB → 256 KiB, else 64 KiB; +1
+  order for merge ≥ 8). `cell=N[K|M]` overrides; `cell=0` explicitly
+  selects zsmalloc.
+- **All evacuation is async.** No synchronous compaction on the free
+  path — batching the entry-table scan across cells is worth more
+  than per-free latency, and the empty-cell return (tier 1) already
+  covers the "user sees MemFree drop" property.
+- **GC batches 8 victims per pass** with one entry-table scan. The
+  shrinker calls it under memory pressure; the `gc_now` sysfs hook
+  calls it on demand for tests.
+- **A cell is sparse at ≤50% utilization.** Object count was the
+  wrong metric; bytes are what evacuation returns to the buddy.
+- **Chunked zsmalloc stays** as the merge>1 backend for zsmalloc
+  pools (it fixed merge≥4 there); cell pools store merged groups as
+  single blocks because cells have no PAGE_SIZE cap.
+- **The entry struct keeps both location forms** (zsmalloc
+  handle / packed cell location) behind `pool->use_cells`. A union
+  would shrink it but complicate every accessor; the struct is
+  ~56 B against kilobytes of compressed data.
+
+### Rules Added
+
+- **Document WHY in code comments, agnostic to project history.**
+  Invariants and physical justifications survive; narratives of what
+  we did and why (review item N found bug M) belong in commit
+  messages and this log.
+- **Mission log at the end of each lump of work, while the session
+  context is hot** — cheaper for the model and more faithful to what
+  actually happened.
+- **When a value domain doubles as an error sentinel, bias the valid
+  domain off zero** (the handle-zero rule).
+
+### What We'd Do Differently
+
+- **Would run the KASAN kernel earlier in the cell work.** The
+  oversized-block overflow and the handle-zero drop were both found
+  only after the feature was "done"; the handle-zero bug in
+  particular was visible in the very first sweep (143/144) and I
+  misread it as noise instead of a signal.
+- **Would prototype the cell allocator behind a flag from day one
+  rather than wiring it into the hot path first.** The `use_cells`
+  dispatch landed in P3b before the GC existed, which meant every
+  test run between P3b and P6 exercised storage without any
+  reclamation path — fine here, but the sparse list grew
+  unreclaimed.
+- **The free-burst stampede guard is still not implemented.** Many
+  threads freeing concurrently can each link sparse cells faster
+  than the shrinker drains them. Harmless today (the shrinker is
+  lazy by design) but a worker kicked off the sparse list length
+  would be the natural next step.
+- **Would have written `test_cell_gc` with half-noise data from the
+  start.** The first version used repeated chars, compressed to 26 B,
+  and passed vacuously — a test that cannot fail is not a test.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem.c` | C6 mount semantics; C7 accounting; C9 merged-group dispatch; cell= parse + seen flag; auto-derivation; gc_now/cell_stats sysfs; read paths → shmem_comp_load_entry |
+| `mm/shmem_compress.c` | C8 tail sweep; cell dispatch in store/load; accessors; batched GC pass; shrinker; retry-safe loader; pool_create cell branch |
+| `mm/cell_store.c` | new: bump allocator, tier-1 return, GC primitives, reader rwsem, cell_make_active (alloc outside lock) |
+| `include/linux/cell_store.h` | new: cell/cell_pool structs, invariants, CELL_IS_SPARSE, GC_BATCH, API |
+| `include/linux/shmem_compress.h` | entry struct comments + pack/unpack (biased cellid); pool accessors; load_entry/GC decls |
+| `include/linux/shmem_fs.h` | comp_cell_order field; forward declaration (C8) |
+| `include/linux/swapops.h` | C8 stale doc removal |
+| `fs/Kconfig` | C8 hidden TMPFS_COMPRESSOR_DEFAULT prompt |
+| `mm/Makefile` | cell_store.o |
+| `TMPFS_COMPRESSION_PLAN.md` | cell-storage transient plan (design, phases, baseline) |
+| rig `tests/test_mount_sem.c` | new: 8 mount-semantics cases |
+| rig `tests/test_cell_storage.c` | new: cell= mounts, stats, round-trip |
+| rig `tests/test_cell_gc.c` | new: fill/free/gc_now/verify/drain |
+| rig `tests/test_untar256.c` | new: 256 MiB untar + per-file FNV-1a checksums |
+| rig `tests/test_seq_compress.c` | cell= argv |
+| rig `initrd/init` + `scripts/run_qemu.sh` + `scripts/sweep_merge.sh` | cell=/untar= wiring |
+
+### Test Results / Benchmarks
+
+**Sweep, cell=64K vs zsmalloc baseline** (`seq 1 100000`, 144 pages,
+lz4, threshold=1, one QEMU boot per merge value):
+
+| merge | zsmalloc ram_total | cell 64K ram_total | Δ |
+|-------|-------------------:|-------------------:|---|
+| 1 | 488,448 | 467,968 | −4% |
+| 2 | 611,968 | **463,360** | **−24%** |
+| 4 | 556,416 | 526,592 | −5% |
+| 8 | 567,552 | 590,976 | +4% |
+| 16 | 456,128 | 590,400 | +29% |
+
+All rows compress the full dataset (144/144, 72/72, …, 9/9 — the
+handle-zero fix moved merge=1 from 143 to 144) and all `ram_*` drain
+to 0 after a full read. merge=2 is the headline: eliminating zsmalloc's
+per-chunk overhead recovers 24%. merge=16 with 64K cells regresses
+because ~25 KB blocks leave only two per cell — the auto-derived
+default (cell size scales with merge) is the mitigation.
+
+**256 MiB untar, per-file checksums (256 files × 1 MiB, all match):**
+
+| backend | untar MB/s | verify MB/s |
+|---------|-----------:|------------:|
+| zsmalloc (cell=0) | 10.7 | 14.7 |
+| cell 64K merge=1 | 12.9 | 21.9 |
+| cell 256K merge=1 | 12.9 | 21.9 |
+| cell 1M merge=1 | 13.3 | 22.6 |
+| cell 256K merge=8 | **21.7** | **50.1** |
+
+Cell storage beats zsmalloc on both axes: the direct-map read path
+never bounce-buffers, and merge=8 amortises sync compression across
+8 pages (untar 2×, verify 2.4×). Generation 8.4 s, golden checksums
+6.5 s; the whole five-round test fits one 2G boot.
+
+**GC test** (`test_cell_gc`, 400 half-noise pages in 64K cells): fill
+spans 13 cells (208 pages); freeing 8 of 10 files returns 9 cells
+inline via tier 1 (`pages_used` 208→64) and leaves 2 boundary cells
+sparse (28% and 39% utilization). `gc_now` relocates their 21 objects
+in one batched pass and returns both cells (64→48 — two freed, one
+spawned). Survivor checksums verify, post-GC writes work, full drain
+returns everything with zero cells remaining.
+
+**Full suite** after every commit: `Test exit code: 0`, zero `Oops:`,
+`BUG:`, or `KASAN:` lines. The suite grew from 6 to 10 test programs
+this session (mount_sem, cell_storage, cell_gc, untar256).
+
+### Next Steps
+
+1. **Free-burst stampede guard**: kick a GC worker when the sparse
+   list exceeds a bound, so concurrent frees cannot outpace the
+   shrinker. Small change in `cell_free()` + a per-pool work item.
+2. **Mission-log carry-overs still open**: deferred compression
+   worker + entropy probe (tiered hot/normal/cold design is on paper
+   only); per-mount stats readers for comp_pages/comp_bytes (the
+   counters are now correct but still unread); faster merge read
+   path (order-3 folio per group); threshold semantics (0 → 65536);
+   mmap test coverage for the cell path; zstd merge matrix at 1G.
+3. **Cell-size policy revisit at scale**: the auto-derivation uses
+   tmpfs size as a proxy for expected compressed volume. A workload
+   that fills 1% of a large tmpfs gets oversized cells. A
+   sysfs-tunable derivation or a runtime cell-size adaptation (split
+   cells when the active cell outlives N allocations) would be more
+   robust.
+4. **Fresh-session branch review** of the full stack (review
+   prompt exists from session 2; the branch has ~25 more commits
+   since — cell allocator, GC, mount semantics).
+5. **Consider zsmalloc retirement decision**: cell storage now beats
+   zsmalloc on RAM (merge≤4), read throughput, and memory-release
+   latency. zsmalloc remains as the `cell=0` fallback and the
+   merge>1 backend for it. Whether to keep both long-term is a
+   question for the next review.
