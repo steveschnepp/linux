@@ -1824,3 +1824,215 @@ specified, show_options lines visible in /proc/mounts.
    matrix A/B.
 3. Keep the torture sweep as the standing regression gate for all of
    it (TEST_TORTURE=1 QEMU_CPUS=4).
+
+---
+
+## Session 9: Stage 1 -- option surface v2 lands end-to-end (2026-10-07)
+
+### What We Did
+
+Implemented Stage 1 of the option surface v2 plan from session 8: the
+watermark knob and coherent option model land end-to-end with the
+built-in default 0:0 (eager = today's behavior), so the surface is
+real before the machinery changes behavior. Four bisectable kernel
+commits, rig suite green, plus one regression hunt that ended in a
+surprise verdict.
+
+**Commit sequence (each build-clean, rig-checked):**
+
+1. `a222524` -- drop the option aliases: `compressor=` (alias of
+   `compress=`) and `compress_merge=` (alias of `merge_pages=`) leave
+   `shmem_fs_parameters[]`. One spelling per concept; the sysfs
+   default knobs keep their own names (they are global defaults, not
+   mount-option aliases). Rig tests updated to canonical spellings
+   (`test_mount_sem.c`, `test_multimount.c` -- both live outside the
+   kernel git).
+2. `8e03528` -- `compress_threshold=` takes memparse units (`64K`),
+   matching `cell=`; unit soup gone. The semantics split is documented
+   where it lives: the knob is write-time-only; the Stage 2 aging pass
+   compresses any eligible survivor >= 1 page.
+3. `7f16e14` -- `compress_watermark=LOW:HIGH` end-to-end, mount side:
+   parse (`shmem_comp_opts_set_watermark()`, low <= high enforced) ->
+   opts + `watermark_seen` -> fill_sb resolution (mount > sysfs >
+   built-in 0:0) -> `shmem_comp_sb` fields -> resolved-state mount
+   line. The 100:100 never-sentinel resolves to no pool, no memory
+   overhead -- identical resolved state to nocompress. All "off"
+   spellings now normalize to one state, with a WHY in the mount line
+   (`nocompress` / `compress=none` / `compress_watermark=100:100` /
+   `not participating (default off)`) via `enum shmem_comp_off_reason`.
+4. `275a232` -- the visibility half: sysfs `compress_watermark`
+   default knob (reuses the mount-option parser -- one grammar, one
+   validator, sentinel semantics cannot drift) and
+   `shmem_comp_show_options()`: /proc/mounts tells the truth
+   (`,nocompress` for uncompressed mounts;
+   `compress=<algo>,compress_watermark=LOW:HIGH[,merge_pages=N]` for
+   compressed ones; cell_order stays deliberately internal). Plus a
+   real pre-existing incoherence fixed on the way: sysfs
+   `compressor=none` used to be stored as NULL, which silently fell
+   back to the Kconfig default algo -- "none" is now stored as-is, so
+   default-following mounts resolve algo none and run uncompressed
+   (Layer 1 normalization: one resolved state, no pool).
+
+**The unset-vs-explicit-zero collision** (session 8's predicted
+subtlety, confirmed in code): `compress_watermark=0:0` is a valid
+explicit value that collides with zero-init. `watermark_seen` in the
+opts struct makes fill_sb take the sysfs default only when the mount
+did not ask -- same bug class as `cell=0` vs not-given
+(`cell_seen`). Rig-proven: with sysfs at 50:70, a mount passing
+`compress_watermark=0:0` shows `compress_watermark=0:0` in
+/proc/mounts and compresses eagerly; a default-following mount shows
+`50:70`.
+
+**Rig work:** test_mount_sem rewritten (10 cases: canonical
+spellings, 100:100 never-sentinel, explicit 0:0 vs sysfs default
+collision, memparse threshold, /proc/mounts truth x2, remount
+rejects incl. compress_watermark, sysfs default). A new isolation
+gate landed: `TEST_ENTRYRACE=1` -> `test.entryrace=1` in
+run_qemu.sh + initrd/init (mirrors the torture/cellzram gates) --
+needed for the investigation below.
+
+**The regression hunt (the interesting part):** the full-suite boot
+on the Stage-1 kernel showed `read errors: 2` in the entry-lifetime
+race test plus ~158 `shmem_comp: entry N refs underflow` WARNs from
+`shmem_decompress_folio() -> shmem_comp_entry_release()` -- zero
+occurrences in ~50 prior serial logs. The diff provably did not touch
+the entry/data path, but "provably harmless" is not a verdict, so:
+added the isolation gate, reproduced deterministically on the
+Stage-1 kernel (~170 WARNs/boot, 3/3 boots), then built the
+PRE-change kernel (`e3a1861`) in a throwaway `git worktree` (ccache
+made it ~2.5 min) and ran the same gate: **~173-177 WARNs/boot,
+identical read-error shape.** Verdict: not a regression from this
+session's commits -- a pre-existing latent entry-lifetime race that
+the isolated gate exposes deterministically. Full-suite boots on old
+kernels were timing-marginal clean; a fresh-boot gate hammers the
+race immediately. Both worktrees/images cleaned up; rig restored to
+the Stage-1 kernel.
+
+### What We Learned
+
+- **A new isolation gate must be A/B'd against the pre-change kernel
+  before declaring a regression.** The gate itself changes timing
+  (fresh boot, immediate hammering) versus full-suite context; a
+  symptom that appears only under the new gate may predate everything
+  you changed. The worktree+ccache baseline build cost ~3 minutes and
+  settled a question that code reading could not.
+- Mechanism hypothesis for the underflow (recorded for the future
+  investigation): the compression entry xarray encodes the entry ID
+  only, with no generation counter. A reader that samples the slot
+  value, loses the race to truncate (entry freed, ID recycled by a
+  rewrite), then pins the recycled ID, decompresses the WRONG entry's
+  data (userspace sees bad bytes -- the "read errors"), and its
+  `entry_release()` is applied to the new entry -- dropping a slot
+  reference it never owned. Later teardown of the real owner
+  underflows. This is the P1 #5 class the entry-race test hunts; the
+  get/put pinning fixed the UAF, but the stale-value + ID-reuse hole
+  remains. A generation field in the entry encoding (or rejecting
+  stale values at get time) is the likely fix -- separate work item.
+- `test_entry_race` has an accounting bug: `run_phase()` resets the
+  error counters per phase and `failures = read_errors + write_errors`
+  is computed after the LAST phase only, so `Race test failures: 0`
+  can print (and exit 0) while Phase A had read errors. The WARN
+  storm in dmesg is the real verdict -- which the test's own comment
+  already says ("KASAN log is authoritative"), but the exit code
+  disagrees with the printed FAIL line, which is worse than useless in
+  automation.
+- Pre-existing incoherences surface while implementing adjacent code:
+  the sysfs `compressor=none` -> NULL -> Kconfig-fallback bug was
+  invisible until the "all off spellings normalize to one resolved
+  state" rule gave a crisp definition of what "none" must mean.
+- Mutex discipline: `shmem_comp_opts_init()` was reading the sysfs
+  default `enabled` flag without `shmem_comp_defaults_lock`; cheap to
+  fix while touching the function, but it took the session-8 decision
+  ("copied out under the lock") to even look.
+
+### What We Decided
+
+- Stage 1 = surface only, default 0:0 eager. The write path does not
+  yet consult the watermark (except the never-sentinel, which removes
+  the pool). Stage 2 flips the machinery and the default (50:70).
+- show_options prints `compress_watermark` always (when compression
+  is on) and `merge_pages` only when non-default; cell_order stays
+  internal -- observable at mount, free to change, not /proc/mounts
+  ABI.
+- The entry-ID-reuse race is a KNOWN-OPEN issue, pre-existing,
+  reproducible: recipe `TEST_ENTRYRACE=1 QEMU_CPUS=4` (~170 underflow
+  WARNs per boot on both pre- and post-Stage-1 kernels). It does not
+  block Stage 2 but must be fixed before any upstream posting.
+- Test-rig rule (below) about gate A/B.
+
+### Rules Added
+
+- **Gate A/B rule:** when a newly added isolation gate (or any new
+  test configuration) surfaces a failure, run the SAME gate on a
+  kernel built from the pre-change commit before investigating your
+  own diff. Only an A/B difference is a regression attributable to the
+  change under review.
+- **Counter-survival rule:** when a test resets counters per phase,
+  the final failure sum must aggregate all phases, not the last one.
+  Check this before trusting a test's exit code in automation.
+- **One grammar, one validator:** sysfs default knobs that mirror
+  mount options must reuse the mount option's parser
+  (`shmem_comp_opts_set_watermark()` case in point) so semantics
+  cannot drift between entry points.
+
+### What We'd Do Differently
+
+- Built the pre-change baseline FIRST, before re-running the Stage-1
+  kernel three times. The reproduction was never in doubt (3/3
+  already); the only open question was attribution, and the baseline
+  answers that directly. One boot each, then conclude.
+- The full-suite log review initially mis-counted "read errors"
+  (pattern `read errors: [02]` matched both values); a targeted
+  `grep -c "read errors: 2"` per log would have established the
+  "only today" fact in one command instead of a misleading table.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem.c` | aliases dropped; compress_watermark enum/table/parse; threshold memparse; nocompress off_reason; show_options hook |
+| `mm/shmem_compress.c` | watermark parse helper + defaults global/getter; fill_sb watermark resolution + never sentinel + why-off mount lines; sysfs compress_watermark attr; compressor=none normalization; shmem_comp_show_options(); opts_init under lock |
+| `include/linux/shmem_compress.h` | opts struct: watermark_{low,high}, watermark_seen, off_reason; `enum shmem_comp_off_reason`; set_watermark + show_options decls; seq_file fwd decl |
+| rig `tests/test_mount_sem.c` | 10-case rewrite: canonical spellings, sentinel, seen-collision, memparse, /proc/mounts truth, remount rejects |
+| rig `tests/test_multimount.c` | canonical spellings |
+| rig `scripts/run_qemu.sh` | TEST_ENTRYRACE=1 -> test.entryrace=1 |
+| rig `initrd/init` | test.entryrace=1 isolation gate |
+| `TMPFS_COMPRESSION_PLAN.md` | Stage 1 status + known-open note |
+
+### Test Results / Benchmarks
+
+Full suite, Stage-1 kernel #63 (KASAN, QEMU_CPUS=4,
+results/serial_20261007_161445.log):
+
+- `Test exit code: 0`; seq sweeps, mmap coherency (0 failures),
+  size limit, cell storage (ALL PASS), cell GC (ALL PASS), bench
+  matrix, multimount all green.
+- `test_mount_sem: ALL PASS` -- all 10 cases, including the new
+  sentinel/collision/memparse/proc-mounts cases. dmesg shows the new
+  resolved-state lines doing their job: `tmpfs: compression on,
+  algo=lz4 merge_pages=1 threshold=1 cell_order=8 watermark=0:0`,
+  `tmpfs: compression off (compress=none)`, `tmpfs: compression off
+  (compress_watermark=100:100)`.
+- Entry-race anomaly (explained above): Phase A `read errors: 2`,
+  ~158 `refs underflow` WARNs. Isolated gate on Stage-1 kernel #63:
+  180/169/167 WARNs over 3 boots. Isolated gate on pre-change kernel
+  `e3a1861`: 173/177/174 WARNs over 3 boots. Same class, both
+  kernels -- pre-existing.
+
+### Next Steps
+
+1. Stage 2 machinery: candidate marker list (list_add under
+   spinlock, unlink/truncate purge = skipped_dead),
+   `shmem_comp_maintain()` (survivors mandatory >= 1 page, sparse
+   cell evacuation, ~4:1 alternating budgets, hysteresis mode flips),
+   triggers (shrinker, gc_now, periodic delayed_work); flip built-in
+   default to 50:70; torture policy matrix A/B (never / 0:0 / 50:70 /
+   50:100 vs today's eager numbers).
+2. Entry-ID-reuse race (known-open, pre-existing): generation
+   counter in the entry encoding or stale-value rejection at
+   entry_get; fix `test_entry_race` phase-counter aggregation first
+   so the gate's exit code means something.
+3. Standing gates: full suite per commit (`run_tests.sh`,
+   QEMU_CPUS=4); entry-race isolation gate for entry work
+   (`TEST_ENTRYRACE=1`); torture sweep for Stage 2 policy work
+   (`TEST_TORTURE=1`).
