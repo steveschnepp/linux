@@ -4587,11 +4587,9 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 #endif
 #ifdef CONFIG_TMPFS_COMPRESSION
 	fsparam_string("compress", Opt_compress_algo),
-	fsparam_string("compressor", Opt_compress_algo), /* sysfs-style alias */
 	fsparam_flag  ("nocompress", Opt_nocompress),
 	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
-	fsparam_u32   ("compress_merge", Opt_compress_merge),
-	fsparam_u32   ("merge_pages", Opt_compress_merge), /* alias */
+	fsparam_u32   ("merge_pages", Opt_compress_merge),
 	fsparam_string("cell", Opt_cell),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),

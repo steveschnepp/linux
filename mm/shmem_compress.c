@@ -1471,7 +1471,7 @@ void shmem_comp_opts_free(struct shmem_comp_opts *opts)
 }
 
 /*
- * shmem_comp_opts_set_algo - Parse the compress=/compressor= value
+ * shmem_comp_opts_set_algo - Parse the compress= mount option
  * @opts: options to update
  * @algo: algorithm string from the mount option (may be NULL/empty)
  *
