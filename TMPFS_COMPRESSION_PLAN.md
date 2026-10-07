@@ -2812,3 +2812,102 @@ the sweep and full suite are the acceptance gate per commit.
   mm_stat (`entry_bytes`) so the vs-zram comparison is like-for-like;
   per-block entries are ~64 B and remain the v2 batched-entry lever
   at 8 GiB scale.
+
+---
+
+# Option Surface v2 -- coherent model (2026-10-07)
+
+The option surface grew organically across sessions and accumulated
+incoherences: two spellings for the algorithm and merge knobs
+(compress=/compressor=, compress_merge=/merge_pages=), three different
+"off" spellings with subtly different meanings, unit soup (cell= takes
+memparse syntax, compress_threshold= raw bytes), a threshold default
+(64K) that silently disables compression for small-file farm
+workloads, and a /proc/mounts that shows nothing about compression
+(the cell256k torture bug -- a mount benchmarking as plain tmpfs --
+was invisible exactly there).
+
+## Three layers, one concept per knob, no aliases
+
+**Layer 1 -- WHAT (participation + algorithm):**
+
+| knob | syntax | meaning |
+|------|--------|---------|
+| `compress=<algo>` | string; `none` = off | algorithm; presence = participate |
+| `nocompress` | flag | explicit off |
+
+All "off" spellings normalize to one resolved state: no pool, no
+memory overhead.
+
+**Layer 2 -- WHEN (policy dial):**
+
+| knob | syntax | sentinels |
+|------|--------|-----------|
+| `compress_watermark=LOW:HIGH` | percents, LOW <= HIGH | `0:0` = always (eager); `100:100` = never (identical to nocompress, no pool); `50:100` = pure deferral (maintenance-only aging); `50:70` = default target |
+
+HIGH: new writes compress inline at usage% >= HIGH.
+LOW: return to chill at usage% <= LOW (hysteresis band in between).
+usage = used_blocks / max_blocks (relative to size=, default half of
+RAM). Mode flips happen in the maintenance pass, never per write --
+the write path cost is one READ_ONCE(comp->hot). Name chosen over
+"compress_ratio": ratio already means compression ratio in comp_stats.
+
+**Layer 3 -- GEOMETRY (storage shape):**
+
+| knob | syntax | meaning |
+|------|--------|---------|
+| `merge_pages=N` | pages per group | large-file knob; leave at 1 for small/mixed workloads (torture-proven: groups that never fill stay uncompressed, collapsing ratio on small-file farms) |
+| `cell=SIZE\|0` | memparse; 0 = zsmalloc backend | absent = auto-derived from tmpfs size (+1 order when merge>=8); derivation printed at mount |
+| `compress_threshold=SIZE` | memparse suffixes now (`64K`) | applies to WRITE-TIME compression only (eager/hot path); the aging pass compresses any eligible survivor >= 1 page -- small survivors are worth their RAM |
+
+**Global sysfs mirrors the defaults** (/sys/fs/tmpfs/compression/):
+`compressor` (algo or none), `compression` (bool: do new mounts
+participate at all), `merge_pages`, `compress_watermark` (new).
+Precedence: mount option > sysfs default > built-in. The resolved
+state prints as one complete line at mount (including WHY a mount is
+uncompressed: nocompress / compress=none / watermark=100:100) and is
+exposed via show_options, so /proc/mounts tells the truth.
+
+**Deliberately internal (no knobs):** cell_order derivation, GC and
+maintenance batch sizes, per-CPU contexts, entry table. Observable
+(printed at mount / in cell_stats) but free to change.
+
+## Compression policy v2 -- death-before-pop aging
+
+Transient files are the point of tmpfs; compressing them at write
+time spends CPU on data that dies unread (the torture workload's .d
+depfiles and punch-hole temps). New policy, in stages:
+
+1. **Stage 1 (this commit):** the watermark knob lands end-to-end
+   (parse -> opts -> fill_sb -> sb -> show_options -> sysfs default)
+   with the built-in default `0:0` (eager = today's behavior) so the
+   surface is real before the machinery changes behavior. The never
+   sentinel (100:100) already works: no pool created.
+
+2. **Stage 2 (next):** deferred compression with death-before-pop.
+   Chill-mode writes land uncompressed and drop a cheap candidate
+   marker (list_add under a spinlock); unlink/truncate purges the
+   marker (death-before-pop = free win, quantified as skipped_dead).
+   Hot mode (usage >= HIGH) compresses inline as today. The
+   maintenance pass -- one shmem_comp_maintain() per mount, triggered
+   by the shrinker, gc_now, and a periodic delayed_work when
+   candidates are pending -- MANDATORILY compresses eligible
+   survivors (order-0, uptodate, unmapped, unpinned; clean pages
+   included; threshold ignored: survivors of any size are worth it),
+   then evacuates sparse cells, alternating budgets ~4:1 so crypto
+   and GC memcpy do not starve each other. Compression raises cell
+   density -> fewer sparse cells -> cheaper GC. Mode flips (with
+   hysteresis) happen in the same pass.
+
+3. **Why the 70% mark behaves like a soft limit:** compression
+   releases size= accounting -- compressed entries are accounted like
+   swap pages and shmem_recalc_inode() unaccounts blocks as they
+   become value entries. Hot-mode compression therefore lowers
+   used_blocks, dropping usage back below the mark; effective
+   capacity for compressible data is size= / ratio.
+
+Validation: the torture sweep becomes the policy matrix -- configs
+for never / 0:0 / 50:70 / 50:100 against today's eager numbers,
+predicting T=1 single-job throughput toward plain (26 vs 17.1 MB/s),
+skipped_dead absorbing transient churn, survivor ratio unchanged
+(~48% stored), and bounded Shmem overshoot (max sampled in-window).
