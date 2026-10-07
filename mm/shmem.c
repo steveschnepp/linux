@@ -5066,6 +5066,10 @@ static int shmem_show_options(struct seq_file *seq, struct dentry *root)
 		seq_printf(seq, ",grpquota_inode_hardlimit=%lld",
 			   sbinfo->qlimits.grpquota_ihardlimit);
 #endif
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* /proc/mounts tells the truth about compression (option v2) */
+	shmem_comp_show_options(seq, sbinfo);
+#endif
 	return 0;
 }
 

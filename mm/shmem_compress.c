@@ -66,6 +66,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/percpu.h>
@@ -1792,6 +1793,35 @@ bool shmem_comp_should_compress(struct inode *inode)
 }
 
 /*
+ * shmem_comp_show_options - Print the resolved compression config
+ * @seq: seq_file of /proc/mounts
+ * @sbinfo: superblock info of the mount
+ *
+ * Called from shmem_show_options(): /proc/mounts tells the truth about
+ * compression. A mount that does not compress says so (nocompress) --
+ * the cell256k-class bug (a mount benchmarking as plain tmpfs, with
+ * nothing in the mount line showing why) is visible exactly here. A
+ * compressed mount shows its effective algo, watermark and geometry
+ * (merge_pages only when non-default; cell_order is deliberately
+ * internal).
+ */
+void shmem_comp_show_options(struct seq_file *seq,
+			     struct shmem_sb_info *sbinfo)
+{
+	struct shmem_comp_sb *comp = sbinfo->comp;
+
+	if (!comp || !comp->enabled) {
+		seq_puts(seq, ",nocompress");
+		return;
+	}
+	seq_printf(seq, ",compress=%s", comp->compressor);
+	seq_printf(seq, ",compress_watermark=%u:%u",
+		   comp->watermark_low, comp->watermark_high);
+	if (comp->merge_pages > 1)
+		seq_printf(seq, ",merge_pages=%u", comp->merge_pages);
+}
+
+/*
  * shmem_comp_free_swap - Release one compressed page-cache slot
  * @mapping: mapping whose mount owns the entry
  * @radswap: the radix entry holding the compression ID
@@ -1898,16 +1928,12 @@ static ssize_t compressor_store(struct kobject *kobj,
 	}
 
 	mutex_lock(&shmem_comp_defaults_lock);
-	/* Free old value; "none" clears the default (new mounts uncompressed).
-	 * Print the stored value, never a freed string. */
+	/* Free old value. "none" is stored as-is: default-following
+	 * mounts resolve algo "none" and run uncompressed (Layer 1
+	 * normalization -- one resolved state, no pool). */
 	kfree(shmem_comp_default_compressor);
-	shmem_comp_default_compressor = strcmp(algo, "none") ? algo : NULL;
-	if (shmem_comp_default_compressor)
-		pr_info("tmpfs: default compressor set to %s\n", algo);
-	else {
-		pr_info("tmpfs: default compressor set to none\n");
-		kfree(algo);
-	}
+	shmem_comp_default_compressor = algo;
+	pr_info("tmpfs: default compressor set to %s\n", algo);
 	mutex_unlock(&shmem_comp_defaults_lock);
 	return count;
 }
@@ -1981,6 +2007,54 @@ static ssize_t merge_pages_store(struct kobject *kobj,
 static struct kobj_attribute merge_pages_attr = __ATTR(merge_pages, 0644,
 					merge_pages_show, merge_pages_store);
 
+static ssize_t compress_watermark_show(struct kobject *kobj,
+				       struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	ret = sysfs_emit(buf, "%u:%u\n", shmem_comp_default_wm_low,
+			 shmem_comp_default_wm_high);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return ret;
+}
+
+static ssize_t compress_watermark_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct shmem_comp_opts opts;	/* reuses the mount-option parser */
+	char *val;
+	int ret;
+
+	val = kstrdup(buf, GFP_KERNEL);
+	if (!val)
+		return -ENOMEM;
+	val[strcspn(val, "\n")] = '\0';
+
+	/*
+	 * One grammar, one validator: the sysfs default knob and the
+	 * mount option share shmem_comp_opts_set_watermark(), so the
+	 * sentinel semantics (0:0 eager, 100:100 never) cannot drift.
+	 */
+	memset(&opts, 0, sizeof(opts));
+	ret = shmem_comp_opts_set_watermark(&opts, val);
+	kfree(val);
+	if (ret)
+		return ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	shmem_comp_default_wm_low = opts.watermark_low;
+	shmem_comp_default_wm_high = opts.watermark_high;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	pr_info("tmpfs: default compress_watermark set to %u:%u\n",
+		opts.watermark_low, opts.watermark_high);
+	return count;
+}
+static struct kobj_attribute compress_watermark_attr =
+	__ATTR(compress_watermark, 0644, compress_watermark_show,
+	       compress_watermark_store);
+
 static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
 
 static ssize_t cell_stats_show(struct kobject *kobj,
@@ -2016,6 +2090,7 @@ static struct attribute *tmpfs_comp_attrs[] = {
 	&compression_attr.attr,
 	&compressor_attr.attr,
 	&merge_pages_attr.attr,
+	&compress_watermark_attr.attr,
 	&comp_stats_attr.attr,
 	&cell_stats_attr.attr,
 	&gc_now_attr.attr,

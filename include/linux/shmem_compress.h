@@ -6,6 +6,7 @@ struct shmem_comp_pool;
 struct cell_pool;
 struct shmem_sb_info;
 struct shmem_inode_info;
+struct seq_file;
 
 /*
  * shmem_compress.h - Internal interfaces for tmpfs transparent compression
@@ -359,6 +360,14 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 		       struct shmem_comp_opts *opts,
 		       unsigned long tmpfs_bytes);
 void shmem_comp_put_super(struct shmem_sb_info *sbinfo);
+
+/*
+ * show_options: print the resolved per-mount compression config into
+ * /proc/mounts (called from shmem_show_options()). Uncompressed
+ * mounts print ",nocompress" -- /proc/mounts must tell the truth.
+ */
+void shmem_comp_show_options(struct seq_file *seq,
+			     struct shmem_sb_info *sbinfo);
 
 /*
  * Write-path hook (shmem_write_end): true when this inode's mount has
