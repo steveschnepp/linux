@@ -123,6 +123,22 @@ struct shmem_comp_pcpu {
  * Pools use simple refcounting to support sharing between mounts.
  * When refcount reaches zero, the pool is destroyed.
  */
+/*
+ * Per-mount compression state. Created by shmem_comp_fill_sb(), freed
+ * by shmem_comp_put_super(); reachable from mm/shmem.c only through
+ * the opaque pointer shmem_sb_info.comp.
+ */
+struct shmem_comp_sb {
+	bool enabled;
+	char *compressor;		/* owned; freed with the sb */
+	unsigned int threshold;		/* min file size to compress, bytes */
+	unsigned int merge;		/* pages per compression group */
+	unsigned int cell_order;	/* cell storage order, informational */
+	struct shmem_comp_pool *pool;	/* compression pool */
+	atomic_long_t pages;		/* compressed pages (this mount) */
+	atomic_long_t bytes;		/* compressed bytes stored (this mount) */
+};
+
 struct shmem_comp_pool {
 	/*
 	 * Storage backing.  Exactly one of zs_pool / cells is non-NULL;	 * use_cells selects which.  The choice is made at pool creation

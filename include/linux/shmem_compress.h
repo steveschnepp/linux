@@ -265,10 +265,14 @@ static inline bool xa_is_shmem_comp(const void *entry)
 /*
  * Per-mount compression state and parsed mount options (carve C3/C4).
  *
- * shmem_comp_fill_sb() creates a struct shmem_comp_sb for mounts with
- * compression enabled; shmem_comp_put_super() frees it. It hangs off
- * the single pointer shmem_sb_info.comp (NULL = uncompressed mount),
- * so mm/shmem.c never touches compression internals directly.
+ * shmem_comp_fill_sb() creates the per-mount compression state for
+ * mounts with compression enabled; shmem_comp_put_super() frees it. It
+ * hangs off the single pointer shmem_sb_info.comp (NULL = uncompressed
+ * mount), so mm/shmem.c never touches compression internals directly.
+ *
+ * The definition of struct shmem_comp_sb is private to
+ * mm/shmem_compress.c (carve C4); only the pointer crosses into
+ * shmem_fs.h.
  *
  * Ownership rules:
  *  - opts->compressor is owned by the opts (freed by opts_free());
@@ -277,22 +281,8 @@ static inline bool xa_is_shmem_comp(const void *entry)
  *  - comp->compressor is owned by the comp and freed by put_super().
  *  - fill_sb() failure before pool creation fails the mount (-ENOMEM);
  *    pool-creation failure is graceful: the mount runs uncompressed.
- *
- * The shmem_comp_sb definition is visible here only while the
- * compression implementation block still lives in mm/shmem.c (carve
- * C1). Once it moves into mm/shmem_compress.c the definition becomes
- * private to that file.
  */
-struct shmem_comp_sb {
-	bool enabled;
-	char *compressor;		/* owned; freed with the sb */
-	unsigned int threshold;		/* min file size to compress, bytes */
-	unsigned int merge;		/* pages per compression group */
-	unsigned int cell_order;	/* cell storage order, informational */
-	struct shmem_comp_pool *pool;	/* compression pool */
-	atomic_long_t pages;		/* compressed pages (this mount) */
-	atomic_long_t bytes;		/* compressed bytes stored (this mount) */
-};
+struct shmem_comp_sb;
 
 /*
  * Parsed compression mount options: compress=, nocompress,

@@ -11,6 +11,9 @@
 #include <linux/fs_parser.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/bits.h>
+#ifdef CONFIG_TMPFS_COMPRESSION
+struct shmem_comp_sb;		/* mm/shmem_compress.c */
+#endif
 
 /* inode in-kernel data */
 
