@@ -861,6 +861,17 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 
 /*
+ * Generation counter for entry incarnations (swapops.h packs 23 bits
+ * of it into every page cache xarray value, next to the ID) and the
+ * count of stale xarray values those generations rejected. A stale
+ * value is normal under truncate + rewrite churn -- the caller retries
+ * -- but a counter climbing without bound points at an ID-recycling
+ * storm worth investigating.
+ */
+static atomic64_t shmem_comp_gen_counter = ATOMIC64_INIT(0);
+static atomic64_t shmem_comp_stale_retries;
+
+/*
  * Entry lookup and reference discipline.
  *
  * Every page cache slot holding the ID owns one entry reference
@@ -921,19 +932,26 @@ static void shmem_comp_entry_free(unsigned int id)
 	kfree_rcu(ent, rcu);
 }
 
-bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
-			  unsigned int *length, unsigned int *nr_pages,
-			  unsigned long **handles,
-			  unsigned short *nchunks)
+static bool shmem_comp_entry_get_common(unsigned int id, bool check_gen,
+					unsigned int gen,
+					unsigned long *handle,
+					unsigned int *length,
+					unsigned int *nr_pages,
+					unsigned long **handles,
+					unsigned short *nchunks)
 {
 	struct shmem_comp_entry *ent;
 	bool found = false;
 
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
-	/* inc_unless_zero: fail on a dying entry instead of pinning
-	 * memory that teardown is about to free. */
-	if (ent && atomic_inc_not_zero(&ent->refs)) {
+	if (ent && check_gen && READ_ONCE(ent->gen) != gen) {
+		/* Stale xarray value: this ID names a different
+		 * incarnation. Reject without touching the new entry. */
+		atomic64_inc(&shmem_comp_stale_retries);
+	} else if (ent && atomic_inc_not_zero(&ent->refs)) {
+		/* inc_unless_zero: fail on a dying entry instead of
+		 * pinning memory that teardown is about to free. */
 		if (handle)
 			*handle = ent->handle;
 		if (length)
@@ -949,6 +967,30 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 	rcu_read_unlock();
 
 	return found;
+}
+
+bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
+			  unsigned int *length, unsigned int *nr_pages,
+			  unsigned long **handles,
+			  unsigned short *nchunks)
+{
+	/* Bare-ID pin: table-internal users only (cellzram, whose
+	 * entries are pinned by their own table references). Anything
+	 * that reached the ID through a page cache xarray value must
+	 * use shmem_comp_entry_get_gen(). */
+	return shmem_comp_entry_get_common(id, false, 0, handle, length,
+					   nr_pages, handles, nchunks);
+}
+
+bool shmem_comp_entry_get_gen(unsigned int id, unsigned int gen,
+			      unsigned long *handle,
+			      unsigned int *length,
+			      unsigned int *nr_pages,
+			      unsigned long **handles,
+			      unsigned short *nchunks)
+{
+	return shmem_comp_entry_get_common(id, true, gen, handle, length,
+					   nr_pages, handles, nchunks);
 }
 
 void shmem_comp_entry_put(unsigned int id)
@@ -972,7 +1014,7 @@ void shmem_comp_entry_put(unsigned int id)
 	shmem_comp_entry_free(id);
 }
 
-bool shmem_comp_entry_release(unsigned int id)
+bool shmem_comp_entry_release(unsigned int id, unsigned int gen)
 {
 	struct shmem_comp_entry *ent;
 	bool last_slot;
@@ -980,6 +1022,14 @@ bool shmem_comp_entry_release(unsigned int id)
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
 	if (!ent) {
+		rcu_read_unlock();
+		return false;
+	}
+	if (READ_ONCE(ent->gen) != gen) {
+		/* Stale xarray value: the entry this slot referenced died
+		 * and the ID was recycled. The old entry's accounting ran
+		 * when IT died; do not charge the new incarnation. */
+		atomic64_inc(&shmem_comp_stale_retries);
 		rcu_read_unlock();
 		return false;
 	}
@@ -1000,10 +1050,12 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 				    unsigned long handle, unsigned int length,
 				    unsigned short nr_pages,
 				    unsigned long *handles,
-				    unsigned short nchunks)
+				    unsigned short nchunks,
+				    unsigned int *gen)
 {
 	struct shmem_comp_entry *ent;
 	unsigned int id;
+	unsigned int g;
 	int ret;
 
 	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
@@ -1013,6 +1065,9 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 	ent->handle = handle;
 	ent->length = length;
 	ent->nr_pages = nr_pages;
+	g = (unsigned int)(atomic64_inc_return(&shmem_comp_gen_counter) &
+			    SHMEM_COMP_ENTRY_GEN_MASK);
+	ent->gen = g;
 	ent->handles = handles;
 	ent->nchunks = nchunks;
 	ent->pool = pool;
@@ -1043,6 +1098,8 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 		atomic_long_add(ksize(handles),
 				 &shmem_comp_ram_merged_bytes);
 
+	if (gen)
+		*gen = g;
 	return id;
 }
 
@@ -1329,6 +1386,8 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 	stats->ram_merged_bytes =
 		atomic_long_read(&shmem_comp_ram_merged_bytes);
 	stats->ram_entries = atomic_read(&shmem_comp_ram_entries);
+	stats->stale_value_retries =
+		(unsigned long)atomic64_read(&shmem_comp_stale_retries);
 
 	spin_unlock(&shmem_comp_stats_lock);
 
@@ -1828,21 +1887,25 @@ void shmem_comp_show_options(struct seq_file *seq,
  *
  * Called from shmem_free_swap() for compression entries only. The slot
  * erase happens there under the xas lock; here we drop the slot's
- * entry reference and update the once-per-group accounting. get()
- * cannot fail while the slot is being erased (it still holds its
- * reference); the pin keeps the entry and its data alive across the
- * release.
+ * entry reference and update the once-per-group accounting. get/release
+ * are generation-validated: between the erase and this call the entry
+ * can die and the ID be recycled -- a stale value must not be charged
+ * against the new incarnation. On a stale value got/last are both
+ * false: the old entry's accounting already ran when IT died.
  */
 void shmem_comp_free_swap(struct address_space *mapping, void *radswap)
 {
 	struct shmem_comp_sb *comp =
 		shmem_comp_get_sb(mapping->host->i_sb)->comp;
-	unsigned int id = shmem_comp_entry_id(radix_to_swp_entry(radswap));
+	swp_entry_t entry = radix_to_swp_entry(radswap);
+	unsigned int id = shmem_comp_entry_id(entry);
+	unsigned int gen = shmem_comp_entry_gen(entry);
 	unsigned int length = 0, entry_nr = 1;
 	bool got, last;
 
-	got = shmem_comp_entry_get(id, NULL, &length, &entry_nr, NULL, NULL);
-	last = shmem_comp_entry_release(id);
+	got = shmem_comp_entry_get_gen(id, gen, NULL, &length, &entry_nr,
+					NULL, NULL);
+	last = shmem_comp_entry_release(id, gen);
 	if (got)
 		shmem_comp_entry_put(id);
 	if (comp && last && got) {
@@ -1955,6 +2018,7 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		"ratio: %lu.%02lu%%\n"
 		"compress_fails: %lu\n"
 		"decompress_fails: %lu\n"
+		"stale_value_retries: %lu\n"
 		"ram_pool_bytes: %lu\n"
 		"ram_merged_bytes: %lu\n"
 		"ram_entry_bytes: %lu\n"
@@ -1968,6 +2032,7 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		stats.ratio % 100,
 		stats.compress_fails,
 		stats.decompress_fails,
+		stats.stale_value_retries,
 		stats.ram_pool_bytes,
 		stats.ram_merged_bytes,
 		stats.ram_entry_bytes,
@@ -2133,7 +2198,8 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
 						  pgoff_t pgoff);
 static int shmem_decompress_group(struct inode *inode, pgoff_t index,
-				   unsigned int id, unsigned int comp_len,
+				   unsigned int id, unsigned int gen,
+				   unsigned int comp_len,
 				   unsigned short nr_pages,
 				   gfp_t gfp, struct folio **foliop);
 static int shmem_compress_group(struct inode *inode, pgoff_t last);
@@ -2170,17 +2236,20 @@ static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
  *
  * Per-slot races (concurrent reader, truncation) are resolved by
  * shmem_add_to_page_cache(): it only installs a folio if the slot
- * still holds the replicated ID, otherwise -EEXIST is returned and
- * the caller retries.
+ * still holds the replicated ID+generation, otherwise -EEXIST is
+ * returned and the caller retries.
  */
 static int shmem_decompress_group(struct inode *inode, pgoff_t index,
-				   unsigned int id, unsigned int comp_len,
+				   unsigned int id, unsigned int gen,
+				   unsigned int comp_len,
 				   unsigned short nr_pages,
 				   gfp_t gfp, struct folio **foliop)
 {
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
 	pgoff_t head = index - (index % nr_pages);
+	unsigned long *handles = NULL;
+	unsigned short nchunks = 0;
 	void *cbuf, *dbuf, *dst;
 	unsigned int dlen;
 	unsigned short slice;
@@ -2189,11 +2258,28 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	*foliop = NULL;
 
 	/*
+	 * Pin the entry for the whole group decompress. The pin is
+	 * generation-validated: the caller's xarray value can be stale
+	 * (truncate freed the entry, a rewrite recycled the ID), and a
+	 * bare-ID pin could land on the wrong incarnation -- torn reads
+	 * plus a slot release charged to an entry this path never
+	 * owned. Every error path below drops this pin; the final put
+	 * balances it. (The cell-backed path used to drop a pin it
+	 * never took: refs corruption on every cell+merge group
+	 * decompress whose ID got recycled.)
+	 */
+	if (!shmem_comp_entry_get_gen(id, gen, NULL, NULL, NULL,
+				      &handles, &nchunks))
+		return -ENOENT;
+
+	/*
 	 * Load the compressed data.  Cell storage uses the pinned,
-	 * retry-safe loader — GC may relocate the block between the
+	 * retry-safe loader: GC may relocate the block between the
 	 * caller's entry_get() and this copy, and a stale handle would
 	 * memcpy from a cell already returned to the buddy.  Zsmalloc
-	 * loads chunk by chunk through the handle array.
+	 * loads chunk by chunk through the handle array.  load_entry()
+	 * re-pins internally; our pin above keeps the ID from being
+	 * recycled underneath it.
 	 */
 	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
 		cbuf = kmalloc(comp_len, GFP_KERNEL);
@@ -2208,14 +2294,8 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			return ret;
 		}
 	} else {
-		unsigned long *handles = NULL;
-		unsigned short nchunks = 0;
-
-		if (!shmem_comp_entry_get(id, NULL, NULL, NULL,
-					   &handles, &nchunks) ||
-		    !handles) {
-			if (handles)
-				shmem_comp_entry_put(id);
+		if (!handles) {
+			shmem_comp_entry_put(id);
 			return -ENOENT;
 		}
 
@@ -2277,7 +2357,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 
 		ret = shmem_add_to_page_cache(sib, mapping, sidx,
 					       swp_to_radix_entry(
-						       make_shmem_comp_entry(id)),
+						       make_shmem_comp_entry(id, gen)),
 					       gfp);
 		if (ret) {
 			folio_unlock(sib);
@@ -2298,7 +2378,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 
 		/* Consume this slice's slot reference; the pin taken
 		 * above keeps the entry (and cbuf) alive regardless. */
-		shmem_comp_entry_release(id);
+		shmem_comp_entry_release(id, gen);
 
 		if (sidx == index) {
 			folio_set_referenced(sib);
@@ -2316,9 +2396,9 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
 				comp_len);
 
-	/* Drop the pin: entry teardown (zsmalloc chunks + handle
-	 * array) runs here if the slice loop consumed every slot
-	 * reference. */
+	/* Drop the group pin taken at function entry: entry teardown
+	 * (zsmalloc chunks + handle array) runs here if the slice loop
+	 * consumed every slot reference. */
 	shmem_comp_entry_put(id);
 
 	kfree(cbuf);
@@ -2345,6 +2425,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 	void *kbuf, *cbuf = NULL, *src;
 	unsigned int comp_len;
 	unsigned int id;
+	unsigned int gen;
 	unsigned int i;
 	int ret = 0;
 
@@ -2438,7 +2519,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 			goto cleanup;
 		}
 		id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle,
-					     comp_len, nr, NULL, 0);
+					     comp_len, nr, NULL, 0, &gen);
 		if (!id) {
 			u16 cellid;
 			u32 offset;
@@ -2462,7 +2543,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 		}
 		id = shmem_comp_entry_alloc(sbinfo->comp->pool, 0,
 					     comp_len, nr,
-					     handles, nchunks);
+					     handles, nchunks, &gen);
 		if (!id) {
 			shmem_comp_free_merged(sbinfo->comp->pool,
 					       handles, nchunks);
@@ -2484,7 +2565,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 	/* Swap every folio of the group for the replicated ID entry */
 	for (i = 0; i < nr; i++) {
 		shmem_delete_from_page_cache(folios[i],
-			swp_to_radix_entry(make_shmem_comp_entry(id)));
+			swp_to_radix_entry(make_shmem_comp_entry(id, gen)));
 		folio_unlock(folios[i]);
 		folio_put(folios[i]);
 	}
@@ -2598,6 +2679,7 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	unsigned long handle;
 	unsigned int comp_len;
 	unsigned int id;
+	unsigned int gen;
 	unsigned int nr_pages;
 	unsigned int dlen;
 	void *src, *dst;
@@ -2611,24 +2693,28 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	/*
 	 * Pin the entry: handle/comp_len are used below outside RCU,
 	 * and truncate can erase our slot (dropping the last slot
-	 * reference) at any point. Fails with -ENOENT when the entry is
-	 * already dying; the caller retries against the updated slot.
+	 * reference) at any point. Generation-validated: the slot value
+	 * this pin is derived from can be stale (entry died, ID
+	 * recycled); fails with -ENOENT and the caller retries against
+	 * the updated slot.
 	 */
 	id = shmem_comp_entry_id(comp_entry);
-	if (!shmem_comp_entry_get(id, &handle, &comp_len, &nr_pages,
-				   NULL, NULL))
+	gen = shmem_comp_entry_gen(comp_entry);
+	if (!shmem_comp_entry_get_gen(id, gen, &handle, &comp_len,
+				       &nr_pages, NULL, NULL))
 		return -ENOENT;
 
 	/*
-	 * Merged group (merge_pages > 1): the ID is replicated in all
-	 * nr_pages slots of the group. Decompress the whole block and
-	 * install one folio per slice; the requested slice is returned.
-	 * The group path pins the entry itself; drop our pin first so
-	 * the reference accounting stays one-pin-per-get.
+	 * Merged group (merge_pages > 1): the ID+generation is
+	 * replicated in all nr_pages slots of the group. Decompress the
+	 * whole block and install one folio per slice; the requested
+	 * slice is returned. The group path pins the entry itself
+	 * (generation-validated); drop our pin first so the reference
+	 * accounting stays one-pin-per-get.
 	 */
 	if (nr_pages > 1) {
 		shmem_comp_entry_put(id);
-		return shmem_decompress_group(inode, index, id,
+		return shmem_decompress_group(inode, index, id, gen,
 					       comp_len, nr_pages,
 					       gfp, foliop);
 	}
@@ -2717,7 +2803,7 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	/* Consume the slot's reference; our pin keeps the entry (and
 	 * its zsmalloc block) alive until put() below, which runs the
 	 * teardown when no other reference remains. */
-	shmem_comp_entry_release(id);
+	shmem_comp_entry_release(id, gen);
 
 	/* Update accounting */
 	atomic_long_dec(&sbinfo->comp->pages);
@@ -2759,6 +2845,7 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	void *src, *comp_buf;
 	unsigned int comp_len;
 	unsigned int id;
+	unsigned int gen;
 	unsigned long handle;
 	int ret;
 
@@ -2839,17 +2926,18 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	/*
 	 * Register the compressed data in the entry ID table. The
 	 * zsmalloc handle is a kernel pointer and cannot be packed
-	 * into the xarray value, so the page cache stores only the ID.
-	 * The entry owns the handle from here (freed with the entry).
+	 * into the xarray value, so the page cache stores only the
+	 * {ID, generation} pair. The entry owns the handle from here
+	 * (freed with the entry).
 	 */
 	id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle, comp_len,
-				    1, NULL, 0);
+				    1, NULL, 0, &gen);
 	if (!id) {
 		shmem_comp_free(sbinfo->comp->pool, handle);
 		folio_unlock(folio);
 		return -ENOMEM;
 	}
-	comp_entry = make_shmem_comp_entry(id);
+	comp_entry = make_shmem_comp_entry(id, gen);
 
 	/*
 	 * Compressed slots are accounted like swap pages: raise

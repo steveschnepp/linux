@@ -248,7 +248,10 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 		return -ENOMEM;
 	}
 
-	id = shmem_comp_entry_alloc(dev->pool, handle, len_bytes, 1, NULL, 0);
+	/* Table-internal block: never referenced from a page cache
+	 * xarray value, so no generation is needed (NULL out-param). */
+	id = shmem_comp_entry_alloc(dev->pool, handle, len_bytes, 1, NULL, 0,
+				    NULL);
 	if (!id) {
 		u16 cellid;
 		u32 offset_bytes;
