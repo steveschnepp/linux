@@ -7,9 +7,34 @@
  *
  * The compression subsystem provides:
  * - Per-CPU compression contexts using kernel crypto API (LZ4/LZO)
- * - zsmalloc-based storage for compressed page data
+ * - zsmalloc-based storage for compressed page data (cell storage via
+ *   mm/cell_store.c when the cell= mount option is used)
  * - Pool lifecycle management (create/destroy)
+ * - Page-cache integration: compress on write, decompress on access
+ * - Per-mount state (struct shmem_comp_sb) and mount-option parsing
+ * - Global defaults + sysfs interface (/sys/fs/tmpfs, group
+ *   "compression")
  * - Statistics tracking for sysfs reporting
+ *
+ * Carve contract (see TMPFS_COMPRESSION_PLAN.md, "Upstream Shape"):
+ * this translation unit is the sole in-tree consumer of the exported
+ * shmem primitives (shmem_recalc_inode, shmem_add_to_page_cache,
+ * shmem_delete_from_page_cache, shmem_alloc_folio -- each exported
+ * from mm/shmem.c inside #ifdef CONFIG_TMPFS_COMPRESSION). Adding a
+ * second consumer of those exports is a design change, not a
+ * convenience. mm/shmem.c keeps only the dispatch hooks (write_end,
+ * get_folio_gfp, free_swap), the mount-option ABI table and the
+ * opts/fill_sb plumbing.
+ *
+ * Ownership rules (details in include/linux/shmem_compress.h):
+ * - sbinfo->comp owns its pool and compressor string; freed by
+ *   shmem_comp_put_super(), safe on partial init (mount failure).
+ * - shmem_comp_opts owns its compressor string; freed by
+ *   shmem_comp_opts_free() at fs_context teardown.
+ * - Sysfs registration is driven by tmpfs_sysfs_init() in mm/shmem.c
+ *   with the tmpfs kobject as parent; best-effort (tmpfs works
+ *   without the group). The defaults globals live here, guarded by
+ *   shmem_comp_defaults_lock.
  *
  * Design Notes:
  * - Compression uses the crypto acomp (asynchronous compression) API
@@ -19,12 +44,13 @@
  *
  * Compression Flow:
  *   1. Page is compressed via shmem_comp_compress()
- *   2. Compressed data stored via shmem_comp_store()
- *   3. xarray entry replaced with shmem_comp_entry encoding
+ *   2. Compressed data stored via shmem_comp_store() (zsmalloc handle
+ *      or cell {cellid, offset}, depending on the pool backend)
+ *   3. Page cache slot replaced with the entry ID (SWP_SHMEM_COMPRESS)
  *
  * Decompression Flow:
- *   1. xarray entry decoded via shmem_radix_to_comp_entry()
- *   2. Data loaded via shmem_comp_load()
+ *   1. xarray entry ID decoded via shmem_comp_entry_id()
+ *   2. Data loaded via shmem_comp_load() / shmem_comp_load_entry()
  *   3. Page decompressed via shmem_comp_decompress()
  *
  * Performance Considerations:

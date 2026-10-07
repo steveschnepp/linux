@@ -478,6 +478,10 @@ bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
 }
 
 #ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
 EXPORT_SYMBOL_GPL(shmem_recalc_inode);
 #endif
 
@@ -962,6 +966,10 @@ unlock:
 }
 
 #ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
 EXPORT_SYMBOL_GPL(shmem_add_to_page_cache);
 #endif
 
@@ -985,6 +993,10 @@ void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 }
 
 #ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
 EXPORT_SYMBOL_GPL(shmem_delete_from_page_cache);
 #endif
 
@@ -1973,6 +1985,10 @@ struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 }
 
 #ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
 EXPORT_SYMBOL_GPL(shmem_alloc_folio);
 #endif
 
@@ -2499,7 +2515,11 @@ repeat:
 
 	if (xa_is_value(folio)) {
 #ifdef CONFIG_TMPFS_COMPRESSION
-		/* Check if this is a compressed page entry */
+		/*
+		 * Compressed entry: decompress + install a folio,
+		 * replacing the entry. -EEXIST/-ENOENT: the slot changed
+		 * or the entry vanished (races); retry against the slot.
+		 */
 		if (xa_is_shmem_comp(folio)) {
 			swp_entry_t comp_entry;
 
@@ -2507,11 +2527,6 @@ repeat:
 			error = shmem_decompress_folio(inode, index,
 							comp_entry, gfp,
 							&folio);
-			/* -EEXIST: slot changed under us (another
-			 * decompressor won). -ENOENT: the entry vanished
-			 * between xarray load and entry_get (truncate won
-			 * the race). Both are races, not errors: retry
-			 * against the updated slot. */
 			if (error == -EEXIST || error == -ENOENT)
 				goto repeat;
 

@@ -62,6 +62,9 @@ static inline int current_is_kswapd(void)
  * Compressed pages in tmpfs are stored in the page cache xarray using
  * a special entry type, similar to how swap entries are stored. This
  * allows compressed pages to be transparently decompressed on access.
+ *
+ * Compression entries live only in the page cache xarray, never in
+ * PTEs: no PTE swap-type space is consumed by them.
  */
 #define SWP_SHMEM_COMPRESS_NUM 1
 #ifdef CONFIG_TMPFS_COMPRESSION
