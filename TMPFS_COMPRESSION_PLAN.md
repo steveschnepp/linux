@@ -2911,3 +2911,19 @@ for never / 0:0 / 50:70 / 50:100 against today's eager numbers,
 predicting T=1 single-job throughput toward plain (26 vs 17.1 MB/s),
 skipped_dead absorbing transient churn, survivor ratio unchanged
 (~48% stored), and bounded Shmem overshoot (max sampled in-window).
+
+## Status (2026-10-07)
+
+Stage 1 landed as four commits (`a222524`..`275a232`): aliases
+dropped, compress_threshold memparse units, compress_watermark=LOW:HIGH
+end-to-end (mount parse -> watermark_seen -> fill_sb sentinels -> sb ->
+show_options -> sysfs default knob, built-in default 0:0),
+resolved-state mount lines with why-off, /proc/mounts truth via
+shmem_comp_show_options(), and sysfs compressor=none normalization
+(stored as-is; no Kconfig fallback). Rig gate recipe for entry work:
+TEST_ENTRYRACE=1 QEMU_CPUS=4. Known-open (pre-existing, reproduced on
+both pre- and post-Stage-1 kernels under that gate): entry-ID-reuse
+race -- stale xarray slot value + ID recycling pins the wrong entry,
+`refs underflow` WARNs in shmem_comp_entry_release(), torn reads.
+Fix before upstream posting; separate work item (mission log session
+9). Stage 2 (machinery + default flip to 50:70) is next.
