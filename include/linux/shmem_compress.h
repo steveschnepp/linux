@@ -288,13 +288,16 @@ struct shmem_comp_sb;
  * Parsed compression mount options: compress=, nocompress,
  * compress_threshold=, merge_pages=, cell=. "Unset" means zero/NULL;
  * shmem_comp_fill_sb() substitutes the sysfs/Kconfig defaults for
- * those. A threshold_bytes of 0 means "use the default": there is no
- * way to ask for "compress everything" other than threshold_bytes=1.
+ * those. threshold_bytes takes memparse syntax at mount ("64K"); 0
+ * means "use the default" -- there is no way to ask for "compress
+ * everything" other than threshold_bytes=1. The threshold applies to
+ * WRITE-TIME compression only; the aging pass (Stage 2) compresses
+ * any eligible survivor >= 1 page.
  */
 struct shmem_comp_opts {
 	bool compress;			/* false = nocompress / compress=none */
 	char *compressor;		/* algorithm, NULL = default */
-	unsigned int threshold_bytes;		/* bytes; 0 = default */
+	unsigned int threshold_bytes;		/* write-time min file size, bytes; 0 = default */
 	unsigned int merge_pages;		/* pages; 0 = sysfs default */
 	unsigned int cell_order;	/* 0 = derive from tmpfs size */
 	bool cell_seen;			/* cell= given (incl. cell=0 opt-out) */

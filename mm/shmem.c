@@ -4588,7 +4588,7 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 #ifdef CONFIG_TMPFS_COMPRESSION
 	fsparam_string("compress", Opt_compress_algo),
 	fsparam_flag  ("nocompress", Opt_nocompress),
-	fsparam_u32   ("compress_threshold", Opt_compress_threshold),
+	fsparam_string("compress_threshold", Opt_compress_threshold),
 	fsparam_u32   ("merge_pages", Opt_compress_merge),
 	fsparam_string("cell", Opt_cell),
 #endif
@@ -4813,7 +4813,10 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_threshold:
-		ctx->comp_opts.threshold_bytes = result.uint_32;
+		size = memparse(param->string, &rest);
+		if (*rest || size > UINT_MAX)
+			goto bad_value;
+		ctx->comp_opts.threshold_bytes = size;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_merge:
