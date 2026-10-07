@@ -2267,3 +2267,140 @@ cell_gc ALL PASS).
 3. The panic asserts are only as good as the runs that exercise
    them: keep the entry-race gate (TEST_ENTRYRACE=1) and full suite
    as standing gates for all data-path commits.
+
+---
+
+## Session 11: Apple's fstools in the guest -- fsx + fstorture on compressed tmpfs (2026-10-07)
+
+### What We Did
+
+Brought https://github.com/apple/fstools into the QEMU test guest:
+cloned, ported to Linux, built statically, wired into the initramfs,
+and gated behind `TEST_FSTOOLS=1`. The repo is Apple's filesystem
+**testing** tools -- `fsx` (the classic filesystem exerciser) and
+`fstorture` (reference-model directory-tree torture) -- which is
+better news than expected: these are exactly the kind of third-party
+torture workloads this rig exists for.
+
+**The port** (all patches local to the rig, none upstream):
+
+- `fstools-compat/` -- four Linux shims, force-included or -I'd:
+  - `sys/paths.h`: `_PATH_FORKSPECIFIER` -> `""` (Darwin named forks
+    do not exist; keeps fsx's fork code inert).
+  - `membership.h`: `uuid_t` + `mbr_uid_to_uuid()` stub deriving a
+    deterministic pseudo-UUID from the uid (guest has no Open
+    Directory; fstorture needs a stable per-user token for its ACL
+    path, which the Linux branch disables anyway).
+  - `sys/acl.h`: Darwin ACL API (ACL_TYPE_EXTENDED,
+    ACL_EXTENDED_ALLOW/DENY, perm/tag constants) as ENOSYS-returning
+    stubs -- fstorture's ACL path is NFSv4-ACL semantics with no
+    Linux equivalent, and the port branch forces acl=0.
+  - `fsx_linux.h`: force-included. Maps Darwin xattr arity to Linux
+    (fgetxattr 6->4, fsetxattr 6->5 keeping options-as-flags,
+    fremovexattr 3->2), F_NOCACHE -> invalid fcntl cmd (999, no-op),
+    and pulls stdint.h for uintptr_t.
+- `fstorture.c`: `#ifdef __APPLE__` guard around the getattrlist(2)
+  capability probe (and its statfs.f_mntonname use -- Linux statfs
+  has no such field). Linux branch: assume symlinks+hardlinks, ACLs
+  off, print "(Linux port)" capabilities lines.
+- `fsx.c`: default EA name patched to `"user.fsx"` on Linux -- the
+  Darwin default is the program name (`/bin/fsx`), namespace-less,
+  rejected by Linux with EOPNOTSUPP. This was found by the gate, not
+  by reading.
+- Build quirks: `-static`, fstorture needs `-include string.h
+  -include signal.h -DF_NOCACHE=999 -lm`; fsx needs `-include
+  fsx_linux.h`. Reproducible via `scripts/build_fstools.sh`.
+
+**Rig wiring:** binaries into `initrd/bin/`; `test.fstools=1` gate in
+`initrd/init` (mounts compressed tmpfs -- lz4, merge_pages=1,
+compress_threshold=1 -- runs fsx -N 2000, fsx -e -N 500, fstorture 1
+process x 25 cycles, dumps comp_stats, exits with the summed status);
+`TEST_FSTOOLS=1` env hook in `run_qemu.sh`.
+
+**Gate dead ends (rig-side, all fixed):**
+
+1. fstorture was given two separate tmpfs mounts as its two roots.
+   Its core operations rename/hardlink BETWEEN the roots, so every
+   such op failed EXDEV -- the tool printed errors but exited 0 and
+   "completed" 25 cycles testing nothing. Silent-failure trap: a
+   filesystem torture tool that cannot operate on the filesystem is
+   not a test. Fix: one mount, two subdirectories.
+2. The subdirectories were mkdir'd BEFORE the mount, so the mount
+   hid them; fstorture exited1 on "root1 does not exist". Fix:
+   mkdir after mount (paths inside a new mount must be created
+   inside it).
+3. fsx -e failed with EOPNOTSUPP (the EA-name port gap above).
+
+**Final results** (kernel #69, panic asserts armed):
+fsx 2139 ops "completed A-OK!" exit 0; fsx -e 500 xattr ops A-OK
+exit 0 (through the Darwin-arity shims, on a compressed mount);
+fstorture 25 cycles clean exit 0; `Test exit code: 0`; comp_stats
+13 compressed / 13 uncompressed pages, stale_value_retries 0; both
+mount lines resolved correctly (cell-backed, lz4, watermark=0:0).
+
+### What We Learned
+
+- The "third-party torture workload" genre is the strongest possible
+  external validation: fsx's pattern-verification model checked our
+  compress->store->decompress path under2139 random ops without a
+  single mismatch. When our own tests all pass, importing an
+  independent oracle is the next-best evidence.
+- fstorture's exit code does not reflect its printed errors -- it
+  "completed" while every cross-root op was EXDEV. Exit code is not
+  a verdict; the operation log is. Same class as the session-10
+  lesson, different tool.
+- Darwin->Linux ports fail in predictable layers: headers
+  (sys/paths.h, membership.h), API shapes (xattr arity,
+  getattrlist), semantics (EA namespaces), and build glue (missing
+  string.h/signal.h transitive includes). Shimming the headers got
+  compilation; only in-guest runs exposed the semantic gaps.
+- macOS capability probing has no Linux equivalent worth faking in
+  detail: assume what Linux guarantees (symlinks, hardlinks) and
+  disable what has no counterpart (NFSv4 ACLs).
+
+### What We Decided
+
+- fstools live in the rig as a gated workload (`TEST_FSTOOLS=1`),
+  not part of the default suite -- they are external validation, not
+  the standing acceptance gate.
+- Port patches stay local and are documented in build_fstools.sh
+  (a fresh clone needs them redone; none are worth upstreaming here).
+- fsx -e stays in the gate: it is the only coverage of the xattr
+  shim layer.
+
+### Rules Added
+
+- **Same-filesystem rule:** any torture tool taking two roots
+  (source/destination trees) must run them on ONE filesystem unless
+  cross-device behavior is the explicit subject; EXDEV turns the run
+  into a no-op that still exits 0.
+- **Mount-then-mkdir rule:** paths that live inside a new mount are
+  created after the mount, never before it.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| rig `fstools-src/` | cloned apple/fstools + local Linux patches (fstorture.c capability guard, fsx.c EA name) |
+| rig `fstools-compat/` | Linux shims: sys/paths.h, membership.h, sys/acl.h, fsx_linux.h |
+| rig `scripts/build_fstools.sh` | reproducible static build of fsx + fstorture into initrd/bin |
+| rig `scripts/run_qemu.sh` | TEST_FSTOOLS=1 -> test.fstools=1 |
+| rig `initrd/init` | fstools gate: compressed tmpfs mounts, fsx / fsx -e / fstorture, comp_stats dump |
+| rig `initrd/bin/fsx`, `fstorture` | static binaries (~1 MB each) |
+
+### Test Results / Benchmarks
+
+`TEST_FSTOOLS=1 QEMU_CPUS=4`, kernel #69: fsx 2139 ops A-OK (exit
+0); fsx -e 500 xattr ops A-OK (exit 0); fstorture 25 cycles clean
+(exit 0); Test exit code 0; comp_stats 13/13 pages,
+stale_value_retries 0; zero oopses/warnings beyond boot noise.
+
+### Next Steps
+
+1. Optional: fold a short fstools run into the default suite rotation
+   (e.g., fsx -N 500) so every kernel build gets the external-oracle
+   check, not just explicit gate boots.
+2. fstorture longer/time-based runs (-t) as a Stage-2 torture
+   companion alongside the munin untar farm.
+3. Stage 2 machinery remains the main line (marker list,
+   shmem_comp_maintain(), default flip to 50:70, policy matrix).
