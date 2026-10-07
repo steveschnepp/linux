@@ -5,6 +5,7 @@
 struct shmem_comp_pool;
 struct cell_pool;
 struct shmem_sb_info;
+struct shmem_inode_info;
 
 /*
  * shmem_compress.h - Internal interfaces for tmpfs transparent compression
@@ -49,6 +50,7 @@ struct shmem_sb_info;
 
 #include <linux/types.h>
 #include <linux/fs.h>
+#include <linux/swap.h>
 
 struct kobject;
 
@@ -351,6 +353,31 @@ bool shmem_comp_should_compress(struct inode *inode);
  * per-mount accounting.
  */
 void shmem_comp_free_swap(struct address_space *mapping, void *radswap);
+
+/*
+ * Compression data path (mm/shmem_compress.c), called from the three
+ * dispatch sites in mm/shmem.c (write_end, get_folio_gfp) and from the
+ * eviction hook.
+ */
+int shmem_compress_folio(struct inode *inode, pgoff_t index,
+			 struct folio *folio);
+int shmem_decompress_folio(struct inode *inode, pgoff_t index,
+			   swp_entry_t comp_entry, gfp_t gfp,
+			   struct folio **foliop);
+
+/*
+ * shmem primitives exported for the tmpfs compression backend
+ * (mm/shmem_compress.c). Exported inside CONFIG_TMPFS_COMPRESSION so
+ * no new API exists when the config is off.
+ */
+bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped);
+int shmem_add_to_page_cache(struct folio *folio,
+			    struct address_space *mapping,
+			    pgoff_t index, void *shadow, gfp_t gfp);
+void shmem_delete_from_page_cache(struct folio *folio, void *radswap);
+struct folio *shmem_alloc_folio(gfp_t gfp, int order,
+				struct shmem_inode_info *info,
+				pgoff_t index);
 
 /*
  * Global compression defaults and sysfs interface.

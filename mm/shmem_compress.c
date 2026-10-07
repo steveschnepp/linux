@@ -1902,6 +1902,772 @@ void shmem_comp_sysfs_unregister(void)
 #endif /* CONFIG_SYSFS */
 
 /*
+ * Compression data path: compress on write, decompress on access.
+ *
+ * Moved here from mm/shmem.c (carve C1). This translation unit is the
+ * sole in-tree consumer of the exported shmem primitives
+ * (shmem_recalc_inode, shmem_add_to_page_cache,
+ * shmem_delete_from_page_cache, shmem_alloc_folio); adding a second
+ * consumer of those exports is a design change, not a convenience.
+ */
+
+
+int shmem_compress_folio(struct inode *inode, pgoff_t index,
+				struct folio *folio);
+static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
+						  pgoff_t pgoff);
+static int shmem_decompress_group(struct inode *inode, pgoff_t index,
+				   unsigned int id, unsigned int comp_len,
+				   unsigned short nr_pages,
+				   gfp_t gfp, struct folio **foliop);
+static int shmem_compress_group(struct inode *inode, pgoff_t last);
+
+/*
+ * Fetch an existing folio without allocating: used by group
+ * compression to gather the sibling pages of a merge group. The
+ * shmem_get_folio_noalloc() helper is only compiled with
+ * CONFIG_USERFAULTFD, so keep a local wrapper that works
+ * unconditionally.
+ */
+static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
+						  pgoff_t pgoff)
+{
+	struct folio *folio;
+	int err;
+
+	err = shmem_get_folio(inode, pgoff, 0, &folio, SGP_NOALLOC);
+	if (err)
+		return ERR_PTR(err);
+
+	return folio;
+}
+
+/*
+ * Decompress a merged group (merge_pages > 1) and install one folio
+ * per slice. The ID entry is replicated in every slot of the group;
+ * each successfully installed slice releases one reference, and the
+ * entry plus its zsmalloc block are freed with the last release.
+ *
+ * The folio covering @index is returned locked (shmem_get_folio()
+ * contract); sibling slices remain cached, so sequential reads of a
+ * group cost a single decompression.
+ *
+ * Per-slot races (concurrent reader, truncation) are resolved by
+ * shmem_add_to_page_cache(): it only installs a folio if the slot
+ * still holds the replicated ID, otherwise -EEXIST is returned and
+ * the caller retries.
+ */
+static int shmem_decompress_group(struct inode *inode, pgoff_t index,
+				   unsigned int id, unsigned int comp_len,
+				   unsigned short nr_pages,
+				   gfp_t gfp, struct folio **foliop)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	pgoff_t head = index - (index % nr_pages);
+	void *cbuf, *dbuf, *dst;
+	unsigned int dlen;
+	unsigned short slice;
+	int ret = 0;
+
+	*foliop = NULL;
+
+	/*
+	 * Load the compressed data.  Cell storage uses the pinned,
+	 * retry-safe loader — GC may relocate the block between the
+	 * caller's entry_get() and this copy, and a stale handle would
+	 * memcpy from a cell already returned to the buddy.  Zsmalloc
+	 * loads chunk by chunk through the handle array.
+	 */
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
+		cbuf = kmalloc(comp_len, GFP_KERNEL);
+		if (!cbuf) {
+			shmem_comp_entry_put(id);
+			return -ENOMEM;
+		}
+		ret = shmem_comp_load_entry(id, cbuf, &comp_len);
+		if (ret) {
+			kfree(cbuf);
+			shmem_comp_entry_put(id);
+			return ret;
+		}
+	} else {
+		unsigned long *handles = NULL;
+		unsigned short nchunks = 0;
+
+		if (!shmem_comp_entry_get(id, NULL, NULL, NULL,
+					   &handles, &nchunks) ||
+		    !handles) {
+			if (handles)
+				shmem_comp_entry_put(id);
+			return -ENOENT;
+		}
+
+		cbuf = kmalloc(comp_len, GFP_KERNEL);
+		if (!cbuf) {
+			shmem_comp_entry_put(id);
+			return -ENOMEM;
+		}
+
+		ret = shmem_comp_load_merged(sbinfo->comp->pool, handles,
+					      nchunks, cbuf, &comp_len);
+		if (ret) {
+			kfree(cbuf);
+			shmem_comp_entry_put(id);
+			return ret;
+		}
+	}
+
+	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
+	if (!dbuf) {
+		kfree(cbuf);
+		shmem_comp_entry_put(id);
+		return -ENOMEM;
+	}
+
+	dlen = (unsigned int)nr_pages * PAGE_SIZE;
+	ret = shmem_comp_decompress(sbinfo->comp->pool, cbuf, comp_len,
+				    dbuf, &dlen);
+	if (ret) {
+		kfree(cbuf);
+		kfree(dbuf);
+		shmem_comp_entry_put(id);
+		return ret;
+	}
+
+	for (slice = 0; slice < nr_pages; slice++) {
+		pgoff_t sidx = head + slice;
+		struct folio *sib;
+
+		/*
+		 * A decompressed slice is a regular shmem page: it must be
+		 * swapbacked (shmem_add_to_page_cache() asserts it) and on
+		 * the LRU once installed (reclaim sees only LRU pages). The
+		 * folio is private until it is stored, so the locked and
+		 * swapbacked bits are set directly.
+		 */
+		sib = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), sidx);
+		if (!sib) {
+			ret = -ENOMEM;
+			break;
+		}
+		__folio_set_locked(sib);
+		__folio_set_swapbacked(sib);
+
+		dst = kmap_local_folio(sib, 0);
+		memcpy(dst, dbuf + (size_t)slice * PAGE_SIZE, PAGE_SIZE);
+		kunmap_local(dst);
+		folio_mark_uptodate(sib);
+
+		ret = shmem_add_to_page_cache(sib, mapping, sidx,
+					       swp_to_radix_entry(
+						       make_shmem_comp_entry(id)),
+					       gfp);
+		if (ret) {
+			folio_unlock(sib);
+			folio_put(sib);
+			if (sidx == index) {
+				/* requested slice lost the race: retry */
+				shmem_comp_entry_put(id);
+				kfree(dbuf);
+				return ret;
+			}
+			continue;
+		}
+
+		folio_add_lru(sib);
+
+		/* Pair with the per-slice recalc in the compress path. */
+		shmem_recalc_inode(inode, 0, -1);
+
+		/* Consume this slice's slot reference; the pin taken
+		 * above keeps the entry (and cbuf) alive regardless. */
+		shmem_comp_entry_release(id);
+
+		if (sidx == index) {
+			folio_set_referenced(sib);
+			*foliop = sib;	/* locked, ref for caller */
+		} else {
+			folio_unlock(sib);
+			folio_put(sib);
+		}
+		ret = 0;
+	}
+
+	/* One group decompressed: update accounting once */
+	atomic_long_sub(nr_pages, &sbinfo->comp->pages);
+	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
+	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
+				comp_len);
+
+	/* Drop the pin: entry teardown (zsmalloc chunks + handle
+	 * array) runs here if the slice loop consumed every slot
+	 * reference. */
+	shmem_comp_entry_put(id);
+
+	kfree(cbuf);
+	kfree(dbuf);
+	return *foliop ? 0 : ret;
+}
+
+/*
+ * Compress a completed merge group: @last is the index of the final
+ * page of the group, so head = last + 1 - comp_merge. All pages are
+ * copied into one buffer and compressed as a single block; the entry
+ * ID is then replicated into every slot of the group.
+ *
+ * Folios stay locked across the compression to keep the group stable;
+ * the inode i_rwsem (held by the write path) already excludes
+ * truncation of this inode.
+ */
+static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
+				     unsigned int nr)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	struct folio **folios;
+	struct folio *folio;
+	void *kbuf, *cbuf = NULL, *src;
+	unsigned int comp_len;
+	unsigned int id;
+	unsigned int i;
+	int ret = 0;
+
+	if (!nr || nr > SHMEM_COMP_MERGE_MAX)
+		return -EINVAL;
+
+	/*
+	 * Heap-allocate the folio array: at SHMEM_COMP_MERGE_MAX the
+	 * pointer table alone is 8KiB, far too much for the kernel stack.
+	 */
+	folios = kcalloc(nr, sizeof(*folios), GFP_KERNEL);
+	if (!folios)
+		return -ENOMEM;
+
+	kbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
+	if (!kbuf) {
+		kfree(folios);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < nr; i++) {
+		folio = shmem_comp_get_folio_noalloc(inode, head + i);
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio);
+			goto cleanup;
+		}
+		if (!folio || !folio_test_uptodate(folio)) {
+			if (folio) {
+				folio_unlock(folio);
+				folio_put(folio);
+			}
+			ret = -EIO;
+			goto cleanup;
+		}
+		/*
+		 * The replicated-ID swap below removes every group
+		 * member from the page cache. A member with live PTEs
+		 * (shared mmap, forked children) must not be swapped:
+		 * stores would land in the orphan while read() serves
+		 * the compressed copy. Folio locks exclude new faults,
+		 * so folio_mapped() is stable. Order-0 only, like the
+		 * single-page path. Members are not required to be
+		 * dirty: a decompressed group is clean by construction
+		 * and recompressing it is safe. Skip the whole group;
+		 * members stay uncompressed.
+		 */
+		if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+		    folio_order(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			ret = 0;
+			goto cleanup;
+		}
+		src = kmap_local_folio(folio, 0);
+		memcpy(kbuf + (size_t)i * PAGE_SIZE, src, PAGE_SIZE);
+		kunmap_local(src);
+		folios[i] = folio;	/* stays locked until swap-out */
+	}
+
+	cbuf = kmalloc((size_t)nr * PAGE_SIZE, GFP_KERNEL);
+	if (!cbuf) {
+		ret = -ENOMEM;
+		goto cleanup;
+	}
+
+	/* One crypto call covers the whole group */
+	comp_len = (unsigned int)nr * PAGE_SIZE;
+	ret = shmem_comp_compress(sbinfo->comp->pool, kbuf,
+				  (unsigned int)nr * PAGE_SIZE,
+				  cbuf, &comp_len);
+	if (ret || comp_len >= nr * PAGE_SIZE) {
+		/* incompressible group: keep pages uncompressed */
+		ret = 0;
+		goto cleanup;
+	}
+
+	/*
+	 * Store the compressed group.  Cell storage uses a single
+	 * block allocation — the entire group fits in one cell region
+	 * and avoids the per-chunk handle array.  Zsmalloc chunks the
+	 * group because ZS_MAX_ALLOC_SIZE is PAGE_SIZE; cell storage
+	 * has no such limit (cells are up to 4 MiB).
+	 */
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
+		unsigned long handle;
+
+		handle = shmem_comp_store(sbinfo->comp->pool,
+					   cbuf, comp_len);
+		if (!handle) {
+			ret = 0;
+			goto cleanup;
+		}
+		id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle,
+					     comp_len, nr, NULL, 0);
+		if (!id) {
+			u16 cellid;
+			u32 offset;
+
+			shmem_comp_unpack_loc(handle, &cellid, &offset);
+			cell_free(shmem_comp_pool_cells(sbinfo->comp->pool),
+				  cellid, offset, comp_len);
+			ret = 0;
+			goto cleanup;
+		}
+	} else {
+		unsigned long *handles = NULL;
+		unsigned short nchunks = 0;
+
+		ret = shmem_comp_store_merged(sbinfo->comp->pool,
+					      cbuf, comp_len,
+					      &handles, &nchunks);
+		if (ret) {
+			ret = 0;
+			goto cleanup;
+		}
+		id = shmem_comp_entry_alloc(sbinfo->comp->pool, 0,
+					     comp_len, nr,
+					     handles, nchunks);
+		if (!id) {
+			shmem_comp_free_merged(sbinfo->comp->pool,
+					       handles, nchunks);
+			ret = 0;
+			goto cleanup;
+		}
+	}
+
+	/*
+	 * Compressed slots are accounted like swap pages: raise
+	 * swapped before the slot swap lowers nrpages, so a racing
+	 * shmem_recalc_inode() never sees the pages as freed (the
+	 * same ordering shmem_writeout() relies on). Pairs with the
+	 * -nr_swaps_freed recalc at the end of shmem_undo_range(),
+	 * which restores the charge when the slots are truncated.
+	 */
+	shmem_recalc_inode(inode, 0, nr);
+
+	/* Swap every folio of the group for the replicated ID entry */
+	for (i = 0; i < nr; i++) {
+		shmem_delete_from_page_cache(folios[i],
+			swp_to_radix_entry(make_shmem_comp_entry(id)));
+		folio_unlock(folios[i]);
+		folio_put(folios[i]);
+	}
+
+	atomic_long_add(nr, &sbinfo->comp->pages);
+	atomic_long_add(comp_len, &sbinfo->comp->bytes);
+	shmem_comp_update_stats(true, (unsigned int)nr * PAGE_SIZE,
+				comp_len);
+
+	kfree(cbuf);
+	kfree(kbuf);
+	kfree(folios);
+	return 0;
+
+cleanup:
+	for (i = 0; i < nr; i++) {
+		if (folios[i]) {
+			folio_unlock(folios[i]);
+			folio_put(folios[i]);
+		}
+	}
+	kfree(cbuf);
+	kfree(kbuf);
+	kfree(folios);
+	return ret;
+}
+
+/*
+ * Choose how many pages of a merge group to compress together.
+ *
+ * Cell storage holds one compressed block per cell region and a
+ * block cannot span cells, so a group whose compressed form might
+ * exceed a cell must be split.  Compression never grows data
+ * (incompressible groups are discarded), so bounding the
+ * uncompressed slice by the cell size guarantees the compressed
+ * slice fits.  The slice must also divide the merge size: the
+ * group head is merge-aligned (the call site only fires on a full
+ * group), so any divisor of merge keeps every slice head aligned,
+ * which is what shmem_decompress_group() relies on to recover the
+ * head from an interior index (index - index % nr_pages).
+ *
+ * merge <= 1024, so the divisor scan is bounded and cheap.  A
+ * prime merge larger than the cell falls back to single pages —
+ * inefficient but correct, and unreachable for power-of-two merge
+ * values with cells >= 16 KiB.
+ */
+static unsigned int shmem_comp_chunk_nr(struct shmem_sb_info *sbinfo,
+					unsigned int nr)
+{
+	unsigned int cell_pages = shmem_comp_pool_cell_pages(sbinfo->comp->pool);
+	unsigned int d;
+
+	if (!cell_pages || nr <= cell_pages)
+		return nr;
+
+	for (d = cell_pages; d > 1; d--)
+		if (nr % d == 0)
+			return d;
+	return 1;
+}
+
+static int shmem_compress_group(struct inode *inode, pgoff_t last)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	unsigned int nr = sbinfo->comp->merge;
+	unsigned int chunk, off;
+	pgoff_t head;
+
+	if (nr < 2 || nr > SHMEM_COMP_MERGE_MAX)
+		return -EINVAL;
+
+	head = last + 1 - nr;
+	chunk = shmem_comp_chunk_nr(sbinfo, nr);
+
+	for (off = 0; off < nr; off += chunk) {
+		int ret = shmem_comp_compress_chunk(inode, head + off,
+						    min(chunk, nr - off));
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/**
+ * shmem_decompress_folio - Decompress a page from the compression pool
+ * @inode: shmem inode
+ * @index: page index in the file
+ * @comp_entry: compression entry found in the page cache
+ * @gfp: allocation flags for the replacement folio
+ * @foliop: output, receives the decompressed folio
+ *
+ * Return: 0 on success, negative errno on failure
+ *
+ * Loads the compressed data from the zsmalloc pool, decompresses it
+ * into a freshly allocated folio and atomically swaps the compression
+ * entry for that folio in the page cache xarray. The folio is returned
+ * locked and with a reference, matching the shmem_get_folio() contract.
+ *
+ * Races with a concurrent compress/decompress of the same index are
+ * resolved by shmem_add_to_page_cache(): it only installs the folio if
+ * the slot still holds @comp_entry, otherwise -EEXIST is returned and
+ * the caller retries.
+ */
+int shmem_decompress_folio(struct inode *inode, pgoff_t index,
+				  swp_entry_t comp_entry, gfp_t gfp,
+				  struct folio **foliop)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *folio;
+	unsigned long handle;
+	unsigned int comp_len;
+	unsigned int id;
+	unsigned int nr_pages;
+	unsigned int dlen;
+	void *src, *dst;
+	int ret;
+
+	*foliop = NULL;
+
+	if (!sbinfo->comp)
+		return -ENODEV;
+
+	/*
+	 * Pin the entry: handle/comp_len are used below outside RCU,
+	 * and truncate can erase our slot (dropping the last slot
+	 * reference) at any point. Fails with -ENOENT when the entry is
+	 * already dying; the caller retries against the updated slot.
+	 */
+	id = shmem_comp_entry_id(comp_entry);
+	if (!shmem_comp_entry_get(id, &handle, &comp_len, &nr_pages,
+				   NULL, NULL))
+		return -ENOENT;
+
+	/*
+	 * Merged group (merge_pages > 1): the ID is replicated in all
+	 * nr_pages slots of the group. Decompress the whole block and
+	 * install one folio per slice; the requested slice is returned.
+	 * The group path pins the entry itself; drop our pin first so
+	 * the reference accounting stays one-pin-per-get.
+	 */
+	if (nr_pages > 1) {
+		shmem_comp_entry_put(id);
+		return shmem_decompress_group(inode, index, id,
+					       comp_len, nr_pages,
+					       gfp, foliop);
+	}
+
+	/* Read the compressed bytes out of the pool first.
+	 * GFP_KERNEL: transient slab buffer, must not carry __GFP_HIGHMEM.
+	 */
+	src = kmalloc(comp_len, GFP_KERNEL);
+	if (!src) {
+		shmem_comp_entry_put(id);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Cell storage: the handle copied above can go stale between
+	 * entry_get() and here — GC may relocate the block and return
+	 * its cell to the buddy.  The retry-safe loader revalidates the
+	 * handle under the cell's read lock.  Zsmalloc handles never
+	 * move under us (objects stay put until zs_free), so the plain
+	 * load is safe there.
+	 */
+	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool))
+		ret = shmem_comp_load_entry(id, src, &comp_len);
+	else
+		ret = shmem_comp_load(sbinfo->comp->pool, handle, src, &comp_len);
+	if (ret) {
+		kfree(src);
+		shmem_comp_entry_put(id);
+		return ret;
+	}
+
+	/*
+	 * A decompressed page is a regular shmem page: it must be
+	 * swapbacked (shmem_add_to_page_cache() asserts it) and on the
+	 * LRU once installed (reclaim sees only LRU pages). The folio is
+	 * private until it is stored, so the locked and swapbacked bits
+	 * are set directly.
+	 */
+	folio = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), index);
+	if (!folio) {
+		kfree(src);
+		shmem_comp_entry_put(id);
+		return -ENOMEM;
+	}
+	__folio_set_locked(folio);
+	__folio_set_swapbacked(folio);
+
+	/* Decompress into the folio */
+	dst = kmap_local_folio(folio, 0);
+	dlen = PAGE_SIZE;
+	ret = shmem_comp_decompress(sbinfo->comp->pool, src, comp_len,
+				    dst, &dlen);
+	kunmap_local(dst);
+	kfree(src);
+
+	if (ret) {
+		folio_unlock(folio);
+		folio_put(folio);
+		shmem_comp_entry_put(id);
+		return ret;
+	}
+
+	folio_mark_uptodate(folio);
+
+	/*
+	 * Atomically replace the compression entry with the folio.
+	 * @comp_entry is passed as the expected xarray slot contents.
+	 */
+	ret = shmem_add_to_page_cache(folio, mapping, index,
+				       swp_to_radix_entry(comp_entry), gfp);
+	if (ret) {
+		folio_unlock(folio);
+		folio_put(folio);
+		shmem_comp_entry_put(id);
+		return ret;
+	}
+
+	/*
+	 * nrpages rose with the folio install; drop the swap-style
+	 * charge the compression raised (see shmem_compress_folio()).
+	 */
+	shmem_recalc_inode(inode, 0, -1);
+
+	folio_add_lru(folio);
+
+	/* Consume the slot's reference; our pin keeps the entry (and
+	 * its zsmalloc block) alive until put() below, which runs the
+	 * teardown when no other reference remains. */
+	shmem_comp_entry_release(id);
+
+	/* Update accounting */
+	atomic_long_dec(&sbinfo->comp->pages);
+	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
+	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
+
+	shmem_comp_entry_put(id);
+
+	folio_set_referenced(folio);
+	/* Hand back the folio locked, with a reference for the caller */
+	*foliop = folio;
+	return 0;
+}
+
+/**
+ * shmem_compress_folio - Compress a folio and store in compression pool
+ * @inode: shmem inode
+ * @index: Page index in file
+ * @folio: Folio to compress
+ *
+ * Return: 0 on success, negative errno on failure
+ *
+ * Compresses the folio data and stores it in the compression pool.
+ * The folio is removed from the page cache and replaced with a
+ * compressed entry. This allows the memory to be reclaimed while
+ * preserving the data for later decompression.
+ *
+ * The compression is skipped if:
+ * - The data doesn't compress well (incompressible)
+ * - The compression pool is not available
+ * - Memory allocation fails
+ */
+int shmem_compress_folio(struct inode *inode, pgoff_t index,
+				struct folio *folio)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	struct address_space *mapping = inode->i_mapping;
+	swp_entry_t comp_entry;
+	void *src, *comp_buf;
+	unsigned int comp_len;
+	unsigned int id;
+	unsigned long handle;
+	int ret;
+
+	if (!sbinfo->comp)
+		return -ENOTSUPP;
+
+	/*
+	 * merge_pages > 1: compress only when a full group has just
+	 * been written (index is the last page of the group). Tail
+	 * pages that do not fill a group remain uncompressed.
+	 */
+	if (sbinfo->comp->merge > 1) {
+		if ((index + 1) % sbinfo->comp->merge == 0)
+			return shmem_compress_group(inode, index);
+		return 0;
+	}
+
+	/* Lock folio to ensure stability during compression */
+	folio_lock(folio);
+
+	/* Verify folio is still valid and uptodate */
+	if (folio->mapping != mapping || !folio_test_uptodate(folio)) {
+		folio_unlock(folio);
+		return -ENOENT;
+	}
+
+	/*
+	 * The slot swap below removes the folio from the page cache.
+	 * That is only safe while nothing else can observe the folio:
+	 * live PTEs (shared mmap, forked children) keep writing to the
+	 * orphaned folio while read() serves the compressed copy. Folio
+	 * locks exclude new faults (shmem_get_folio() takes the lock
+	 * before mapping), so folio_mapped() is stable here. A pinned
+	 * folio may be under DMA. Order-0 only: the compress and
+	 * replace paths below assume a single page. write_end just
+	 * dirtied this folio; clean means the state changed under us.
+	 * Skipping is not an error: the page simply stays uncompressed.
+	 */
+	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
+	    folio_order(folio) || !folio_test_dirty(folio)) {
+		folio_unlock(folio);
+		return 0;
+	}
+
+	/* Get source data from folio */
+	src = kmap_local_folio(folio, 0);
+
+	/* Allocate buffer for compressed data */
+	comp_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!comp_buf) {
+		kunmap_local(src);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+
+	/* Compress the page */
+	comp_len = PAGE_SIZE;
+	ret = shmem_comp_compress(sbinfo->comp->pool, src, PAGE_SIZE,
+				 comp_buf, &comp_len);
+	kunmap_local(src);
+
+	if (ret || comp_len >= PAGE_SIZE) {
+		/* Compression didn't reduce size - skip */
+		kfree(comp_buf);
+		folio_unlock(folio);
+		return -ENOSPC;
+	}
+
+	/* Store compressed data in zsmalloc pool */
+	handle = shmem_comp_store(sbinfo->comp->pool, comp_buf, comp_len);
+	kfree(comp_buf);
+
+	if (!handle) {
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Register the compressed data in the entry ID table. The
+	 * zsmalloc handle is a kernel pointer and cannot be packed
+	 * into the xarray value, so the page cache stores only the ID.
+	 * The entry owns the handle from here (freed with the entry).
+	 */
+	id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle, comp_len,
+				    1, NULL, 0);
+	if (!id) {
+		shmem_comp_free(sbinfo->comp->pool, handle);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+	comp_entry = make_shmem_comp_entry(id);
+
+	/*
+	 * Compressed slots are accounted like swap pages: raise
+	 * swapped before the slot swap lowers nrpages, so a racing
+	 * shmem_recalc_inode() never sees the page as freed (the
+	 * same ordering shmem_writeout() relies on). Pairs with the
+	 * -nr_swaps_freed recalc at the end of shmem_undo_range(),
+	 * which restores the charge when the slot is truncated.
+	 */
+	shmem_recalc_inode(inode, 0, 1);
+
+	/*
+	 * Atomically swap the folio for the compression entry in the
+	 * page cache xarray. shmem_delete_from_page_cache() replaces
+	 * the slot under xa_lock and drops the page cache's reference
+	 * to the folio; the caller keeps its own reference.
+	 */
+	shmem_delete_from_page_cache(folio, swp_to_radix_entry(comp_entry));
+
+	/* Update accounting */
+	atomic_long_inc(&sbinfo->comp->pages);
+	atomic_long_add(comp_len, &sbinfo->comp->bytes);
+	shmem_comp_update_stats(true, PAGE_SIZE, comp_len);
+
+	/*
+	 * The folio has left the page cache; the caller (write_end)
+	 * still owns a reference and releases it after we return.
+	 */
+	folio_unlock(folio);
+
+	return 0;
+}
+
+/*
  * Module initialization.
  */
 
