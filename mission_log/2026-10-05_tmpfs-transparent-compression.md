@@ -2404,3 +2404,44 @@ stale_value_retries 0; zero oopses/warnings beyond boot noise.
    companion alongside the munin untar farm.
 3. Stage 2 machinery remains the main line (marker list,
    shmem_comp_maintain(), default flip to 50:70, policy matrix).
+
+### Addendum: the rig becomes a git repo, fstools stays its own (2026-10-07)
+
+User decision, same day: the rig keeps its path
+`/home/snide/tmpfs-compress-test` (rejected the name linux-rig), and
+-- standing rule -- **any new project subdirectory must be
+git-initialized on creation**.
+
+- Rig repo: initial import `213fb8d` on `main` (89 files, 8,979
+  insertions). Before this the rig lived outside version control and
+  per-session rig work was recorded only in this mission log; history
+  starts at the import. Bisectability convention going forward, same
+  as the kernel tree: one logical change = one commit, rig green at
+  every commit, derived artifacts ignored so diffs stay reviewable.
+  The rig is the acceptance gate the kernel history bisects against;
+  gate runs are quoted in the kernel mission log, which pairs the
+  two repositories' histories.
+- Tracked: scripts/, tests/ (our C suite -- the user's explicit
+  boundary: OUR fs tests live in OUR repo), initrd/init, busybox +
+  applet symlinks (the one prebuilt binary no script produces),
+  .gitkeep placeholders in the guest mount points (proc/sys/mnt/tmp;
+  git cannot track empty dirs), munin-2.0.78.tar + munin.crc
+  (external inputs), README.md. Ignored: rootfs.cpio.gz, kernel/,
+  results/, generated testdata, built test/tool binaries,
+  fstools-src/ + fstools-compat/ (superseded).
+- fstools boundary (final shape after the day's back-and-forth):
+  Apple's fstools stays its OWN repo -- `~/fstools`, branch
+  `linux-port`, commit `0ef92df` -- carrying the source guards,
+  linux-compat/ shims and LINUX-PORT.md. The rig consumes it via
+  scripts/build_fstools.sh (checks out the branch, builds into
+  initrd/bin); nothing fstools is vendored into the rig repo.
+- Two build_initrd.sh fixes rode along with the import: guest mount
+  points are mkdir'd at pack time (the .gitkeep files make git
+  remember them; the mkdir keeps non-git checkouts correct), and
+  the dataset-tar step now uses absolute paths (it silently required
+  cwd = rig root before -- it bit this session once already).
+- Verified from a foreign cwd: build_fstools.sh (uses
+  ~/fstools @ linux-port 0ef92df), build_initrd.sh (cpio contains
+  all four .gitkeep files), and a full guest boot on the
+  repo-built initrd: fsx 2148 ops A-OK, fsx -e 500 xattr ops
+  A-OK, fstorture clean, Test exit code 0.
