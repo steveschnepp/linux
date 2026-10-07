@@ -1481,3 +1481,166 @@ Final run (KVM, 4 vCPUs,2 G guest, kernel #62 with ACPI+NR_CPUS=8):
 - run_qemu.sh should propagate the guest's real exit code (parse
   "Test exit code:" and fail loudly when it is missing instead of
   returning QEMU's status).
+
+---
+
+## Session 7: torture sweep corrections and the ratio/speed tension (2026-10-07)
+
+### What We Did
+
+Continued the torture sweep from session 6 with three corrections and
+one new measurement dimension, ending in the full ratio/speed/RAM
+analysis. All numbers below come from the final green run
+(261 passed, 0 failed; KVM, 4 vCPUs, 2 G guest, kernel #62).
+
+**Correction 1 -- cell256k never compressed.** The config was
+`cell=256K,merge_pages=4,compress_threshold=1` with no `compress=`
+option. `shmem_comp_opts_init()` seeds `compress` from the global
+sysfs default, which is *off* (`compression: 0` at boot, visible in
+the init output). The mount ran plain tmpfs with extra option
+parsing: `comp_pages=0` at every sweep point, and its 184.5 MB/s was
+just plain-tmpfs noise. This invalidated session 6's headline --
+"cell storage = 98% of plain throughput" compared two *uncompressed*
+runs.
+
+**Correction 2 -- the honest backend comparison.** `lz4_m1` has no
+`cell=` either, but fill_sb *auto-derives* cell_order=8 for a size=1G
+tmpfs, so it is cell-backed all along. The like-for-like merge=1
+comparison is therefore lz4_m1 (cells) vs zsmalloc (cell=0):
+98.9 vs 99.1 MB/s, 47.7% vs 47.6% stored -- **parity**. The "zsmalloc
+costs 45%" claim compared compressed zsmalloc against the
+uncompressed cell256k; it was wrong. Cells' wins remain the
+controlled-measurement ones: synchronous RAM return on free/discard
+and the lower RAM footprint from sweep_merge.
+
+**Correction 3 -- the CPU sampler.** Session 6's sampler never
+checked process liveness and reported 0% from a dead pid for 370 s
+while the real run had finished. Fixed: pgrep -n every tick, break
+when the pid disappears. Also fixed the tick math: /proc/PID/stat
+fields 14+15 (utime+stime) are in USER_HZ (100 ticks/s), so
+CPU% = delta_ticks / elapsed_seconds -- the earlier "39040%" samples
+were 100x inflated. Corrected samples: **~400% host CPU** in sweep
+windows, 150-250% between points (mount/join phases). Four KVM
+vCPUs saturating four host cores; no kernel-side serialization
+signal at the environment level.
+
+**New instrumentation -- ratio and RAM.** A one-pass comp_stats
+snapshot (`total_compressed_bytes` / `total_uncompressed_bytes` /
+`ram_total_bytes` / `compressed_pages`) is taken every ~200 ms inside
+each window; the busiest instant (max live comp_pages) is kept, and
+BENCH lines now carry `ratio_pct` (stored/original x100) and
+`ram_mb`. Sampling the max matters: with merge_pages>1 live
+comp_pages is bursty (a group exists only once N pages accumulate),
+so a single sample can catch the pool between groups even though
+compression is engaged -- this false-failed the new engagement guard
+at lz4_m8 T=1 and cell256k T=2 until the max-over-samples fix.
+
+**New hard guard.** Every config except "nocompress" must show
+`comp_pages > 0` at its busiest in-window sample, or the point
+fails. A mount that silently falls back to uncompressed (the
+cell256k bug class) can never benchmark as plain tmpfs again.
+
+### The ratio/speed/RAM analysis
+
+Steady state at T=64 (4 vCPUs, munin farm workload: untar + CRC32
+verify + rm -Rf per thread, 3 s windows):
+
+| config | verify MB/s | stored/original | vs plain | RAM snapshot |
+|--------|------------:|----------------:|---------:|-------------:|
+| plain (nocompress) | 173.0 | -- | 100% | -- |
+| zstd merge=1 | 98.9 | 37% (2.7:1) | 57% | 100M |
+| lz4 merge=1 (auto cells, 1M) | 98.9 | 48% (2.1:1) | 57% | 174M |
+| zsmalloc lz4 merge=1 | 99.1 | 48% (2.1:1) | 57% | 150M |
+| lz4 merge=4 (256K cells) | 112.6 | 65-68% | 65% | 64M |
+| lz4 merge=8 (2M cells) | 131.2 | 68-70% | 76% | 104M |
+
+The pipeline ceiling without compression is 173 MB/s (tar extract +
+CRC32 + tree walk on 4 vCPUs); every compressed config is measured
+against that.
+
+**Algorithm axis: zstd buys 11 points of ratio at ~1.4x the CPU per
+byte.** 48% -> 37% stored is 23% less RAM for the same data. The
+cost is visible wherever compression is the bottleneck: single job
+12.4 vs 17.1 MB/s (-27%), T=16: 51 vs 85 MB/s (-40%). At T=64 both
+sit at ~98.9 MB/s -- but NOT because zstd got cheap: lz4_m1
+flatlines from T=4 onward (see below) while zstd keeps scaling
+(57 -> 99 from T=32 to T=64). The saturation convergence masks
+zstd's per-byte cost behind the merge=1 serialization ceiling; the
+honest per-byte comparison is at T<=32.
+
+**Merge axis: for a small-file farm, merge>1 is a trap.** munin's
+714 files average ~9 KiB. Merge groups compress only when a FULL
+group accumulates (merge=4 -> 16 KiB, merge=8 -> 32 KiB); tail pages
+that never fill a group stay uncompressed by design. Result: ratio
+collapses from 48% (merge=1) to 65-70% -- merge=8 stores ~40% more
+bytes than merge=1 on this workload. Its speed win (131 vs 99 MB/s,
++32%) is partly real (amortized crypto calls per group) and partly
+illusory (it compresses less data). The earlier untar/seq sweeps
+showed the opposite ratio behavior on large sequential files, where
+groups fill completely. Rule: match merge_pages to the file-size
+distribution, not to the mount.
+
+**Storage backend axis: cells and zsmalloc are CPU- and
+ratio-equivalent** on this workload (98.9/48% vs 99.1/47.6%). The
+ram_mb column is an instant snapshot (busiest sample of each window)
+and is NOT trustworthy for cross-config comparison -- different
+configs catch different live-data moments (cell256k's 64M vs
+lz4_m1's 174M at T=64 reflects sample timing, not allocator
+efficiency; the controlled sweep_merge methodology remains the RAM
+authority). Cells' documented wins stand: synchronous buddy return
+on free/discard/swap-slot-free, and the lower RAM footprint at
+merge<=4 from the merge sweep.
+
+**Bottom line for a compilation farm:**
+- lz4 + merge=1 is the Pareto default: half the RAM (2.1:1) at 57%
+  of the uncompressed pipeline throughput, and the best ratio per
+  CPU-cycle of anything measured.
+- zstd when RAM is the binding constraint (build caches, cold
+  artifacts, CI scratch): 2.7:1 for ~1.4x the compression CPU; at
+  low job counts expect 25-40% less throughput, at full saturation
+  the difference hides behind other bottlenecks.
+- Avoid merge>1 unless files are mostly multi-hundred-KiB; on
+  small-file workloads it raises throughput by *not compressing*.
+- Worst case (zstd, all cores busy) still stores 37% of the bytes
+  while leaving 57% of the untar/CRC pipeline -- the tension is
+  real but bounded.
+
+**Performance lead left in the data:** lz4_m1 (merge=1) flattens at
+~99 MB/s from T=4 upward while merge=8 keeps scaling to 131 and
+plain to 173. merge=1 does one crypto call + one entry-table
+insert + one kmalloc per 4 KiB page; the plateau smells like
+serialization in that per-page path (entry table xa_lock? the
+per-CPU context mutex? shmem_write_end folio_lock churn?), not CPU
+exhaustion -- zstd, which does strictly more CPU work per byte,
+scales past it. Profiling this is the next perf task; if the
+per-page overhead is the issue, a merge=2 or per-CPU batched entry
+allocation may recover much of merge=8's throughput without its
+small-file ratio loss.
+
+### Files Changed (this session)
+
+| File | Purpose |
+|------|---------|
+| rig `tests/test_torture.c` | cell256k config fixed (compress=lz4), config table gains expect_comp column, engagement guard (max comp_pages > 0), comp_snapshot() ratio/RAM instrumentation, BENCH ratio_pct + ram_mb fields, liveness-aware sampling |
+| rig `scripts/gen_manifest.c` | (session 6) chdir fix for tree-relative manifest paths |
+| rig `scripts/run_qemu.sh` | -accel kvm -accel tcg,thread=multi |
+| rig kernel config | CONFIG_ACPI=y, CONFIG_NR_CPUS=8 |
+
+### Test Results
+
+Final: **261 passed, 0 failed** (42 sweep points x 6 configs +
+post-storm RAM checks). Host CPU ~400% in sweep windows. Post-storm:
+Shmem back to baseline, zero live compression RAM; MemFree residue
+explained by slab caches + the 5.4 MB tar page cache.
+
+### Next Steps
+
+1. **Profile the merge=1 plateau** (see above) -- the largest
+   unanswered perf question in the dataset.
+2. Re-baseline the farm numbers after any change to the per-page
+   compress path; the torture sweep is the regression gate
+   (TEST_TORTURE=1 QEMU_CPUS=4 ./scripts/run_qemu.sh).
+3. A merge-sweep-style controlled run on the munin tree specifically
+   (fixed data volume, per-merge RAM accounting) would confirm the
+   small-file tail hypothesis with hard RAM numbers instead of
+   ratio-only evidence.
