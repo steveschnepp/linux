@@ -2920,10 +2920,19 @@ end-to-end (mount parse -> watermark_seen -> fill_sb sentinels -> sb ->
 show_options -> sysfs default knob, built-in default 0:0),
 resolved-state mount lines with why-off, /proc/mounts truth via
 shmem_comp_show_options(), and sysfs compressor=none normalization
-(stored as-is; no Kconfig fallback). Rig gate recipe for entry work:
-TEST_ENTRYRACE=1 QEMU_CPUS=4. Known-open (pre-existing, reproduced on
-both pre- and post-Stage-1 kernels under that gate): entry-ID-reuse
-race -- stale xarray slot value + ID recycling pins the wrong entry,
-`refs underflow` WARNs in shmem_comp_entry_release(), torn reads.
-Fix before upstream posting; separate work item (mission log session
-9). Stage 2 (machinery + default flip to 50:70) is next.
+(stored as-is; no Kconfig fallback).
+
+Entry-ID-reuse race: CLOSED (session 10). Root causes were a phantom
+put in the cell-backed group decompress path and ABA via id-only
+xarray values; fixed by generation-encoded entries (32-bit id +
+23-bit generation in the 55-bit swp offset, validated at pin and
+release; `stale_value_retries` in comp_stats) and a single balanced
+group pin. Corruption policy landed with it: refs/slots underflow,
+double teardown (VM_BUG_ON), and decompressed-length mismatches
+PANIC (user rule: any data corruption stops the machine); staleness
+is a counted, retried race outcome. Gate recipe:
+TEST_ENTRYRACE=1 QEMU_CPUS=4 -- 0 underflows, quiescent verify
+12/12 PASS, full suite exit 0. Mid-race zero pages in that test are
+POSIX truncate-vs-read TOCTOU, not corruption; the verdict is the
+quiescent verify (mission log session 10 has the full story).
+Stage 2 (machinery + default flip to 50:70) is next.
