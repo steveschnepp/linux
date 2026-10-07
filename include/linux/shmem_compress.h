@@ -23,7 +23,7 @@ struct shmem_inode_info;
  *   ID (SWP_SHMEM_COMPRESS type). zsmalloc handles are kernel pointers
  *   and cannot be packed into xarray values, so a global ID table
  *   (struct shmem_comp_entry in mm/shmem_compress.c) maps ID ->
- *   {zsmalloc handle, compressed length, merge size, refcounts}
+ *   {zsmalloc handle, compressed length, group size, refcounts}
  * - Decompression happens transparently on page fault/read access
  *
  * Compression Flow:
@@ -288,14 +288,14 @@ struct shmem_comp_sb;
  * Parsed compression mount options: compress=, nocompress,
  * compress_threshold=, merge_pages=, cell=. "Unset" means zero/NULL;
  * shmem_comp_fill_sb() substitutes the sysfs/Kconfig defaults for
- * those. threshold-0-means-default is the one quirk: there is no way
- * to ask for "compress everything" other than threshold=1.
+ * those. A threshold_bytes of 0 means "use the default": there is no
+ * way to ask for "compress everything" other than threshold_bytes=1.
  */
 struct shmem_comp_opts {
 	bool compress;			/* false = nocompress / compress=none */
 	char *compressor;		/* algorithm, NULL = default */
-	unsigned int threshold;		/* bytes; 0 = default */
-	unsigned int merge;		/* pages; 0 = sysfs default */
+	unsigned int threshold_bytes;		/* bytes; 0 = default */
+	unsigned int merge_pages;		/* pages; 0 = sysfs default */
 	unsigned int cell_order;	/* 0 = derive from tmpfs size */
 	bool cell_seen;			/* cell= given (incl. cell=0 opt-out) */
 };
@@ -330,7 +330,8 @@ void shmem_comp_put_super(struct shmem_sb_info *sbinfo);
 
 /*
  * Write-path hook (shmem_write_end): true when this inode's mount has
- * an enabled pool and the file is at/over the compression threshold.
+ * an enabled pool and the file is at/over the compression threshold
+ * (threshold_bytes).
  */
 bool shmem_comp_should_compress(struct inode *inode);
 

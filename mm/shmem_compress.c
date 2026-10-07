@@ -131,8 +131,8 @@ struct shmem_comp_pcpu {
 struct shmem_comp_sb {
 	bool enabled;
 	char *compressor;		/* owned; freed with the sb */
-	unsigned int threshold;		/* min file size to compress, bytes */
-	unsigned int merge;		/* pages per compression group */
+	unsigned int threshold_bytes;		/* min file size to compress, bytes */
+	unsigned int merge_pages;		/* pages per compression group */
 	unsigned int cell_order;	/* cell storage order, informational */
 	struct shmem_comp_pool *pool;	/* compression pool */
 	atomic_long_t pages;		/* compressed pages (this mount) */
@@ -1625,7 +1625,7 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 	 * which triggers the size-based derivation below.
 	 */
 	if (cell_order == 0 && !opts->cell_seen) {
-		unsigned int merge = opts->merge ?: 1;
+		unsigned int merge_pages = opts->merge_pages ?: 1;
 
 		if (tmpfs_bytes >= (256UL << 20))
 			cell_order = 8;	/* 1 MiB */
@@ -1634,7 +1634,7 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 		else
 			cell_order = 4;	/* 64 KiB */
 
-		if (merge >= 8 && cell_order < CELL_ORDER_MAX)
+		if (merge_pages >= 8 && cell_order < CELL_ORDER_MAX)
 			cell_order++;
 	}
 
@@ -1651,16 +1651,16 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 	comp->enabled = true;
 	/* ownership transfers */
 	comp->compressor = algo;
-	comp->threshold = opts->threshold ?: 65536;
+	comp->threshold_bytes = opts->threshold_bytes ?: 65536;
 	comp->cell_order = cell_order;
-	comp->merge = opts->merge ?:
+	comp->merge_pages = opts->merge_pages ?:
 		      (shmem_comp_default_merge_get() ?: 1);
 	atomic_long_set(&comp->pages, 0);
 	atomic_long_set(&comp->bytes, 0);
 	sbinfo->comp = comp;
 
-	pr_info("tmpfs: compression on, algo=%s merge=%u thresh=%u cell_order=%u\n",
-		comp->compressor, comp->merge, comp->threshold,
+	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u cell_order=%u\n",
+		comp->compressor, comp->merge_pages, comp->threshold_bytes,
 		comp->cell_order);
 	return 0;
 }
@@ -1689,7 +1689,7 @@ bool shmem_comp_should_compress(struct inode *inode)
 	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
 
 	return comp && comp->enabled && comp->pool &&
-		i_size_read(inode) >= comp->threshold;
+		i_size_read(inode) >= comp->threshold_bytes;
 }
 
 /*
@@ -2348,7 +2348,7 @@ cleanup:
  * uncompressed slice by the cell size guarantees the compressed
  * slice fits.  The slice must also divide the merge size: the
  * group head is merge-aligned (the call site only fires on a full
- * group), so any divisor of merge keeps every slice head aligned,
+ * group), so any divisor of the merge keeps every slice head aligned,
  * which is what shmem_decompress_group() relies on to recover the
  * head from an interior index (index - index % nr_pages).
  *
@@ -2375,7 +2375,7 @@ static unsigned int shmem_comp_chunk_nr(struct shmem_sb_info *sbinfo,
 static int shmem_compress_group(struct inode *inode, pgoff_t last)
 {
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
-	unsigned int nr = sbinfo->comp->merge;
+	unsigned int nr = sbinfo->comp->merge_pages;
 	unsigned int chunk, off;
 	pgoff_t head;
 
@@ -2596,8 +2596,8 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * been written (index is the last page of the group). Tail
 	 * pages that do not fill a group remain uncompressed.
 	 */
-	if (sbinfo->comp->merge > 1) {
-		if ((index + 1) % sbinfo->comp->merge == 0)
+	if (sbinfo->comp->merge_pages > 1) {
+		if ((index + 1) % sbinfo->comp->merge_pages == 0)
 			return shmem_compress_group(inode, index);
 		return 0;
 	}

@@ -4815,13 +4815,13 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_threshold:
-		ctx->comp_opts.threshold = result.uint_32;
+		ctx->comp_opts.threshold_bytes = result.uint_32;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_compress_merge:
 		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_MERGE_MAX)
 			goto bad_value;
-		ctx->comp_opts.merge = result.uint_32;
+		ctx->comp_opts.merge_pages = result.uint_32;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_cell:
