@@ -2036,3 +2036,234 @@ results/serial_20261007_161445.log):
    QEMU_CPUS=4); entry-race isolation gate for entry work
    (`TEST_ENTRYRACE=1`); torture sweep for Stage 2 policy work
    (`TEST_TORTURE=1`).
+
+---
+
+## Session 10: the refs-underflow fix, and a zero-page hunt that wasn't (2026-10-07)
+
+### What We Did
+
+Fixed the known-open `refs underflow` race from session 9, added the
+panic-on-corruption assert layer (the user's standing rule: "any data
+corruption shall be a kernel panic"), and then spent the bulk of the
+session chasing a second symptom -- mid-race zero pages -- that turned
+out to NOT be a kernel bug at all.
+
+**The underflow fix (commit `22ab9e4`).** Two defects, one storm
+(~170 WARNs per isolated-gate boot, reproduced on pre- and
+post-Stage-1 kernels):
+
+1. *Phantom put* in the cell-backed branch of
+   `shmem_decompress_group()`: that path took NO entry pin
+   (`shmem_comp_load_entry()` re-pins internally) but dropped one at
+   the end -- refs corruption on every cell+merge group decompress
+   whose ID got recycled. The group path now takes ONE
+   generation-validated pin at entry; every error path and the final
+   put balance it.
+2. *ABA in the xarray value*: the value encoded the entry ID only, so
+   a stale value (truncate freed the entry, rewrite recycled the ID)
+   was indistinguishable from the new incarnation -- the pin landed
+   on the wrong entry (torn reads) and its slot release was charged
+   to an entry the stale reader never owned. Entries now carry a
+   23-bit generation packed beside the 32-bit ID in the 55-bit swp
+   offset field (`SHMEM_COMP_ENTRY_GEN_{BITS,MASK}` in swapops.h);
+   `shmem_comp_entry_get_gen()`/`shmem_comp_entry_release(id, gen)`
+   validate it and reject stale values (-ENOENT, caller retries),
+   counted in `stale_value_retries` (new comp_stats line).
+
+Bit budget: swp offset is 55 bits on 64-bit targets (64 -
+SWP_OFFSET_SHIFT + SWP_TYPE_BITS = 64 - 14 + 5). 32-bit ID (xa_alloc
+range unchanged) + 23-bit generation = exactly 55. Generation wrap at
+2^23 is harmless: ABA requires the same ID recycled exactly 2^23
+allocs later, inside a sub-microsecond load-to-pin window. Bare-ID
+`shmem_comp_entry_get()` stays for cellzram (table-internal blocks,
+pinned by their own table references, never in xarray values).
+cellzram.c's `entry_alloc` call passes NULL for the optional gen
+out-param.
+
+Gate result: underflow 180/169/167/173 WARNs per boot -> **0/0/0/0**.
+
+**The panic layer (commit `d0cc4d2`).** Corruption stops the machine:
+refs underflow (put/release) -> panic; slots underflow (release,
+double slot release) -> panic; `VM_BUG_ON(refs != 0)` in
+`entry_free()` (double teardown, debug kernels); decompressed-length
+mismatch on single-page AND group paths -> panic (a successful crypto
+decompress must produce exactly the stored page count; `req->dlen` is
+the crypto-reported actual length, so the check is live). Staleness
+(generation mismatch) deliberately stays a counted, retried
+condition -- stale values are the NORMAL outcome of truncate+rewrite
+churn, and retry is correct behavior. Warning-free on all green runs:
+if any of these ever fires, the in-memory state was already wrong.
+
+**The zero-page hunt (the interesting part).** Post-fix gate boots
+still showed 1-11 "read errors" per phase. Investigation sequence:
+
+1. *Instrumented the test first-class*: split counters (pread syscall
+   errors vs bad-byte reads), hex dumps of the first bad bytes, added
+   `cell=0` (zsmalloc) phases A2/B2, and -- per session 9's own rule
+   -- fixed the phase-counter aggregation bug (verdict now sums all
+   phases; the suite honestly reported exit 1 while this was open).
+2. *Characterized the symptom*: exactly ONE page (bad=4096) of ZEROS
+   at a page-aligned offset, inside full-length reads (r=131072),
+   on BOTH cell and zsmalloc backends. No KASAN, no WARNs.
+3. *Kernel probes* (temporary, since removed): hole detector in
+   `shmem_get_folio_gfp`'s SGP_READ miss branch (+ dump_stack for the
+   first 5), removal tracers in both `shmem_undo_range` loops, an
+   anomaly detector in `shmem_comp_free_swap`. Results: hole probe
+   FIRED 38-46/boot at idx < i_size -- including idx=0 with
+   i_size=131072 (complete file!); stacks showed only
+   `shmem_file_read_iter -> shmem_get_folio -> shmem_get_folio_gfp`;
+   every undo removal showed i_size=0 (legit truncates); free_swap
+   anomaly: 0 hits.
+4. *Code audit of every slot-clearing site* in shmem.c
+   (`xas_store(NULL)`, `filemap_remove_folio`): shmem_free_swap
+   (probed, clean), undo_range loops (probed, i_size=0),
+   get_folio_gfp's SGP_CACHE/falloc error path (SGP_READ never
+   allocates), userfaultfd mfill (unused), shmem_alloc_and_add_folio
+   ENOSPC path (no ENOSPC at 128K in 1G), shmem_writeout (inactive).
+   All accounted for -- yet the holes were real at read time.
+5. *Resolution*: NOT a kernel bug. The writer truncates to 0 and
+   rewrites in a tight loop; a reader samples i_size (large,
+   pre-truncate) at the top of a `shmem_file_read_iter` iteration,
+   then hits the slot AFTER truncate cleared it, correctly zero-fills
+   that page (POSIX hole semantics within the sampled size), and
+   continues -- and the fast rewrite has re-materialized the later
+   pages as 'A'. Full-length read, a few zero pages inside. The
+   probe's "i_size=131072" print is the POST-REWRITE value sampled
+   AFTER the tree read saw the truncation-window hole: two samples at
+   different instants, paired coincidentally. (The TSO "reader must
+   see i_size=0" argument only orders one reader's two loads against
+   the writer's stores; it says nothing about the reader's OWN tree
+   read happening earlier than its own i_size read.)
+6. *Fixed the verdict model*, not the kernel: mid-race zero pages are
+   informational (TOCTOU); the authoritative check is quiescent --
+   after the writer stops, write a known pattern (threshold=1
+   compresses every page, exercising the full compress->store->read->
+   decompress path), read back, verify byte-for-byte. Pread syscall
+   errors (errno not ENOENT/EIO) remain hard failures. All probes
+   removed; kernel tree back to clean committed state.
+
+Post-fix verdict: gate 3 boots x 4 phases -- exit 0, quiescent verify
+PASS everywhere, zero pages informational (2-10 per phase), 0
+underflows, 0 panics; full suite exit 0 (mount_sem, cell_storage,
+cell_gc ALL PASS).
+
+### What We Learned
+
+- **Corruption verdicts in racy workloads require quiescent
+  verification.** The test was counting POSIX-correct truncate-vs-read
+  TOCTOU as corruption and crying wolf; the kernel was clean. The
+  "original symptom" discipline from session 4 cuts both ways: name
+  the symptom precisely, then verify it survives when the race is
+  removed.
+- **Instrumented probes can pair samples coincidentally.** A probe
+  that reads tree state and i_size at two different instants prints a
+  combination that never simultaneously existed. When a probe result
+  contradicts the memory model, suspect the probe's own sampling
+  before suspecting the kernel.
+- **KASAN-generic is blind to buddy-backed storage.** Cell storage
+  (and any page-allocated buffer) can be used-after-free without a
+  KASAN report. A clean KASAN log exonerates slab objects only.
+  Noted permanently in the test's header comment.
+- **Two real bugs were hiding behind one loud symptom.** The
+  underflow WARNs (phantom put + ABA) were genuine and are fixed; the
+  "read errors" that shared their test were benign. Fixing the test's
+  verdict model and the kernel's accounting were independent acts.
+- Test-first instrumentation beats kernel-first: the hex dump
+  (zeros, page-aligned, exactly one page) cracked the case in one
+  run; the kernel probe round-trips only confirmed what the dump
+  already implied.
+- `shmem_replace_entry` + `BUG_ON(error)` in
+  `shmem_delete_from_page_cache` means a compress swap whose slot had
+  already moved is a kernel BUG, not a silent failure -- useful
+  negative evidence during the audit (never fired).
+
+### What We Decided
+
+- Encoding: {32-bit ID, 23-bit generation} in the swp offset; wrap
+  harmless (argument in the swapops.h comment). xa_alloc range
+  unchanged.
+- Validation policy: staleness = -ENOENT + retry + stale_value_retries
+  counter (normal race); accounting corruption (refs/slots
+  underflow, double teardown) and data corruption (decompress length
+  mismatch) = panic. The panic layer is the user's standing rule,
+  applied at every boundary where wrongness becomes observable.
+- test_entry_race verdict = pread sys errors + write errors +
+  quiescent verify failures. Mid-race zero pages: informational,
+  hex-dumped (bounded).
+- Session 9's entry-ID-reuse known-open is CLOSED: root causes found
+  and fixed, asserts armed, gate green.
+
+### Rules Added
+
+- **Quiescent-verify rule:** any "data corruption" verdict in a test
+  with concurrent mutators must be confirmed by a quiescent
+  write-verify after the mutators stop. Mid-race byte counting is
+  diagnostic output, never the verdict.
+- **Single-instant sampling rule:** kernel probes that print
+  correlated state must sample it at one instant (or accept that
+  multi-sample prints can show impossible combinations).
+- **Panic-not-warn rule (tmpfs compression):** accounting corruption
+  (refcount/slot underflow, double teardown) and data corruption
+  (decompress length mismatch) panic unconditionally. Race outcomes
+  (stale values) retry and count. No WARN middle ground.
+- **KASAN scope rule:** a clean KASAN log exonerates slab objects
+  only; buddy-backed storage (cell pages, order-0 allocations) needs
+  explicit checks or quiescent verification.
+
+### What We'd Do Differently
+
+- Instrumented the TEST (hex dumps, split counters) before the
+  kernel. The dump's "zeros, page-aligned, one page" was the whole
+  answer; the probe campaign confirmed it at the cost of three
+  build/boot rounds.
+- The session-9 lesson ("gate A/B before blaming your diff") was
+  applied correctly this time and paid off immediately -- baseline
+  kernel reproduced the underflow, which redirected the hunt from
+  "what did we break" to "what was always broken". Keep doing this.
+- Would have added the quiescent verify when the entry-race test was
+  FIRST written (session 4 review P1 #5): its verdict model has been
+  wrong-shaped since day one; sessions 6-9 inherited the ambiguity.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `include/linux/swapops.h` | {id, gen} packing: make_shmem_comp_entry(id, gen), shmem_comp_entry_gen(), GEN_BITS/MASK, 55-bit budget comment |
+| `include/linux/shmem_compress.h` | entry gen field + kerneldoc; get_gen/release decls; alloc gen out-param; stale_value_retries in stats |
+| `mm/shmem_compress.c` | gen counter + stale counter; get_common/get/get_gen; gen-validated release; balanced group pin (phantom-put fix); alloc gen out; free_swap/decompress/compress call sites; panic layer (refs/slots underflow, length mismatch); VM_BUG_ON double teardown; stale_value_retries in get_stats + comp_stats_show |
+| `mm/cellzram.c` | entry_alloc NULL gen out-param (table-internal blocks) |
+| `mm/shmem.c` | net zero (debug probes added then removed) |
+| rig `tests/test_entry_race.c` | split counters, hex dumps, cell=0 phases A2/B2, phase aggregation fix, quiescent verify verdict model, TOCTOU documentation |
+| rig `initrd/init` | comp_stats dump in entry-race gate |
+| `TMPFS_COMPRESSION_PLAN.md` | status: underflow closed, panic policy |
+
+### Test Results / Benchmarks
+
+- Isolated gate (`TEST_ENTRYRACE=1 QEMU_CPUS=4`, KASAN kernel):
+  underflow WARNs/boot 180/169/167/173 (pre-fix #63) -> 0/0/0/0
+  (post-fix #64) -> 0/0/0 (assert-armed #69, 3 boots). Quiescent
+  verify: 12/12 PASS. Zero pages during race: 2-10 per phase,
+  informational. `stale_value_retries`: 0 on all post-fix boots (the
+  ABA validator is armed; no stale value has reached a pin since).
+- Full suite (#69, asserts armed): `Test exit code: 0`;
+  test_mount_sem / test_cell_storage / test_cell_gc ALL PASS; 0
+  underflows; 0 panics. (Suite previously honest-reported exit 1
+  while the race test's verdict model was wrong-shaped -- now green
+  for the right reason.)
+
+### Next Steps
+
+1. Stage 2 machinery (the plan's next stage): candidate marker list
+   (list_add under spinlock, unlink/truncate purge = skipped_dead),
+   `shmem_comp_maintain()` (survivors mandatory >= 1 page, sparse
+   cell evacuation, ~4:1 alternating budgets, hysteresis flips),
+   triggers (shrinker, gc_now, periodic delayed_work); flip built-in
+   default to 50:70; torture policy matrix A/B (never / 0:0 / 50:70 /
+   50:100 vs eager numbers).
+2. Watch `stale_value_retries` in the torture matrix -- the counter
+   is the early-warning instrument for ID-recycling storms that the
+   panic layer would otherwise meet with a stopped machine.
+3. The panic asserts are only as good as the runs that exercise
+   them: keep the entry-race gate (TEST_ENTRYRACE=1) and full suite
+   as standing gates for all data-path commits.
