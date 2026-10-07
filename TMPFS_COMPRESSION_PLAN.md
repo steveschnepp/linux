@@ -2311,13 +2311,20 @@ if (ret) {                 /* -ENOSPC: store raw, length marks it */
 	memcpy(cbuf, page_addr, PAGE_SIZE);
 }
 handle = shmem_comp_store(pool, cbuf, comp_len);
-if (!handle)
-	return BLK_STS_RESOURCE;     /* cell ENOMEM: blk-mq requeues */
+if (!handle) {
+	bio->bi_status = BLK_STS_IOERR;	/* cell ENOMEM; zram pattern */
+	return;
+}
 id = shmem_comp_entry_alloc(pool, handle, comp_len, 1, NULL, 0);
 if (!id) {
-	cell_free(shmem_comp_pool_cells(pool),
-		  handle >> 32, handle & 0xFFFFFFFFUL, comp_len);
-	return BLK_STS_RESOURCE;
+	u16 cellid;
+	u32 offset;
+
+	/* pack_loc biases cellid +1: unpack, never raw shifts */
+	shmem_comp_unpack_loc(handle, &cellid, &offset);
+	cell_free(shmem_comp_pool_cells(pool), cellid, offset, comp_len);
+	bio->bi_status = BLK_STS_IOERR;
+	return;
 }
 old = xa_exchange(&dev->table, block_nr, xa_mk_value(id), 0);
 if (old)
@@ -2339,10 +2346,15 @@ normal free dispatch -> `cell_free` -> tier-1 cell return when the
 last block of a cell goes away.
 
 Failure handling: `cell_store` returning `-ENOMEM` (genuine memory
-pressure) maps to `BLK_STS_RESOURCE` so blk-mq requeues with backoff
-rather than failing the I/O. This is the one path where the block
-device is stricter than tmpfs (which silently keeps pages
-uncompressed): a block device cannot decline to store data.
+pressure) sets `bio->bi_status = BLK_STS_IOERR` — zram's pattern for
+a failed write. A bio-based driver has no blk-mq requeue path; the
+status reaches the caller as -ENOMEM via `blk_status_to_errno()`.
+Swap survives this: a failed swap write leaves the page in the swap
+cache and the next reclaim pass retries it. `failed_writes` counts
+every occurrence, as zram's stat does. This is the one path where the
+block device is stricter than tmpfs (which silently keeps pages
+uncompressed): a block device cannot decline to store data. Bounded
+internal retry is later hardening; v1 matches zram.
 
 ### Compression policy
 
@@ -2350,10 +2362,13 @@ uncompressed): a block device cannot decline to store data.
 - `none`: device is raw-on-cells - `shmem_comp_store` still stores
   through the cell pool (entry length always 4096), but no crypto
   runs. Debug and latency-sensitive use.
-- The pool is created at `disksize`-set time with the chosen
-  algorithm's per-CPU contexts. In `none` mode the contexts are
-  allocated but idle (noted inefficiency; removing them requires a
-  shmem_comp_pool change deferred to Open Questions).
+- The pool is created at `disksize`-set time.
+  `shmem_comp_pool_create()` validates the algorithm with
+  `crypto_has_acomp()`, which "none" fails — so the pool is always
+  created with a real algorithm (lz4 in `none` mode) and the device's
+  `compressed` flag alone gates crypto. The contexts idle in `none`
+  mode (noted inefficiency; removing them requires a shmem_comp_pool
+  change deferred to Open Questions).
 - No merge groups at the block layer in v1: each 4 KiB block is an
   independent I/O unit, one entry each. Merged-group storage (one
   entry, N block slots) is the v2 ratio lever for sequential-write
@@ -2368,10 +2383,10 @@ Per device, zram-shaped, under `/sys/block/cellzramN/`:
 |-----------|--------|-----------|
 | `disksize` | RW | Logical size in bytes. Writable only when 0 (or after reset). Creates the pool on first set. |
 | `comp_algorithm` | RW | Shows current; writable only before disksize is set or after reset. Values: `lz4`, `zstd`, `none`. |
-| `mm_stat` | RO | `orig_data_size compr_data_size phys_used objects ratio_per_10000` (5 fields, space-separated). `phys_used` = pool `pages_used << PAGE_SHIFT`. |
+| `mm_stat` | RO | `orig_data_size compr_data_size phys_used objects entry_bytes ratio_per_10000` (6 fields, space-separated). `phys_used` = pool `pages_used << PAGE_SHIFT` (cell storage only); `entry_bytes` = live block-table entry RAM (~64 B per written block), reported separately so the zram comparison is like-for-like — zram's `mem_used_total` includes its per-page table. |
 | `stat` | RO | `backing_dev_discard io_reads io_writes` (device-level I/O counters). |
 | `reset` | WO | Freeze queue, erase all table slots (entry_put each), unfreeze. All cells return to the buddy. Stats zeroed. |
-| `discard` granularity | - | 4096; `QUEUE_FLAG_DISCARD` set so swap slot frees and fs truncates reclaim synchronously. |
+| `discard` granularity | - | 4096 via `queue_limits` at `blk_alloc_disk()` time: `.max_hw_discard_sectors = UINT_MAX`, `.discard_granularity = PAGE_SIZE`. This tree has no `QUEUE_FLAG_DISCARD`; zram sets the same limits in `zram_add()`. |
 
 GC interplay: device pools join the global `shmem_comp_pools` list,
 so `/sys/fs/tmpfs/compression/gc_now` already triggers a GC pass on
@@ -2388,7 +2403,7 @@ block-device pool - cosmetic confusion, accepted for the prototype
 | entry lifetime | refcount (refs/slots); readers pin via load_entry |
 | cell memory | per-cell rwsem (GC eviction vs readers) |
 | cell pool bump | cp->lock |
-| reset vs I/O | `blk_mq_freeze_queue` |
+| reset vs I/O | `blk_freeze_queue` (bio-based submit holds a q_usage_counter ref; the drain completes) |
 
 No device-wide lock on the read or write path. Concurrent writers to
 the same block_nr serialise only inside `xa_exchange`; last writer
@@ -2397,10 +2412,23 @@ wins, the loser's entry is freed by the winner's COW put.
 ### Swap
 
 The device is a normal gendisk: `mkswap` + `swapon` work unchanged.
-Setting `QUEUE_FLAG_DISCARD` is what makes swap slot frees reclaim:
-the swap code issues discards for SWP_DISCARDABLE devices, so freed
-anonymous pages return their cells to the buddy synchronously - the
-property zram lacks.
+Two independent reclaim paths return freed swap slots to the buddy:
+
+1. `.swap_slot_free_notify` in `block_device_operations` — zram's
+   primary path. The swap code calls it on every slot free regardless
+   of swapon flags; each notify maps `{si, offset}` -> block_nr ->
+   `xa_erase` + `entry_put`, and the cell returns to the buddy inline
+   when its last object goes.
+2. Discard bios — `sys_swapon()` issues these only when the caller
+   passed `SWAP_FLAG_DISCARD` AND `bdev_max_discard_sectors()` is set
+   (`mm/swapfile.c`). The queue limits satisfy the second condition;
+   the first depends on the invocation, so the rig test uses a tiny
+   static `swapon(2)` wrapper (busybox's swapon may not expose the
+   flag).
+
+v1 implements (1); (2) falls out of the existing discard path for
+free. The synchronous cell return — before the freeing syscall or
+reclaim pass completes — is the property zram lacks.
 
 REQ_PREFLUSH/FUA complete immediately after the write lands (RAM;
 no cache-flush semantics needed), matching zram.
@@ -2420,7 +2448,7 @@ no cache-flush semantics needed), matching zram.
 | File | Action | Purpose |
 |------|--------|---------|
 | `TMPFS_COMPRESSION_PLAN.md` | Modify | This spec |
-| `mm/cellzram.c` | Create | gendisk, blk-mq, block table, I/O paths, sysfs, module init |
+| `mm/cellzram.c` | Create | gendisk (`blk_alloc_disk`, bio-based `.submit_bio`), block table, I/O paths, sysfs, module init |
 | `mm/Kconfig` | Modify | `CONFIG_TMPFS_COMP_BLKDEV` |
 | `mm/Makefile` | Modify | Build `cellzram.o` |
 | `include/linux/shmem_compress.h` | Modify | Only if pool-create tweaks are needed for algo=none (see Open Questions); otherwise untouched |
@@ -2436,12 +2464,14 @@ tier-1 return, GC), `shmem_comp_{compress,store,load_entry,entry_*}`
 
 ### Phase 1: raw skeleton on cells (4-6 h)
 
-1. `mm/cellzram.c`: module init, `nr_devices`, `blk_mq_alloc_disk`
-   with `.submit_bio`, 4K `logical_block_size`, `disksize` sysfs,
-   pool creation with `use_cells` (algo lz4 but compression bypassed:
-   every block stored raw, length 4096).
+1. `mm/cellzram.c`: module init, `nr_devices`, `blk_alloc_disk(&lim,
+   NUMA_NO_NODE)` with `.submit_bio` in `block_device_operations`
+   (zram's shape in this tree — bio-based, no tag set), 4K
+   `logical_block_size`, queue-limits discard fields, `disksize`
+   sysfs, pool creation with `use_cells` (algo lz4 but compression
+   bypassed: every block stored raw, length 4096).
 2. Block table (`xarray`), write/read/discard/reset paths, zero-fill
-   for unwritten blocks, `BLK_STS_RESOURCE` on ENOMEM.
+   for unwritten blocks, `BLK_STS_IOERR` on ENOMEM (zram pattern).
 3. `mm/Kconfig` + `mm/Makefile`; rig config enable.
 4. Rig test: 256 MiB dd round-trip with checksums, unwritten-block
    zero-read, discard half the device and verify `cell_stats` drains
@@ -2461,8 +2491,8 @@ tier-1 return, GC), `shmem_comp_{compress,store,load_entry,entry_*}`
 
 ### Phase 3: swap trial + hardening (3-4 h)
 
-1. `stat` sysfs, `QUEUE_FLAG_DISCARD` + discard granularity wiring
-   if any gaps remain from phase 1.
+1. `stat` sysfs, `.swap_slot_free_notify` wiring, and any queue_limits
+   discard gaps left from phase 1.
 2. Rig: `mkswap` + `swapon` on cellzram0, force page cache pressure,
    verify swap I/O and that freed slots return cells (MemFree
    movement); `swapoff` releases everything.
@@ -2476,9 +2506,9 @@ tier-1 return, GC), `shmem_comp_{compress,store,load_entry,entry_*}`
 |------|-----------|--------|------------|
 | Per-block entry metadata: ~64 B slab per written 4 KiB block (16 MiB per GiB written) | Certain | Med | Same class as zram's per-page table; acceptable for v1. Batched per-cell entries are the v2 lever (Open Questions). |
 | Entry table is global (shared with tmpfs compression); xa_alloc contention between workloads | Low | Low | xarray lock is per-node; measured contention negligible at prototype scale. Split tables if it shows up. |
-| ENOMEM under true memory pressure fails writes (tmpfs degrades gracefully; block device cannot) | Med | Med | `BLK_STS_RESOURCE` requeue with blk-mq backoff, never a hard error for ENOMEM. |
+| ENOMEM under true memory pressure fails writes (tmpfs degrades gracefully; block device cannot) | Med | Med | Bio-based: `BLK_STS_IOERR` (zram pattern); swap retries because the failed page stays in the swap cache. Bounded internal retry is later hardening, not v1. |
 | THP cell allocation (`GFP_TRANSHUGE`) may fail under fragmentation; same requeue path applies | Low | Low | Requeue semantics; optionally create device pools with `use_thp=false` if requeue storms appear. |
-| Reset races in-flight I/O | Low | High | `blk_mq_freeze_queue` before erasing the table; covered by KASAN concurrent test in phase 3. |
+| Reset races in-flight I/O | Low | High | `blk_freeze_queue` before erasing the table; covered by KASAN concurrent test in phase 3. |
 | Global `shmem_comp_global_stats` mixes tmpfs and cellzram numbers | Certain | Low | Accepted for prototype; per-device stats are authoritative (`mm_stat`). |
 | Swap writes bypass nothing (normal bdev path) but swap slot frees depend on discard being honoured | Med | High | Phase 3 explicitly tests swap-free -> MemFree; if the swap code path needs `SWP_DISCARDABLE` hints, wire them. |
 
@@ -2514,5 +2544,271 @@ tier-1 return, GC), `shmem_comp_{compress,store,load_entry,entry_*}`
   vs 612K), and the bugs that shaped the invariants.
 - `mm/cell_store.c` header comment: the four allocator invariants
   this device inherits.
-- zram (`drivers/block/zram/`): the sysfs interface shape and the
-  `QUEUE_FLAG_DISCARD` + swap-reclaim pattern being mirrored.
+- zram (`drivers/block/zram/`): the sysfs interface shape, the
+  bio-based `blk_alloc_disk` + `fops.submit_bio` driver model, and
+  the `swap_slot_free_notify` + queue-limits discard reclaim pattern
+  being mirrored.
+
+---
+
+# Upstream Shape — blast zone, carve plan, comment policy
+
+## Why this section exists
+
+The feature's acceptance depends on the diff to existing files, not on
+the size of the new ones. Measured against base `a90ee4305c4a` (51
+commits): +1,387 lines across 6 existing files, +2,663 lines in new
+files (zero blast). Every existing-file touch already sits inside
+`#ifdef CONFIG_TMPFS_COMPRESSION` (20 guard sites in shmem.c;
+shmem_fs.h fields guarded; `SWP_SHMEM_COMPRESS` compiles to 0 when
+disabled) and the config is `default n`: with the config off, the
+behavioral diff is zero. What remains is the source diff a reviewer
+must read. This section plans how to shrink it to ~+210 lines without
+moving logic across a locking boundary, and fixes the comment policy
+for each tier of file.
+
+Config shape: `CONFIG_EXPERIMENTAL` no longer exists (removed in
+v5.19). The modern acceptance pattern is the zswap precedent: `bool`,
+`default n`, help text says "experimental". `TMPFS_COMPRESSION`
+already is `default n`; the help text gains the experimental wording
+at posting time. The global sysfs defaults are the acceptance-hostile
+surface (they change what plain `mount -t tmpfs` does for NEW mounts):
+gate them behind `TMPFS_COMPRESSION_GLOBAL_DEFAULTS` (default n) or
+leave them out of v1. Per-mount options are additive and change
+nobody's behavior unless requested.
+
+## Measured blast zone
+
+New files, zero blast: `mm/shmem_compress.c` (1412), `mm/cell_store.c`
+(515), `include/linux/shmem_compress.h` (551),
+`include/linux/cell_store.h` (185).
+
+Existing files (+1,387 total):
+
+| File | Added | Hunks |
+|------|------:|------:|
+| mm/shmem.c | 1,283 | 18 |
+| include/linux/swapops.h | 40 | 1 |
+| include/linux/swap.h | 18 | 2 |
+| include/linux/shmem_fs.h | 14 | 2 |
+| fs/Kconfig | 31 | 1 |
+| mm/Makefile | 1 | 1 |
+
+shmem.c hunk breakdown:
+
+| Lines | Site | Nature |
+|------:|------|--------|
+| 767 | after `shmem_split_large_entry` | compress/decompress implementation (folio/group/chunk paths) |
+| 209 | `tmpfs_sysfs_init` area | sysfs attributes |
+| 103 | `shmem_fill_super` | pool creation, cell-order derivation |
+| 63 | `shmem_parse_one` | mount options |
+| 41 | `shmem_free_swap` | eviction: release compression entries |
+| 27 | `shmem_get_folio_gfp` | read path: decompress branch |
+| 23 | `shmem_write_end` | write path: compress trigger |
+| ~56 | 11 small hunks | options struct, reconfigure guard, put_super, free_fc, init_fs_context, decls |
+
+## Carve plan
+
+Each carve is a separate, behavior-neutral commit; the rig suite must
+be green before and after each one (bisectable). None moves logic
+across a locking boundary — they relocate whole functions whose
+dependencies are already clean.
+
+### C1 — the 767-line block -> mm/shmem_compress.c
+
+The implementation block (`shmem_comp_get_folio_noalloc`,
+`shmem_decompress_folio`/`_group`, `shmem_compress_folio`/`_group`,
+`shmem_comp_compress_chunk`, `shmem_comp_chunk_nr`) lives in shmem.c
+only because it calls shmem statics:
+
+| Primitive | Uses in block | Action |
+|-----------|--------------:|--------|
+| `shmem_recalc_inode` | 6 | unstatic + `EXPORT_SYMBOL_GPL` (inside the config ifdef) |
+| `shmem_delete_from_page_cache` | 3 | unstatic + `EXPORT_SYMBOL_GPL` (inside the config ifdef) |
+| `shmem_undo_range` | 2 | try the already-exported `shmem_truncate_range` (it also updates timestamps/iversion — behavior delta gets its own commit); else third export |
+
+`shmem_get_folio` is already exported. Exports go inside
+`#ifdef CONFIG_TMPFS_COMPRESSION`: a disabled build exports nothing
+new — the API surface is gated, not just the code. Precedent for
+exporting shmem internals: `shmem_write_folio` (i915/dramfs),
+`shmem_get_folio`, `shmem_truncate_range`.
+
+### C2 — sysfs + defaults globals -> mm/shmem_compress.c
+
+All attribute bodies (`compression`, `compressor`, `merge_pages`,
+`comp_stats`, `cell_stats`, `gc_now`) touch only `shmem_comp_*`
+functions and the three defaults globals
+(`shmem_comp_default_{enabled,compressor,merge}` + their lock); the
+sole shmem dependency is the parent kobject. New API:
+
+    int  shmem_comp_sysfs_register(struct kobject *parent);
+    void shmem_comp_sysfs_unregister(void);
+
+shmem.c keeps ~4 lines in `tmpfs_sysfs_init()`. The defaults globals
+move with their only consumers; shmem.c holds none. Side benefit:
+gating the global-defaults knobs behind
+`TMPFS_COMPRESSION_GLOBAL_DEFAULTS` becomes a 3-line ifdef inside
+shmem_compress.c — zero shmem.c cost.
+
+### C3 — fill_super pool creation -> shmem_comp_fill_sb()
+
+The 103-line block is pure compression policy: algo resolution (mount
+option -> sysfs default -> Kconfig default), "none" handling,
+cell-order derivation from tmpfs size, pool create, fallback to
+uncompressed on pool failure. New types/functions:
+
+    struct shmem_comp_opts { ... };   /* parsed mount options */
+    struct shmem_comp_sb   { ... };   /* per-mount state */
+
+    int  shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
+                            struct shmem_comp_opts *opts,
+                            unsigned long tmpfs_bytes);
+    void shmem_comp_put_super(struct shmem_sb_info *sbinfo);
+
+`tmpfs_bytes` is passed in so `shmem_default_max_blocks()` needs no
+export. shmem.c keeps a 4-line call.
+
+### C4 — sbinfo: 8 fields -> 1 opaque pointer
+
+After C1-C3 shmem.c has zero reads of `comp_*` sbinfo fields.
+`include/linux/shmem_fs.h` drops from +14 to +3:
+
+    #ifdef CONFIG_TMPFS_COMPRESSION
+    struct shmem_comp_sb;             /* mm/shmem_compress.c */
+    ... struct shmem_comp_sb *comp;   /* NULL = uncompressed mount */
+    #endif
+
+The eight fields become private to shmem_compress.c. Largest
+structural readability win: shmem.c stops knowing about compression,
+not just textually mentioning it.
+
+### C5 — parse_one thinning
+
+The enum + `fs_parameter_spec` entries (~16 lines) stay in shmem.c:
+the mount-option ABI must be greppable in one table alongside every
+other tmpfs option. Case bodies shrink to stores into
+`ctx->comp_opts`; `init_fs_context`/`free_fc`/`reconfigure` become
+one-line calls to `shmem_comp_opts_init/free`. parse_one: 57 -> ~30
+lines. The reconfigure seen-bit guard (~5 lines) stays in shmem.c —
+remount policy is shmem's contract.
+
+## Residual floor
+
+| File | Before | After | Contents after carve |
+|------|-------:|------:|----------------------|
+| mm/shmem.c | +1,283 | ~110 | 3 dispatch hooks (~20), mount ABI + parse (~46), opts plumbing (~30), ifdef wrappers + decls (~30) |
+| shmem.c exports | 0 | +2-3 | gated by CONFIG_TMPFS_COMPRESSION |
+| include/linux/shmem_fs.h | +14 | +3 | forward decl + one pointer |
+| include/linux/swap.h | +18 | +18 | irreducible: swap-type namespace |
+| include/linux/swapops.h | +40 | ~40 | irreducible: entry encode/decode contract |
+| fs/Kconfig + mm/Makefile | +32 | +32 | additive |
+| **Total existing files** | **+1,387** | **~210** | |
+
+~210 is the design floor. Anything smaller requires either hiding the
+entry-type dispatch from shmem's page-cache paths (unreviewable — a
+reader of eviction/fault must see that the xarray holds a second
+value-entry type) or an ops-struct indirection (strictly more code,
+single in-tree user, historically rejected).
+
+## Readability floor — what stays in shmem.c, and why
+
+- The three dispatch sites keep check + 1-2 line invariant comment:
+  `is_shmem_comp_entry` in `shmem_free_swap`, `xa_is_shmem_comp` in
+  `shmem_get_folio_gfp`, the compress call in `shmem_write_end`.
+- The reconfigure seen-bit guard: remount semantics belong to shmem.
+- The #ifdef wrappers (~20 lines): visible gating is what reviewers
+  audit; do not minimize them.
+- The fs_parameter_spec table: mount-option ABI lives with its peers.
+
+## Comment policy
+
+Two tiers, matching file ownership. Everything added to an
+upstream-visible file sits inside an existing
+`#ifdef CONFIG_TMPFS_COMPRESSION` region — additions (code and
+comments) are gated together, so a disabled build's source diff is
+the ifdef skeleton plus Kconfig. Project files
+(`mm/shmem_compress.c`, `mm/cell_store.c`, `mm/cellzram.c`,
+`include/linux/shmem_compress.h`, `include/linux/cell_store.h`) are
+only compiled when the config is on (`obj-$(CONFIG_...)`), so their
+comments are gated by the TU and can be verbose: these files are the
+project's internal documentation, and no separate design docs ship
+with them.
+
+Rule of thumb for both tiers: a comment must be true and useful to a
+maintainer who has never seen this project. Invariants and physical
+justifications survive; what-happened narratives belong in commit
+messages.
+
+### Upstream-visible files — invariant comments only, <=3 lines each
+
+| Site | Comment (intent) |
+|------|------------------|
+| shmem_write_end hook | compression runs after folio_unlock; the path takes the lock itself and it is not recursive; the caller's reference keeps the folio alive |
+| shmem_get_folio_gfp hook | compressed entry -> decompress + install, replacing the entry; NULL only when the entry vanished, caller retries |
+| shmem_free_swap hook | compression entries are not swap entries — release via the entry ID table; routing through the swap code WARNs and leaks the block |
+| shmem_fs.h pointer | compression state for this mount; private to mm/shmem_compress.c |
+| swap.h type slot | extend the existing block: entries live only in the page cache xarray, never in PTEs — no PTE swap-type space is consumed |
+| export sites | exported for the tmpfs compression backend (mm/shmem_compress.c); gated so no API exists when CONFIG_TMPFS_COMPRESSION=n |
+
+Existing shmem.c comments at these sites get a diet pass: narratives
+collapse to invariants; consequence clauses ("WARNs and leaks") stay —
+they document the failure mode a maintainer must not re-create.
+
+swapops.h: wrap `make_shmem_comp_entry` / `shmem_comp_entry_id` /
+`is_shmem_comp_entry` in `#ifdef CONFIG_TMPFS_COMPRESSION` — both call
+sites are already gated, so this is safe and makes the disabled-build
+diff to swapops.h the ifdef skeleton alone.
+
+### Project files — verbose, deliberately
+
+- `mm/shmem_compress.c` header block: extends the existing design
+  overview with the carve contract — this TU is the sole in-tree
+  consumer of the exported shmem primitives; adding a second consumer
+  is a design change, not a convenience. Plus fill_sb ownership rules
+  (who frees opts strings on each failure path, mount-failure vs
+  graceful-uncompressed semantics), sysfs registration lifetime,
+  defaults storage ownership.
+- `mm/shmem_compress.h`: kerneldoc per new type/function —
+  `shmem_comp_opts` field-by-field (units, what "unset" means, the
+  threshold-0-equals-default quirk), `shmem_comp_sb` lifecycle,
+  fill_sb/put_super contracts, sysfs_register parent-kobject rules.
+- `mm/cell_store.h`: already carries the allocator invariants; keep
+  them authoritative. The 8 GiB sizing fixes (derived max_cells,
+  struct cell -> single page pointer, u16 -> u32 cellid/live_objects)
+  land with the allocator-capacity work, not with the carve.
+- `mm/cellzram.c` (when built): file header carries the reuse contract
+  with shmem_comp — which entry semantics the device relies on (ref
+  pin, relocation-safe load_entry, free dispatch via entry_put), and
+  that its pools appear under the tmpfs-named sysfs group
+  provisionally.
+
+## Commit sequence
+
+1. C2 (sysfs + defaults) — no exports, pure move.
+2. C3 + C4 + C5 together (fill_sb + opts struct + sbinfo collapse are
+   one data-structure change; splitting leaves intermediate states
+   where shmem.c reads fields C4 removed).
+3. C1 (767-block move) — the export commit; rig-green before/after.
+4. shmem_undo_range -> shmem_truncate_range substitution — own commit,
+   behavior delta (timestamps, iversion) reviewed separately.
+5. Comment diet + swapops.h ifdef wrap — documentation-only commit.
+
+Each step is behavior-neutral and independently testable on the rig;
+the sweep and full suite are the acceptance gate per commit.
+
+## Review pre-answers
+
+- Swap-type slot: `SWP_SHMEM_COMPRESS` consumes one entry type from
+  the shared namespace (pattern: SWP_DEVICE_*, SWP_PTE_MARKER).
+  Compression entries never appear in PTEs — page-cache xarray only —
+  so PTE type-space width is unaffected.
+- Exports: 2-3, each consumed by exactly one in-tree TU, precedent
+  `shmem_write_folio`. Fallback if the maintainer objects: keep the
+  767-block in shmem.c (status quo) — correctness-neutral.
+- Documentation: mount options + sysfs go in
+  Documentation/filesystems/tmpfs.rst; TMPFS_COMPRESSION_PLAN.md and
+  mission_log/ are project artifacts and never enter the series.
+- Device metadata: cellzram reports entry-table RAM separately in
+  mm_stat (`entry_bytes`) so the vs-zram comparison is like-for-like;
+  per-block entries are ~64 B and remain the v2 batched-entry lever
+  at 8 GiB scale.
