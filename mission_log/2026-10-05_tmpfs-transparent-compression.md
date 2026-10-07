@@ -1331,3 +1331,153 @@ discard, so punched blocks free their cells inline.
 - Upstream series: docs (tmpfs.rst mount options + sysfs), the
   experimental help-text wording, and the sysfs-group naming question
   (device pools appearing under /sys/fs/tmpfs/compression/).
+
+---
+
+## Session 6: the torture sweep -- munin untar farm, 1..64 threads (2026-10-07)
+
+### What We Did
+
+Built `tests/test_torture.c`: a torture + scaling benchmark shaped
+like a compilation farm. The workload pivoted twice during design
+(synthetic object-file churn -> real dataset) and settled on:
+
+- **Dataset**: munin-2.0.78.tar (5.4 MiB, 714 regular files, text-
+  heavy perl tree) injected into the initrd, with a CRC32+size
+  manifest generated on the host (`scripts/gen_manifest.c`, same
+  IEEE CRC32 implementation compiled into the guest test) so the
+  guest only ever computes CRC32s -- no reference untar, no cmp.
+- **Per-thread lifecycle, in isolation**: mkdir -> untar (busybox
+  tar) -> CRC32-verify every file against the manifest -> rm -Rf.
+  Threads never touch each other's directories; the concurrency is
+  happenstance. The tar's page cache is preloaded before the sweep
+  (we measure tmpfs, not initramfs read speed); drop_caches is never
+  used -- it does not happen in real life.
+- **Sweep**: 1,2,4,..,64 threads x 6 mount configs (lz4 merge=1,
+  lz4 merge=8, zstd, cell=256K+merge=4, zsmalloc baseline,
+  nocompress), fixed 3s window per point, BENCH lines with
+  verify_MBps / files_per_s / live comp_pages.
+- **Post-storm RAM check**: after every thread's final rm -Rf lands
+  together (no engineered storm needed), assert Shmem back to
+  pre-test baseline and zero live compressed pages; MemFree gets a
+  slack because dentry/inode slab caches from millions of churned
+  files legitimately hold ~66 MiB (Slab 95 MB, SReclaimable 24 MB,
+  Cached 5.4 MB = the tar page cache) -- and Shmem, the precise
+  tmpfs metric, comes back to baseline within 200 kB.
+
+**Rig environment bugs found en route** (none were kernel bugs):
+
+1. **QEMU had no acceleration**: run_qemu.sh never passed -enable-kvm,
+   so every rig run to date had been single-threaded TCG emulation --
+   which is why a 4-vCPU guest used 100% of one host CPU. Fixed:
+   `-accel kvm -accel tcg,thread=multi` (KVM first, multithreaded
+   TCG fallback). With KVM, QMP confirms 4 vCPUs, and the sweep
+   saturates ~400% host CPU in its windows (dips between points are
+   mount/join phases -- not a kernel lock).
+2. **CONFIG_ACPI was off in the rig kernel**: modern QEMU presents
+   SMP topology via ACPI MADT, so a non-ACPI kernel fell back to the
+   MP table and brought up 1 CPU even with -smp 4. Enabled
+   CONFIG_ACPI=y; also raised CONFIG_NR_CPUS 2 -> 8 (the rig was
+   capped at 2). Guest now reports 4 CPUs.
+3. **run_qemu.sh's exit code lies on crashes**: a segfaulting test
+   leaves no "Test exit code:" line, so the script returns QEMU's own
+   exit (0). Noted; the serial log remains the source of truth.
+
+**Test-side bug parade** (all found by the rig, all mine):
+
+1. `threshold=1` is not a mount option -- it is `compress_threshold=`.
+   Five of six configs failed to mount with EINVAL; only "plain" ran
+   for two sweeps. The dead `absent` counter (declared, never
+   incremented) then hid the real symptom.
+2. `walk_verify` built top-level paths without the base directory
+   (branched on `rel[0]` instead of `dir[0]`), so lstat missed
+   everything and the recursion never ran; the recursion's return
+   value (the file count) was discarded, so "extracted nothing" and
+   "extracted 714 files" looked identical: short=13566 = 19 iters x
+   714, zero everywhere else. Replaced the dead counter with a real
+   `short_files` = manifest_count - found per iteration.
+3. **Stack overflow via recursion + big frame**: `walk_verify` had a
+   64 KiB read buffer on the stack; munin's tree depth (~4) x 72 KiB
+   frames > the 256 KiB worker stack -> segfault (write to [rsp+0x18]
+   right after `sub rsp,0x120c8`). Buffer went thread-local, stacks
+   raised to 512 KiB.
+4. `comp_pages` sampled after thread join reads 0 by construction
+   (everything already unlinked); moved the sample inside the window.
+5. First CPU sampler never checked liveness and happily reported 0%
+   from a dead pid for 370 s while the real run had finished --
+   exactly the failure mode the user called out ("the qemu did stop,
+   but you didn't notice"). Fixed: pgrep -n each tick, break on exit.
+
+### What We Learned
+
+**Technical**
+
+- Under KVM, a guest without ACPI sees 1 CPU no matter what -smp
+  says; check CONFIG_ACPI before blaming QEMU or the workload for
+  "why is my 4-CPU VM using one core".
+- The block-device/tmpfs sysfs option names are easy to get subtly
+  wrong (`threshold` vs `compress_threshold`); EINVAL on mount is the
+  tell, but only if the failure is not swallowed by a dead counter.
+- Recursive directory walks with per-frame scratch buffers are a
+  stack-overflow trap; count-with-return + thread-local scratch is
+  the safe shape.
+- Shmem returning to baseline is the honest "RAM usage is 0"
+  verification for tmpfs; MemFree never fully returns on a churn
+  workload because slab caches (dentry/inode) hold metadata -- report
+  the breakdown rather than widening the assertion blindly.
+
+**Process**
+
+- The manifest-upfront design (host-generated CRC32 table) removed an
+  entire class of guest-side work and made verification O(files)
+  without any reference state in the guest.
+- Fixed-window weak scaling (constant work per thread, measure
+  steady-state throughput) is the right bench shape for "how many
+  build jobs can this box feed"; thread counts as powers of two give
+  the saturation curve directly.
+- Sample the metric you care about DURING steady state, not after
+  teardown.
+
+### What We Decided
+
+- Window 3.0s x 7 thread points x 6 configs: ~4 min per boot, well
+  within rig timeouts, enough iterations per point for stable
+  numbers (T=1 does ~12-17 untar/verify/rm cycles per window).
+- ENOSPC on a size=1G mount with a ~400 MiB live set is a failure
+  (leak detector), not a skip.
+- MemFree post-storm slack 256 MB with the residue printed (Slab/
+  SReclaimable/Cached); Shmem assert stays tight (baseline + 4 MB).
+- No drop_caches, no taskset, no engineered storm: the test stays
+  plausible for a farm because farms do not do those things either.
+
+### Test Results
+
+Final run (KVM, 4 vCPUs,2 G guest, kernel #62 with ACPI+NR_CPUS=8):
+
+- **226 passed, 0 failed** across 42 sweep points; every CRC matched,
+  every manifest entry present, zero ENOSPC, zero unexpected errors.
+- Scaling at T=64 (verify_MBps, munin tree): **plain 182.9, cell256k
+  179.0 (98% of plain), lz4_m8 116-140, lz4_m1 98.9, zstd 98.7,
+  zsmalloc 98.9**. Headline: cell storage matches plain tmpfs
+  throughput under farm load while zsmalloc-backed lz4 costs ~45% --
+  the same story the merge sweep told for RAM, now for CPU.
+- Compression engagement during windows: live comp_pages 1.4K
+  (T=1) to 52K (zstd T=64).
+- Host CPU during sweep windows: ~400% (4 KVM vCPUs), confirming the
+  environment fix; no kernel-side serialization signal.
+- Post-storm: Shmem 54892 kB vs baseline 54684 kB (tmpfs data
+  freed), zero live compressed pages, residue explained by slab
+  caches + the 5.4 MB tar page cache.
+
+### Next Steps
+
+- Re-run the torture sweep after future compression changes as a
+  standing regression gate (it is wired: TEST_TORTURE=1
+  QEMU_CPUS=4 ./scripts/run_qemu.sh).
+- lz4_m1 flattens at ~99 MB/s from T=4 upward while cell256k keeps
+  scaling to 179 -- worth profiling whether the merge=1 path or
+  zsmalloc-free cell path is the differentiator at T=64 (likely the
+  per-block kmalloc + entry table churn in the single-page path).
+- run_qemu.sh should propagate the guest's real exit code (parse
+  "Test exit code:" and fail loudly when it is missing instead of
+  returning QEMU's status).
