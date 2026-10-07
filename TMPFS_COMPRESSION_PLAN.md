@@ -2146,3 +2146,373 @@ From sweep_merge_20261006_183047.summary:
 
 Target: match or beat ram_total for every merge value, with the biggest
 gains expected at merge=2/4 where zsmalloc chunk overhead is worst.
+
+---
+
+# Spec: cellzram - compressed RAM block device on the cell allocator
+
+## Overview
+
+cellzram is a compressed memory block device (`/dev/cellzramN`) that
+stores 4 KiB blocks in the cell allocator instead of zsmalloc. It is
+zram's contract (logical capacity set via `disksize`, physical usage
+grows on demand) with the cell allocator's properties: zero
+per-object storage metadata, direct-map reads with no bounce buffer,
+and synchronous whole-cell return to the buddy allocator on discard
+and free.
+
+## Motivation
+
+zram is the standard compressed-RAM block device (swap, scratch
+backing), but its storage layer is zsmalloc, which we measured this
+project paying a 14% metadata tax on (8-byte handle in every slot,
+size-class rounding, zspage structs, handle-slab objects) and which
+retains freed pages until its shrinker runs - precisely when memory
+is tight. Our cell allocator already fixes both problems for tmpfs
+(24% less RAM at merge=2, 21.9 vs 14.7 MB/s read throughput,
+synchronous cell release). A block device front-end makes those
+properties available to workloads that require a `struct
+block_device`: swap, ext4/xfs, O_DIRECT databases, journal devices.
+The discard path is the headline synergy: ext4 issues discards on
+truncate/delete, and each discard frees entries whose cells return
+to the buddy inline - the filesystem sees MemFree jump before the
+deleting syscall returns.
+
+The device must not exist as an uncompressed ramdisk: `brd` already
+does that, and uncompressed memory-backed storage is what tmpfs is.
+Compression is the point. `compress=none` exists only as a debug and
+latency escape hatch.
+
+## Goals
+
+- `/dev/cellzramN` gendisk with 4 KiB logical and physical sectors,
+  capacity set at runtime via `disksize` sysfs (zram-style).
+- Compression ON by default (lz4); `comp_algorithm` accepts
+  `lz4|zstd|none`; `none` stores raw blocks (debug/latency opt-out).
+- Physical allocation on demand: a 1 GiB disksize backed by a 300 MB
+  working set physically commits ~300 MB.
+- Discard frees blocks synchronously: empty cells return to the buddy
+  before the discard completes.
+- Swap works unmodified (mkswap/swapon on the device), with
+  discard-driven reclamation of freed swap slots.
+- Rig-verified: checksum-verified write/read across all modes,
+  discard-then-verify-cells-drain, reset-returns-all-cells, swap
+  trial. Zero KASAN/Oops.
+- Measurably better than zram's architecture on RAM overhead and
+  read throughput under the rig's existing methodology.
+
+## Non-Goals
+
+- Raw/uncompressed mode as a first-class feature. `brd` exists;
+  uncompressed memory storage is what tmpfs is. `compress=none` is a
+  debug knob, not a product mode.
+- writeback-to-backing-device (zram's `backing_dev` feature).
+- Replacing zram upstream; this is a project experiment first.
+- Runtime switching between compressed and raw. `comp_algorithm` is
+  writable only when `disksize` is 0 (before first use) or after
+  `reset`.
+- Hot-added devices via configfs or netlink. `nr_devices` module
+  parameter, fixed at load.
+- Per-cell batched entry tables (one entry covering N blocks).
+  Deferred; see Open Questions - it is the main metadata lever.
+- Read-only device support, bad-block handling, encryption.
+
+## Design
+
+### Device model
+
+One `struct cellzram` per device, created at module init:
+
+```c
+struct cellzram {
+	struct gendisk		*disk;
+	struct request_queue	*q;
+	/*
+	 * Private compression pool: gives us the per-CPU acomp
+	 * contexts, the cell pool (use_cells=true), and the entry
+	 * table membership.  All hot paths (compress, store, load,
+	 * entry pin/retry) are shmem_comp's, unchanged.
+	 */
+	struct shmem_comp_pool	*pool;
+	/*
+	 * block_nr -> entry id.  Sparse by nature: unwritten blocks
+	 * have no slot and read as zeros.  Values only (entry ids
+	 * via xa_mk_value), so no pointer/value mixing.
+	 */
+	struct xarray		table;
+	u64			logical_size;	/* bytes; 0 until disksize set */
+	bool			compressed;	/* false when algo == none */
+	/* stats for mm_stat / stat */
+	atomic64_t		orig_data_size;
+	atomic64_t		compr_data_size;
+	atomic64_t		objects;
+	atomic64_t		io_reads;
+	atomic64_t		io_writes;
+	struct mutex		io_lock;	/* serialises reset only */
+};
+```
+
+Module parameters: `nr_devices` (default 1). Devices appear as
+`/dev/cellzram0..N-1` after `nr_devices` disks are allocated at
+init. All I/O paths run lock-free except `io_lock`, which serialises
+`reset` against itself (I/O is serialised against reset by freezing
+the request queue).
+
+### Addressing and the block table
+
+Logical sector size is 4096; block_nr = sector >> 3. The table maps
+block_nr to a `shmem_comp_entry` id - the same ID table tmpfs
+compression uses, so pinning, relocation-safe loads, and free
+dispatch come for free. Each block is one entry (`nr_pages = 1`).
+
+Entry `length` doubles as the raw/compressed discriminator:
+
+| Entry length | Meaning | Read path |
+|--------------|---------|-----------|
+| 4096 | raw block (algo=none, or compression did not shrink) | `cell_load` memcpy |
+| < 4096 | lz4/zstd compressed block | `shmem_comp_load_entry` + `crypto_acomp_decompress` |
+
+`shmem_comp_compress()` returns `-ENOSPC` when output >= input, so a
+stored block with `length == 4096` is unambiguously raw - no flag
+needed in the entry.
+
+### I/O paths
+
+```mermaid
+graph TD
+    A[submit_bio] --> B{REQ_OP}
+    B -->|WRITE| C[per-page loop]
+    B -->|READ| D[per-page loop]
+    B -->|DISCARD| E[block range free]
+    C --> C1[compressed? compress : skip]
+    C1 --> C2["shmem_comp_store() -> packed handle"]
+    C2 --> C3["entry_alloc(pool, handle, len, 1, NULL, 0)"]
+    C3 --> C4["xa_exchange(table, nr, id): COW swap"]
+    C4 --> C5["old id? entry_put: tier-1 cell return"]
+    D --> D1["xa_load(table, nr)"]
+    D1 --> D2{slot exists?}
+    D2 -->|no| D3[zero-fill page]
+    D2 -->|yes| D4["shmem_comp_load_entry(id, ...)"]
+    D4 --> D5{length == 4096?}
+    D5 -->|raw| D6[done]
+    D5 -->|compressed| D7[acomp decompress]
+    E --> E1["xa_erase + entry_put per block"]
+    E1 --> E5[cells return to buddy inline]
+```
+
+Write path (per 4 KiB page of the bio):
+
+```c
+/* compressed mode: one crypto call per page, same as tmpfs */
+comp_len = PAGE_SIZE;
+ret = shmem_comp_compress(pool, page_addr, PAGE_SIZE, cbuf, &comp_len);
+if (ret) {                 /* -ENOSPC: store raw, length marks it */
+	comp_len = PAGE_SIZE;
+	memcpy(cbuf, page_addr, PAGE_SIZE);
+}
+handle = shmem_comp_store(pool, cbuf, comp_len);
+if (!handle)
+	return BLK_STS_RESOURCE;     /* cell ENOMEM: blk-mq requeues */
+id = shmem_comp_entry_alloc(pool, handle, comp_len, 1, NULL, 0);
+if (!id) {
+	cell_free(shmem_comp_pool_cells(pool),
+		  handle >> 32, handle & 0xFFFFFFFFUL, comp_len);
+	return BLK_STS_RESOURCE;
+}
+old = xa_exchange(&dev->table, block_nr, xa_mk_value(id), 0);
+if (old)
+	shmem_comp_entry_put(xa_to_value(old));   /* COW: free previous */
+```
+
+The COW xarray swap is the entire write-atomicity story: a reader
+pinning the old entry keeps its data alive until the read completes;
+there is no torn-block state to lock around.
+
+Read path (per 4 KiB page): `xa_load` -> miss = zero-fill (brd
+semantics for unwritten blocks); hit = `shmem_comp_load_entry(id,
+buf, &len)` (pins internally, retries if GC relocated the block
+mid-read), then decompress iff `len < PAGE_SIZE`.
+
+Discard path: `xa_erase` + `entry_put` per block in range. The
+entry's table reference is its slot reference; dropping it runs the
+normal free dispatch -> `cell_free` -> tier-1 cell return when the
+last block of a cell goes away.
+
+Failure handling: `cell_store` returning `-ENOMEM` (genuine memory
+pressure) maps to `BLK_STS_RESOURCE` so blk-mq requeues with backoff
+rather than failing the I/O. This is the one path where the block
+device is stricter than tmpfs (which silently keeps pages
+uncompressed): a block device cannot decline to store data.
+
+### Compression policy
+
+- Default algorithm: lz4 (throughput). `zstd` opt-in for ratio.
+- `none`: device is raw-on-cells - `shmem_comp_store` still stores
+  through the cell pool (entry length always 4096), but no crypto
+  runs. Debug and latency-sensitive use.
+- The pool is created at `disksize`-set time with the chosen
+  algorithm's per-CPU contexts. In `none` mode the contexts are
+  allocated but idle (noted inefficiency; removing them requires a
+  shmem_comp_pool change deferred to Open Questions).
+- No merge groups at the block layer in v1: each 4 KiB block is an
+  independent I/O unit, one entry each. Merged-group storage (one
+  entry, N block slots) is the v2 ratio lever for sequential-write
+  filesystems on top; partial-group invalidation under random writes
+  is the reason it is deferred.
+
+### Sysfs interface
+
+Per device, zram-shaped, under `/sys/block/cellzramN/`:
+
+| Attribute | Access | Semantics |
+|-----------|--------|-----------|
+| `disksize` | RW | Logical size in bytes. Writable only when 0 (or after reset). Creates the pool on first set. |
+| `comp_algorithm` | RW | Shows current; writable only before disksize is set or after reset. Values: `lz4`, `zstd`, `none`. |
+| `mm_stat` | RO | `orig_data_size compr_data_size phys_used objects ratio_per_10000` (5 fields, space-separated). `phys_used` = pool `pages_used << PAGE_SHIFT`. |
+| `stat` | RO | `backing_dev_discard io_reads io_writes` (device-level I/O counters). |
+| `reset` | WO | Freeze queue, erase all table slots (entry_put each), unfreeze. All cells return to the buddy. Stats zeroed. |
+| `discard` granularity | - | 4096; `QUEUE_FLAG_DISCARD` set so swap slot frees and fs truncates reclaim synchronously. |
+
+GC interplay: device pools join the global `shmem_comp_pools` list,
+so `/sys/fs/tmpfs/compression/gc_now` already triggers a GC pass on
+cellzram's sparse cells, and the shrinker registered at pool creation
+reclaims under memory pressure. The sysfs group is tmpfs-named for a
+block-device pool - cosmetic confusion, accepted for the prototype
+(Open Questions).
+
+### Concurrency and locking
+
+| Resource | Protection |
+|----------|------------|
+| block table | xarray internal lock (xa_exchange/xa_erase/xa_load) |
+| entry lifetime | refcount (refs/slots); readers pin via load_entry |
+| cell memory | per-cell rwsem (GC eviction vs readers) |
+| cell pool bump | cp->lock |
+| reset vs I/O | `blk_mq_freeze_queue` |
+
+No device-wide lock on the read or write path. Concurrent writers to
+the same block_nr serialise only inside `xa_exchange`; last writer
+wins, the loser's entry is freed by the winner's COW put.
+
+### Swap
+
+The device is a normal gendisk: `mkswap` + `swapon` work unchanged.
+Setting `QUEUE_FLAG_DISCARD` is what makes swap slot frees reclaim:
+the swap code issues discards for SWP_DISCARDABLE devices, so freed
+anonymous pages return their cells to the buddy synchronously - the
+property zram lacks.
+
+REQ_PREFLUSH/FUA complete immediately after the write lands (RAM;
+no cache-flush semantics needed), matching zram.
+
+## Build Changes
+
+| Target | Change |
+|--------|--------|
+| `mm/Kconfig` | New `CONFIG_TMPFS_COMP_BLKDEV` (bool, default n, depends on TMPFS_COMPRESSION, help: cell-backed compressed RAM block device) |
+| `mm/Makefile` | `obj-$(CONFIG_TMPFS_COMP_BLKDEV) += cellzram.o` |
+| rig `kernel/.config` | Enable `CONFIG_TMPFS_COMP_BLKDEV=y` |
+| rig `initrd/init` | Run cellzram test when `test.cellzram=1` on cmdline |
+| rig `scripts/run_qemu.sh` | `TEST_CELLZRAM` -> `test.cellzram=` cmdline passthrough |
+
+## File Manifest
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `TMPFS_COMPRESSION_PLAN.md` | Modify | This spec |
+| `mm/cellzram.c` | Create | gendisk, blk-mq, block table, I/O paths, sysfs, module init |
+| `mm/Kconfig` | Modify | `CONFIG_TMPFS_COMP_BLKDEV` |
+| `mm/Makefile` | Modify | Build `cellzram.o` |
+| `include/linux/shmem_compress.h` | Modify | Only if pool-create tweaks are needed for algo=none (see Open Questions); otherwise untouched |
+| rig `tests/test_cellzram.c` | Create | dd round-trips + checksums, discard/drain, reset, comp_algorithm matrix, swap trial |
+| rig `initrd/init` | Modify | Gate test behind `test.cellzram=1` |
+| rig `scripts/run_qemu.sh` | Modify | `TEST_CELLZRAM` passthrough |
+
+Reuse (no changes expected): `mm/cell_store.c` (bump allocator,
+tier-1 return, GC), `shmem_comp_{compress,store,load_entry,entry_*}`
+(hot paths), cell GC + shrinker + `gc_now`.
+
+## Migration
+
+### Phase 1: raw skeleton on cells (4-6 h)
+
+1. `mm/cellzram.c`: module init, `nr_devices`, `blk_mq_alloc_disk`
+   with `.submit_bio`, 4K `logical_block_size`, `disksize` sysfs,
+   pool creation with `use_cells` (algo lz4 but compression bypassed:
+   every block stored raw, length 4096).
+2. Block table (`xarray`), write/read/discard/reset paths, zero-fill
+   for unwritten blocks, `BLK_STS_RESOURCE` on ENOMEM.
+3. `mm/Kconfig` + `mm/Makefile`; rig config enable.
+4. Rig test: 256 MiB dd round-trip with checksums, unwritten-block
+   zero-read, discard half the device and verify `cell_stats` drains
+   and MemFree rises, reset returns every cell.
+5. Commit. Full suite green.
+
+### Phase 2: compression on by default (4-6 h)
+
+1. `comp_algorithm` sysfs (`lz4|zstd|none`), writable pre-disksize.
+2. Wire `shmem_comp_compress` into the write path; entry length
+   discriminator on read; `-ENOSPC` -> raw store.
+3. `mm_stat` with orig/compr/phys/objects/ratio.
+4. Rig test: compressible vs incompressible datasets, ratio reported,
+   checksums in lz4/zstd/none, physical usage < logical for
+   compressible data.
+5. Commit. Full suite green.
+
+### Phase 3: swap trial + hardening (3-4 h)
+
+1. `stat` sysfs, `QUEUE_FLAG_DISCARD` + discard granularity wiring
+   if any gaps remain from phase 1.
+2. Rig: `mkswap` + `swapon` on cellzram0, force page cache pressure,
+   verify swap I/O and that freed slots return cells (MemFree
+   movement); `swapoff` releases everything.
+3. KASAN boot: full test battery including concurrent dd writers +
+   gc_now + discard storm.
+4. Commit. Mission log entry.
+
+## Risks
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| Per-block entry metadata: ~64 B slab per written 4 KiB block (16 MiB per GiB written) | Certain | Med | Same class as zram's per-page table; acceptable for v1. Batched per-cell entries are the v2 lever (Open Questions). |
+| Entry table is global (shared with tmpfs compression); xa_alloc contention between workloads | Low | Low | xarray lock is per-node; measured contention negligible at prototype scale. Split tables if it shows up. |
+| ENOMEM under true memory pressure fails writes (tmpfs degrades gracefully; block device cannot) | Med | Med | `BLK_STS_RESOURCE` requeue with blk-mq backoff, never a hard error for ENOMEM. |
+| THP cell allocation (`GFP_TRANSHUGE`) may fail under fragmentation; same requeue path applies | Low | Low | Requeue semantics; optionally create device pools with `use_thp=false` if requeue storms appear. |
+| Reset races in-flight I/O | Low | High | `blk_mq_freeze_queue` before erasing the table; covered by KASAN concurrent test in phase 3. |
+| Global `shmem_comp_global_stats` mixes tmpfs and cellzram numbers | Certain | Low | Accepted for prototype; per-device stats are authoritative (`mm_stat`). |
+| Swap writes bypass nothing (normal bdev path) but swap slot frees depend on discard being honoured | Med | High | Phase 3 explicitly tests swap-free -> MemFree; if the swap code path needs `SWP_DISCARDABLE` hints, wire them. |
+
+## Open Questions
+
+- **Per-cell batched entries.** One `shmem_comp_entry` per cell
+  region covering N contiguous blocks would cut entry metadata ~32x
+  (one 64 B entry per 128 KiB instead of per 4 KiB). Cost: partial
+  discard inside a batched region requires decompress-split, and the
+  read path becomes offset-within-entry. This is the single biggest
+  optimization lever left; needs a design pass before v2.
+- **Device naming** (`cellzram`) is a placeholder; upstream review
+  would pick the final name.
+- **Sysfs placement**: cellzram pools appear under
+  `/sys/fs/tmpfs/compression/` via the global pool list. Either
+  rename the group compression-agnostically or give cellzram its own
+  group.
+- **`comp_algorithm=none` pool weight**: idle per-CPU acomp contexts
+  are allocated even in raw mode. Removing them needs a
+  `shmem_comp_pool_create` variant; low priority.
+- **zstd default?** lz4 wins on throughput (21.7 MB/s untar vs
+  lz4 numbers in the sweep); zstd wins ~10% ratio. Keep lz4 default,
+  revisit with real dataset measurements.
+
+## References
+
+- `TMPFS_COMPRESSION_PLAN.md` sections: "Cell-Based Storage
+  (FTL-inspired)" (allocator design, invariants), "Mount options"
+  (cell= derivation), "Baseline" (zsmalloc sweep numbers).
+- `mission_log/2026-10-05_tmpfs-transparent-compression.md` session
+  3: cell allocator implementation, async batched GC, the 256M untar
+  numbers (cell 21.9 vs zsmalloc 14.7 MB/s verify; merge=2 RAM 463K
+  vs 612K), and the bugs that shaped the invariants.
+- `mm/cell_store.c` header comment: the four allocator invariants
+  this device inherits.
+- zram (`drivers/block/zram/`): the sysfs interface shape and the
+  `QUEUE_FLAG_DISCARD` + swap-reclaim pattern being mirrored.
