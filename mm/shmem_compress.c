@@ -901,6 +901,10 @@ static void shmem_comp_entry_free(unsigned int id)
 	if (!ent)
 		return;
 
+	/* Teardown runs only from the refs==0 path (dec_and_test); a
+	 * live entry here means double teardown. Debug kernels panic. */
+	VM_BUG_ON(atomic_read(&ent->refs) != 0);
+
 	/* Un-account live RAM before freeing (ksize needs a live
 	 * object; do it before kfree/kfree_rcu). */
 	atomic_dec(&shmem_comp_ram_entries);
@@ -1004,8 +1008,11 @@ void shmem_comp_entry_put(unsigned int id)
 		return;
 	}
 	if (!atomic_dec_and_test(&ent->refs)) {
-		if (unlikely(atomic_read(&ent->refs) < 0))
-			WARN(1, "shmem_comp: entry %u refs underflow\n", id);
+		if (unlikely(atomic_read(&ent->refs) < 0)) {
+			rcu_read_unlock();
+			panic("shmem_comp: entry %u refs underflow -- "
+			      "reference accounting corrupted", id);
+		}
 		rcu_read_unlock();
 		return;
 	}
@@ -1034,9 +1041,17 @@ bool shmem_comp_entry_release(unsigned int id, unsigned int gen)
 		return false;
 	}
 	last_slot = atomic_dec_and_test(&ent->slots);
+	if (unlikely(atomic_read(&ent->slots) < 0)) {
+		rcu_read_unlock();
+		panic("shmem_comp: entry %u slots underflow -- "
+		      "page cache slot released twice", id);
+	}
 	if (!atomic_dec_and_test(&ent->refs)) {
-		if (unlikely(atomic_read(&ent->refs) < 0))
-			WARN(1, "shmem_comp: entry %u refs underflow\n", id);
+		if (unlikely(atomic_read(&ent->refs) < 0)) {
+			rcu_read_unlock();
+			panic("shmem_comp: entry %u refs underflow -- "
+			      "reference accounting corrupted", id);
+		}
 		rcu_read_unlock();
 		return last_slot;
 	}
@@ -2331,6 +2346,13 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		return ret;
 	}
 
+	/* Data corruption: a successful group decompress must produce
+	 * exactly nr_pages pages. See the single-page check. */
+	if (unlikely(dlen != (unsigned int)nr_pages * PAGE_SIZE))
+		panic("shmem_comp: group decompressed %u bytes, expected "
+		      "%u -- compressed data corrupt (id=%u)",
+		      dlen, (unsigned int)nr_pages * PAGE_SIZE, id);
+
 	for (slice = 0; slice < nr_pages; slice++) {
 		pgoff_t sidx = head + slice;
 		struct folio *sib;
@@ -2776,6 +2798,15 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 		shmem_comp_entry_put(id);
 		return ret;
 	}
+
+	/* Data corruption: a successful decompress of a single-page
+	 * block must produce exactly one page. Anything else means the
+	 * compressed stream or the entry metadata is wrong -- serving
+	 * it to userspace would be silent corruption, so stop. */
+	if (unlikely(dlen != PAGE_SIZE))
+		panic("shmem_comp: decompressed %u bytes, expected %u "
+		      "-- compressed data corrupt (id=%u)",
+		      dlen, PAGE_SIZE, id);
 
 	folio_mark_uptodate(folio);
 
