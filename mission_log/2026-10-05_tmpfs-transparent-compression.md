@@ -3072,3 +3072,90 @@ Flip attributions (dmesg, in-stream + final dmesg re-dump = x2 each):
   stops lying by omission.
 - Per-mount comp_stats readers (standing gap) -- the one-boot matrix
   works around them with per-config deltas on global counters.
+
+---
+
+## Session 17: the watermark axis, and eating a correction (2026-10-08)
+
+### What We Did
+
+Swept watermark levels at fixed size, per the plan's remaining axis:
+12 per-mount rows in ONE boot (test.torture TORTURE_WMSWEEP=1 ->
+init.sh test.wmsweep=1): eager/never anchors, LOW sweep @HIGH=70
+(0/25/50/70), HIGH sweep @LOW=50 (50/60/80/90/100), wide-band probe
+25:90.  sweep_wm.sh [size] runs it; flip lines are attributed to
+configs by serial position (dmesg re-dump excluded via the "Kernel
+log (dmesg):" marker).
+
+The sweep immediately exposed a gate bug: config_engage() mapped
+0:70 to the eager per-point check, but 0:70 starts CHILL (fill_sb:
+hot = (wm_high == 0)) and, with LOW=0, can only leave chill at usage
+0.  Only the true eager sentinel (0:0) now gets the per-point check.
+
+Ran the sweep at 384M twice, then at 512M.
+
+### What We Learned
+
+- **The correction (say it plainly): the session-16 "384M cliff"
+  result was noise.** Run 2 at 384M reshuffled every failure:
+  never clean->4, 25:70 4->0, 50:100 8->0, 25:90 7->12.  Mechanism:
+  size=384M = 98304 blocks; compressed entries charge 1 block each
+  (swap-style), so eager's comp_pages=82k + in-flight uncompressed
+  ~= the cap.  EVERY mode at 384M/T=64 lives within +/-5% of the
+  ceiling, and whether a tar(1) call trips ENOSPC is scheduling
+  noise.  The v2 map's "50:70 survives where eager is marginal" was
+  luck of the draw.  Only the robust rows survive as findings:
+  192M is below the live set under every policy; >=512M has
+  headroom; the 384M row must be discarded.
+- **Rule: measure the policy axis only where capacity is not the
+  dominant variable.** A knife-edge size confounds EVERY other axis;
+  two identical boots differing in outcomes is the tell.  Cheap
+  repeatability check (one rerun) before interpreting any
+  cliff-shaped result -- the20-boot sweep we killed would have
+  burned2h to produce the same confounded map.
+- **512M sweep (466/0), the real watermark results**: throughput at
+  T=64 tracks TIME SPENT HOT, not the level: eager (always hot)
+  99.1 MB/s; earliest flip (50:60, flip@67%) 131.3; 50:50 144.9;
+  50:70 165.2 (flip@72%); late flips (0:70, 25:70, flip@77%) ~178;
+  never-flip levels (50:80/90/100, 25:90 -- usage peaks ~77%) cluster
+  161-176.  Zero-width bands (50:50, 70:70) flap without breaking
+  anything: the hysteresis mechanics survive their degenerate case.
+- Flip usage numbers map the backlog: HIGH=50 -> flips at 60%,
+  HIGH=60 -> 67%, HIGH=70 -> 72-77%.  The flip fires at the first
+  maintain pass after crossing HIGH, so the reported usage is
+  HIGH+backlog-at-cadence, a direct read on how far the deferred set
+  runs ahead of the pass.
+- T=1: deferral is free at EVERY level (26.2-27.8 vs eager 18.5 =
+  plain speed).  The CPU bill only appears after a flip makes writes
+  compress inline -- consistent with session 15's T=1 numbers, now
+  shown to be level-independent.
+- 50:70 at headroom sizes flips only under real pressure (72% peak)
+  and defers otherwise.  No reason to move the default levels; step
+  5 (the flip) stands.
+
+### Test Results
+
+- 384M run 1: 457+/11 untar fails (all T=64, scattered); run 2:
+  different scatter (9 fails).  Never oopses; post-storm clean both
+  runs (Shmem back to baseline).
+- 512M: 466 passed / 0 failed; flips at 60/67/72/77% attributed to
+  50:50/50:60/50:70/{0:70,25:70,70:70}; no flip at HIGH>=80.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/tests/test_torture.c` | wmsweep rows, config_engage (0,0)-only point check |
+| `~/tmpfs-compress-test/guest/init.sh` | test.wmsweep=1 -> TORTURE_WMSWEEP=1 |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_WMSWEEP passthrough |
+| `~/tmpfs-compress-test/scripts/sweep_wm.sh` | the sweep runner + flip attribution |
+| `TMPFS_COMPRESSION_PLAN.md` | step-4 v3 status + correction |
+
+### Next Steps
+
+- Step 5: default flip 0:0 -> 50:70 (both axes now measured; levels
+  unchanged).
+- Repeat-boot discipline in the harness: any capacity-cliff-shaped
+  result gets ONE rerun before it enters the plan.
+- The untar-fail-as-capacity-death classification (standing) --
+  would have flagged the 384M confound earlier.
