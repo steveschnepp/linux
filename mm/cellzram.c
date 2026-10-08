@@ -93,6 +93,13 @@ struct cellzram {
 	atomic64_t		io_writes;
 	atomic64_t		failed_writes;
 	atomic64_t		discarded_blocks;
+	/*
+	 * all-zero writes stored as nothing (see cellzram_write_block):
+	 * a zero block reads back identically to an unwritten one via the
+	 * read-miss zero-fill, so no slot/entry/cell is held. Reported in
+	 * mm_stat to mirror zram's same_pages for the head-to-head.
+	 */
+	atomic64_t		zero_blocks;
 	struct mutex		io_lock;	/* serialises reset + sysfs */
 };
 
@@ -211,6 +218,24 @@ static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
 }
 
 /*
+ * True if every word in the page is zero.  Word-at-a-time (512 compares
+ * on x86_64), never touches memory we do not own.  Used to short-circuit
+ * all-zero writes: such a block is stored as nothing (see
+ * cellzram_write_block), which is safe only because a read-miss
+ * zero-fills -- so "all zeros" and "never written" read back identically.
+ */
+static bool cellzram_page_all_zero(const void *src)
+{
+	const unsigned long *p = src;
+	size_t i, n = PAGE_SIZE / sizeof(*p);
+
+	for (i = 0; i < n; i++)
+		if (p[i])
+			return false;
+	return true;
+}
+
+/*
  * Write one full logical block. Stores raw in phase-1 mode
  * (compressed == false); phase 2 wires compression in with the entry
  * length as the discriminator. Replaces any previous block (COW): the
@@ -220,6 +245,25 @@ static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
 static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 				const void *src)
 {
+	/*
+	 * all-zero page: store nothing, exactly as discard does (erase the
+	 * slot, drop the ref, cell returns to the buddy inline).  A zero
+	 * block reads back as zeros via the read-miss path, indistinguishable
+	 * from an unwritten block, so we hold no slot/entry/cell for it.
+	 * Filesystem metadata (unused inode tables, bitmaps, padding) is
+	 * zero-heavy, so this turns ext4's own zero writes into free storage
+	 * without the fs having to issue a discard.  Net win: a 512-word scan
+	 * replaces lz4 + store + entry_alloc.  Applies in raw (none) mode too.
+	 */
+	if (cellzram_page_all_zero(src)) {
+		void *old = xa_erase(&dev->table, block_nr);
+
+		if (old)
+			cellzram_put_entry(dev, xa_to_value(old));
+		atomic64_add(PAGE_SIZE, &dev->orig_bytes);
+		atomic64_inc(&dev->zero_blocks);
+		return 0;
+	}
 	unsigned long handle;
 	unsigned int id;
 	unsigned int len_bytes = PAGE_SIZE;
@@ -536,10 +580,12 @@ static ssize_t mm_stat_show(struct device *dev,
 	struct gendisk *disk = dev_to_disk(dev);
 	struct cellzram *cz = disk->private_data;
 	unsigned long long orig_bytes, compr_bytes, phys_bytes = 0, objects, entry_bytes;
+	unsigned long long zero_blocks;
 
 	orig_bytes = atomic64_read(&cz->orig_bytes);
 	compr_bytes = atomic64_read(&cz->compr_bytes);
 	objects = atomic64_read(&cz->objects);
+	zero_blocks = atomic64_read(&cz->zero_blocks);
 	if (cz->pool && shmem_comp_pool_uses_cells(cz->pool))
 		phys_bytes = (unsigned long long)
 			atomic_long_read(&shmem_comp_pool_cells(cz->pool)->
@@ -553,9 +599,10 @@ static ssize_t mm_stat_show(struct device *dev,
 	 */
 	entry_bytes = objects * sizeof(struct shmem_comp_entry);
 
-	return sysfs_emit(buf, "%llu %llu %llu %llu %llu %llu\n",
+	return sysfs_emit(buf, "%llu %llu %llu %llu %llu %llu %llu\n",
 			  orig_bytes, compr_bytes, phys_bytes, objects, entry_bytes,
-			  compr_bytes ? compr_bytes * 10000 / orig_bytes : 0);
+			  compr_bytes ? compr_bytes * 10000 / orig_bytes : 0,
+			  zero_blocks);
 }
 static DEVICE_ATTR_RO(mm_stat);
 
@@ -624,6 +671,7 @@ static ssize_t reset_store(struct device *dev,
 	atomic64_set(&cz->io_writes, 0);
 	atomic64_set(&cz->failed_writes, 0);
 	atomic64_set(&cz->discarded_blocks, 0);
+	atomic64_set(&cz->zero_blocks, 0);
 
 	blk_mq_unfreeze_queue(cz->disk->queue, memflags);
 	mutex_unlock(&cz->io_lock);
