@@ -2913,6 +2913,169 @@ predicting T=1 single-job throughput toward plain (26 vs 17.1 MB/s),
 skipped_dead absorbing transient churn, survivor ratio unchanged
 (~48% stored), and bounded Shmem overshoot (max sampled in-window).
 
+## Stage 2 machinery -- walk-based aging (implementation design, 2026-10-07)
+
+The policy above (death-before-pop, hysteresis flips, 4:1 aging:GC) is
+unchanged. What changed is the candidate-finding MECHANISM: the policy
+section sketched "a cheap candidate marker (list_add under a spinlock)";
+code analysis against the real tree rejected markers. Decision:
+**walk-based aging** -- the maintenance pass walks the mount's page
+caches. Recorded here because it amends the policy section before any
+Stage 2 code exists (plan-first protocol, session 3).
+
+### Why not the marker list
+
+- A marker holding no folio reference dangles when shmem_writeout()
+  swaps an uncompressed chilled folio out -- writeout never touches
+  undo_range, so no truncate-side purge would run. Fixing that needs a
+  third purge hook in the swapout path, widening the shmem.c blast
+  radius the session-4 carve just shrank.
+- A marker pinning the inode (igrab) breaks tmpfs delete semantics:
+  tmpfs truncates at EVICT (shmem_evict_inode -> shmem_truncate_range),
+  and evict runs only at i_count == 0. A pinned inode cannot evict, so
+  a chilled file deleted under pressure keeps its pages until the pass
+  runs -- and unmount with pending pins is the busy-inodes hazard.
+- Walk-based aging has no new lifetime rules at all: a truncated page
+  is simply absent from the xarray when the pass arrives. There is
+  nothing to purge, so there is nothing to purge wrong.
+
+### Mechanism
+
+Per-mount state additions to struct shmem_comp_sb:
+
+- `bool hot` -- the mode flag. Write path: one READ_ONCE. Pass:
+  WRITE_ONCE at flips. Initial value at fill_sb: (wm_high == 0), i.e.
+  eager mounts start hot, 50:70 / 50:100 start chill.
+- `struct super_block *sb` -- back-pointer for the inode walk and
+  usage computation (fill_sb gains an sb parameter).
+- `struct delayed_work age_work` + `struct mutex maintain_lock` --
+  one pass per mount, serialized (work + gc_now + shrinker can race).
+- `struct list_head list` on a global shmem_comp_mounts list -- gc_now
+  iterates mounts; put_super removes before freeing comp and runs
+  cancel_delayed_work_sync() first.
+- `atomic_long_t aged_pages, skipped_dead` -- per-mount tallies
+  (global stats for comp_stats; per-mount readers remain the standing
+  carry-over).
+
+Write path (shmem_write_end): `should_compress` gains `READ_ONCE(hot)`;
+the else-branch calls `shmem_comp_arm_aging(inode)` -- a no-op unless
+the mount participates AND the write left an uncompressed candidate
+(chill write, or sub-threshold write in hot mode). Arming is
+schedule_delayed_work, cheap when already pending. No allocation, no
+new state per write.
+
+`shmem_comp_maintain(comp)`, one pass:
+
+1. usage = max_blocks ? used_blocks * 100 / max_blocks : 0 (percpu
+   sum, sbinfo via comp->sb). Flip rules, hysteresis band (LOW, HIGH)
+   keeps current mode:
+   - usage >= wm_high -> hot
+   - usage <= wm_low  -> chill
+   For 0:0 the first rule always holds -> permanently hot, never
+   flips to chill (the empty-fs + integer-division trap: 1 page on a
+   large tmpfs reads usage 0; the sentinel must not flinch).
+   pr_info once per flip (rare; greppable in serial logs).
+2. Aging: walk sb->s_inodes (prune_icache pinning pattern: i_lock,
+   skip I_FREEING/I_WILL_FREE, __iget). For each shmem inode, walk
+   the page cache with find_get_entries() (the undo_range pattern --
+   folios come back referenced, values as exceptionals). Per folio:
+   xa_is_value -> skip (compressed entry or swap; NEVER swapin from
+   the pass); lock; revalidate folio->mapping == mapping && uptodate;
+   skip mapped/pinned/order>0; compress via the single-page core with
+   allow_clean=TRUE. Threshold is ignored: any eligible survivor >=
+   1 page is aged (this is what dissolves grate #2 -- the 64K
+   write-time threshold no longer condemns small survivors to stay
+   uncompressed forever).
+   merge_pages interaction (v1): the pass always compresses SINGLE
+   pages, bypassing the group dispatch. Compatible by construction:
+   entries carry their own nr_pages and the decompress path dispatches
+   per entry, so single-page entries coexist with write-time groups on
+   the same mount. Group-aware aging is a follow-up if the policy
+   matrix shows the ratio cost matters.
+3. Budget alternation ~4:1: each round ages up to
+   SHMEM_COMP_AGE_BUDGET (128) pages, then -- cell-backed pools only
+   -- runs one shmem_comp_cell_gc() batch; up to SHMEM_COMP_AGE_MAX
+   ROUNDS (4) rounds per pass (~2 MB aged max). Budget bounds the
+   per-pass cost regardless of data compressibility (see gaps).
+   zsmalloc pools: rounds age only, GC is the pool's own shrinker's
+   job.
+4. Re-arm: if a pass hit its round budget (candidates likely
+   remain), schedule_delayed_work again; otherwise idle until the
+   next write arms it.
+
+`skipped_dead` accounting: shmem_comp_note_unmap(inode) called from
+shmem_undo_range() adjacent to each FULL truncate_inode_folio() (both
+loops; partial large-folio truncates are NOT deaths -- the folio
+survives). Counts only when the mount is chilled (READ_ONCE(!hot)):
+eager-mode deaths of uncompressed pages are not policy wins (those
+pages were attempted at write time -- incompressible/mapped/below
+threshold). Covers unlink, truncate, fallocate punch, and evict (evict
+routes through shmem_truncate_range). The metric: pages that died
+without paying a compression cycle -- the CPU death-before-pop saved.
+
+Triggers:
+
+- Armed delayed_work (above): writes arm it; delay
+  SHMEM_COMP_AGE_DELAY_MS (1000).
+- gc_now (sysfs): extended from cell-GC-all to also run one maintain
+  pass per compressed mount (global mounts list) before the pool GC.
+  Deterministic test trigger for the policy matrix.
+- Shrinker: the existing cell-pool shrinker scan ARMS the work for
+  mounts on that pool instead of compressing inline -- allocation
+  under fs_reclaim (crypto contexts, kmalloc buffers, cell alloc_pages)
+  is the reclaim-recursion hazard session 3 already hit once
+  (alloc_pages(GFP_KERNEL) under cp->lock). Aging from the workqueue
+  keeps GFP_KERNEL honest. Deviation from the plan text, recorded:
+  "triggered by the shrinker" is satisfied asynchronously.
+  zsmalloc-backed mounts have no such shrinker and rely on the armed
+  work + gc_now in v1.
+
+Core refactor: shmem_compress_folio()'s single-page body moves to
+shmem_comp_compress_one(inode, index, folio, bool allow_clean). The
+write path calls with allow_clean=false (unchanged: "write_end just
+dirtied this folio; clean means the state changed under us"); the pass
+calls with allow_clean=true. Existing race hardening (folio lock,
+mapping revalidate, expected-value slot swap) is shared, not copied.
+
+### Known v1 gaps (deliberate, measured-then-fixed)
+
+1. Incompressible retry: the walk's candidate set is "uncompressed
+   pages", which includes pages that failed compression at write time
+   (hot mode). Each pass retries them within its budget. The budget
+   bounds the CPU cost per pass; the waste is budget consumed by noise
+   (quality, not stability). The proper fix is the session-1 entropy
+   probe -- lands if the policy matrix's noise rows demand it.
+   (The rejected marker design skipped these for free: markers existed
+   only for never-attempted chilled pages.)
+2. Chilled pages can still be written to swap uncompressed (writeout
+   bypasses compression). v1 accepts it; compress-at-swapout is a
+   separate lever.
+3. Read-decompressed pages get recompressed by the next pass (clean
+   pages are eligible by design). Thrash is bounded by the armed delay
+   + budget; a referenced-bit eligibility check is the follow-up if
+   read-heavy mounts show churn in the matrix.
+4. Per-mount stats readers (comp_pages/comp_bytes/aged/skipped) remain
+   open; the matrix uses global deltas with one mount active per
+   config, plus pr_info flip lines.
+
+### Landing sequence (bisectable, each rig-gated)
+
+1. This amendment (docs only).
+2. Machinery commit: hot flag + write-path consult + arm hook +
+   maintain pass + skipped_dead hooks + delayed_work/mounts list +
+   gc_now extension + stats + fill_sb(sb)/put_super teardown. Built-in
+   default STAYS 0:0 -- eager mounts keep today's inline behavior; the
+   only behavior change is sub-threshold pages now aging (grate #2)
+   and explicit non-eager watermarks finally doing something. Config
+   off-n build gate (session 4 rule: shmem.c touched).
+3. Rig: new test_watermark_policy (chill mount: writes land
+   uncompressed, gc_now ages them, unlink counts skipped_dead; eager
+   mount: sub-threshold pages age; hysteresis flip via size= pressure).
+4. Policy matrix on the torture sweep (never / 0:0 / 50:70 / 50:100
+   vs session-7 eager numbers; watch stale_value_retries).
+5. Default flip 0:0 -> 50:70 + suite + matrix re-run (final step,
+   after the matrix validates 50:70).
+
 ## Status (2026-10-07)
 
 Stage 1 landed as four commits (`a222524`..`275a232`): aliases
