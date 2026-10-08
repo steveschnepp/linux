@@ -3298,3 +3298,39 @@ Also landed: test.tsw= thread-axis override (T up to 256) -- ready
 for the oversubscription sweep; the T-curves already show eager
 plateauing at T=4 (inline lz4 saturates the vCPUs) while deferral
 keeps scaling (T=64: 99 vs 178 MB/s).
+
+## Configuration guidance -- what config when (synthesis, 2026-10-08)
+
+Distilled from the session-15/16/17/18 matrices (plus 1/7 backend
+work).  The default answer for transient-heavy workloads:
+
+    mount -t tmpfs -o compress=lz4,compress_watermark=50:70 tmpfs /mnt/x
+
+with size= >= ~1.5-2x peak live set.
+
+| When                              | Config          | Key evidence |
+|-----------------------------------|-----------------|--------------|
+| transient churn                   | lz4 + 50:70     | T=1 free (plain speed); T=64 ~2x eager; comp RAM 1MB vs 166MB |
+| steady hot data, RAM-bound        | 0:0 or 50:70 held hot by size= | eager costs -30..-45% throughput |
+| capacity pressure                 | 50:70 with HIGH reachable | at the 384M cliff never/50:100 die, 50:70 most robust; HIGH>=80 never flips -> deferral only, no inline relief |
+| low concurrency                   | any deferral    | all levels = plain speed at T=1-2 |
+| zstd                              | large-file, long-lived, ratio-bound only | +10-12% ratio; slower T=1 write; no write-side edge under deferral (aging does singles in kworker) |
+| merge_pages > 1                   | eager + large files only | engagement collapses 78k->512 comp pages m1->m32; irrelevant under deferral |
+| compress_threshold                | leave 64K       | write-time only; aging ignores it |
+| 100:100                           | off-switch/benchmark | no pool; = nocompress |
+| backend (cell vs zsmalloc)        | default         | speed/ratio parity; cells win RAM return on free/discard |
+
+Standing rules: (1) size= is a per-page envelope -- within ~10% of
+peak live set every policy dies stochastically; do not tune or
+measure there.  (2) Throughput tracks time-spent-hot, not the level.
+(3) Flip usage = HIGH + backlog-at-cadence (a direct read on the
+deferred set).  (4) Degenerate bands (LOW==HIGH flapping; LOW=0
+one-way) are safe.  (5) Eager plateaus at vCPU count (T=4 of 4
+CPUs), deferral scales -- the eager penalty grows with concurrency.
+(6) Observability: comp_stats aged_pages/skipped_dead/
+stale_value_retries==0, dmesg flip lines, post-storm Shmem return --
+all GLOBAL counters; per-mount readers are the standing gap.
+
+Open before step 5 (default flip): read-heavy re-compression thrash
+(gap #3); group-aware aging if zstd+large-files becomes a target;
+per-mount stats readers.
