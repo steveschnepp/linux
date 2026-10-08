@@ -2593,7 +2593,7 @@ wording, sysfs-group naming) trails all of it.
 
 ---
 
-## Session 2: C PID 1 supervisor + the POSIX_TIMERS gotcha (2026-10-08)
+## Session 12: C PID 1 supervisor + the POSIX_TIMERS gotcha (2026-10-08)
 
 ### What We Did
 
@@ -2684,7 +2684,7 @@ unblocks it before execl).
 
 ---
 
-## Session 3: repo restructure -- tracked guest/ vs disposable build/ (2026-10-08)
+## Session 13: repo restructure -- tracked guest/ vs disposable build/ (2026-10-08)
 
 ### What We Did
 
