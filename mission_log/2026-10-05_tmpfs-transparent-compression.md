@@ -2681,3 +2681,87 @@ unblocks it before execl).
 - If the rig kernel config is ever regenerated from scratch, POSIX_TIMERS
   must be re-enabled or both the watchdog and guest sleeps break again
   silently.
+
+---
+
+## Session 3: repo restructure -- tracked guest/ vs disposable build/ (2026-10-08)
+
+### What We Did
+
+The rig repo's `initrd/` tree mixed git-tracked rootfs content with
+build-generated artifacts, and the `.gitignore` compensated with an
+ever-finer denylist (`initrd/bin/test_*` ignored but `busybox` tracked;
+`testdata/*.bin` ignored but `munin-2.0.78.tar` tracked).  Restructured
+into a two-tree scheme:
+
+- `guest/` -- tracked source that ships VERBATIM at the same path
+  (`init.sh` -> /init.sh, `bin/busybox` + applet symlinks -> /bin,
+  `testdata/munin*` -> /testdata)
+- `tests/` -- guest program sources (unchanged)
+- `scripts/` -- host tooling (unchanged role)
+- `build/` -- 100% disposable, one gitignore line: `bin/` (compiled
+  programs from build_tests.sh / build_fstools.sh), `rootfs/` (staging
+  rebuilt from scratch by build_rootfs.sh), `rootfs.cpio.gz`, `kernel/`
+
+`build_initrd.sh` became `build_rootfs.sh`: fresh staging every run =
+`cp -a guest/.` + overlay `build/bin/.` + mknod + generated testdata ->
+cpio.  Fails loudly if the compiled `/init` supervisor is missing.
+The tracked `initrd/init` binary is gone -- it is derived from
+`tests/init.c` like every other binary.
+
+### What We Learned
+
+- **The migration flushed out two latent bugs**, both variations of
+  "generated stuff with no build rule":
+  1. `build_tests.sh`'s hand-maintained TESTS list had drifted from
+     `tests/*.c`: eight test binaries (bench, cell_gc, cell_storage,
+     entry_race, mount_sem, mmap_coherent, multimount, size_limit)
+     were invoked by `init.sh` but built by NO script -- they only
+     existed as untracked leftovers in the old `initrd/bin/`.  The
+     first fresh build from the new layout made the suite exit 127
+     ("not found" x8).  Fix: derive the build list from `tests/*.c`
+     so drift is structurally impossible.  Lesson: a tracked *output*
+     hides missing build rules; deleting it is the only way to find
+     out what actually produces the tree.
+  2. `tests/test_concurrent.c` missed `<sys/time.h>`; implicit
+     `gettimeofday` is a hard error on GCC 14, so it had never built
+     on this host -- silently, because build_tests.sh treats a failed
+     compile as non-fatal.
+- Design detail worth keeping: binary builds and rootfs assembly must
+  stay independent.  The first cut had build_tests.sh output straight
+  into the staging tree, which build_rootfs.sh then wipes at the
+  start of every run -- binaries vanished between the two steps.
+  The `build/bin/` output dir + overlay copy breaks the cycle.
+- `git mv` of symlink farms (busybox applet links) preserves the
+  links; untracked leftovers next to them do not survive `rm -rf`,
+  which is exactly the intended purge.
+- Old root-level `rootfs.cpio.gz` became visible only after the
+  gitignore rewrite dropped its entry -- rewrites of ignore files
+  should be diffed against `git status` of the OLD tree first.
+
+### Files Changed (high level)
+
+| File | Purpose |
+|------|---------|
+| `guest/{init.sh,bin/*,testdata/munin*}` | moved from initrd/, now the tracked verbatim rootfs source |
+| `scripts/build_rootfs.sh` | replaces build_initrd.sh: fresh staging + pack |
+| `scripts/build_tests.sh` | glob-derived test list, outputs to build/bin/ |
+| `scripts/{build_kernel,build_fstools,run_qemu,run_tests,quick_test,setup_test_env}.sh` | retargeted to build/ paths |
+| `tests/test_concurrent.c` | missing <sys/time.h> (GCC 14 hard error) |
+| `.gitignore`, `README.md` | two-tree rule documented |
+
+### Test Results
+
+Full pipeline from the new layout: build_tests (16 tests + init, all
+OK) + build_fstools (fsx, fstorture) + build_rootfs (14M cpio, all
+binaries verified present) -> sweep boot exit 0; INIT_REBOOT=3
+watchdog kill mid-suite -> run_qemu exit 125.
+
+### Next Steps
+
+- The CI snippet in README.md was updated mechanically but has never
+  actually run; if the rig ever goes to CI, QEMU+KVM availability and
+  the kernel build from /home/snide/linux are the first blockers.
+- `setup_test_env.sh` still hardcodes the rig path like everything
+  else; a REPO="$(cd "$(dirname "$0")/.." && pwd)" sweep across the
+  scripts would make the repo relocatable.
