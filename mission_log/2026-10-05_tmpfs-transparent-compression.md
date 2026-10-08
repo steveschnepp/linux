@@ -3439,3 +3439,375 @@ The plan's landing sequence is COMPLETE.  Standing items:
 - re-run the policy matrix under the flipped default if any sweep
   mixes explicit and inherited mounts (the wmsweep rows are all
   explicit; classic rows now inherit)
+
+---
+
+## Session 21: cellzram for block devices -- fs workloads, zram head-to-head, and the zero-page finding (2026-10-09)
+
+### What We Did
+
+Pivoted from the tmpfs landing sequence (complete as of session 20) to
+the cellzram block-device track: the spec's motivation promised the
+cell allocator's properties for "workloads that require a `struct
+block_device`: swap, ext4/xfs, O_DIRECT databases, journal devices,"
+but sessions 1-20 only ever exercised cellzram as a *synthetic* device
+(dd round-trips, discard drain, reset, one swap trial). This session
+built the missing workload layer -- filesystems and random I/O,
+head-to-head against zram -- and found the one thing that actually
+matters for fs-on-cellzram.
+
+1. **Kernel config.** Added `CONFIG_EXT4_FS` + `CONFIG_EXT4_USE_FOR_EXT2`
+   (busybox mke2fs makes an ext2 image; the ext4 driver mounts it) and
+   `CONFIG_ZRAM` to the rig build script. First zram build forced
+   LZO-only (`ZRAM_BACKEND_FORCE_LZO` is `def_bool` when no backend is
+   selected) with default `lzo-rle` -- an unfair head-to-head against
+   cellzram's lz4 default. Fixed: enabled `ZRAM_BACKEND_LZ4` +
+   `ZRAM_BACKEND_ZSTD`, set `ZRAM_DEF_COMP_LZ4`. bzImage 4,035,584 ->
+   4,039,680 B.
+
+2. **`tests/test_blkdev_fs.c`** -- the fs farm. Per device (cellzram0,
+   zram0) x algo (lz4, plus cellzram `none` as the uncompressed-cells
+   baseline): set disksize 256M -> mke2fs -> `mount -t ext4 -o discard`
+   -> untar the munin tree 8x (timed) -> CRC32-verify every file
+   against the host manifest (timed) -> rm -Rf (timed) -> fstrim ->
+   umount -> reset. Reuses test_torture.c's CRC32/manifest code. BENCH
+   lines carry untar/verify/rm MB/s + MemFree snapshots + device RAM.
+   Hard asserts limited to correctness (CRC, untar, teardown recovery);
+   the RAM/throughput columns are reported, not asserted (the
+   quiescent-verify rule -- no mutators here, but the gauges are still
+   racy against slab/page-cache noise).
+
+3. **`tests/test_randio.c`** -- the database-shaped workload. 4K random
+   write/read, buffered + O_DIRECT, both raw on the device (O_DIRECT
+   only -- session 5's rule: raw block I/O that isn't O_DIRECT tests
+   the page cache, not the device) and on an ext4 file. Per-block
+   xorshift pattern keyed by (block, round) with a round tracker, so
+   every read block is verified against its generating content.
+
+4. **Rig gates.** `test.fsdev=1` -> `test_blkdev_fs`, `test.randio=1` ->
+   `test_randio` (init.sh isolation blocks + run_qemu.sh `TEST_FSDEV` /
+   `TEST_RANDIO` passthrough). Both are ONE-boot-per-run isolation
+   gates like cellzram/entryrace/watermark.
+
+5. **The mm_stat unit misparse.** First run's `dev_ram_kb` column read
+   nonsense: cellzram `none` = 8799144 ("8.4 GB" on a 256 MB disk),
+   zram = 81920 ("80 KB" for 124 MB live). Root cause: BOTH drivers
+   emit **bytes** (`zram: mem_used << PAGE_SHIFT`), and the column was
+   labeled KB and compared against KB fields. Fixed: `dev_ram_mb` (bytes
+   / MIB) + a raw-mm_stat BENCH line so the parse is *verifiable, not
+   trusted*.
+
+6. **The zero-page finding (the session's real result).** With the
+   parse fixed, the fs-phase numbers were:
+
+   | device | orig | compr | phys/mem_used | same_pages | entries |
+   |--------|------|-------|---------------|------------|---------|
+   | cellzram lz4 | 8441856 | 54118 | 262144 (64 cells) | - | 2061 |
+   | zram lz4 | 8441856 | 867 | 81920 (20 pages) | **2048** | - |
+   | cellzram none | 8441856 | 8441856 | 8650752 | - | 2061 |
+
+   Same orig (apples-to-apples), throughput dead even (untar 20.3 vs
+   20.4, verify 77.2 vs 78.0, rm 58.5 vs 59.1 MB/s), but zram held
+   20 pages vs cellzram's 64 cells + 2061 entries. The tell:
+   `same_pages=2048` of 2061 written pages. I initially narrated this
+   as "zram deduplicated the 8 identical copies" -- **wrong**, and the
+   user caught it. `page_same_filled()` (zram_drv.c:333) compares every
+   word to `page[0]`: it catches *uniform-fill* pages (all zeros, all
+   0xFF), NOT identical-content pages. The 2048 are zero pages from
+   ext4 metadata (unused inode tables, bitmaps, padding), which
+   filesystems are full of. zram stores each as an 8-byte element;
+   cellzram has no such fast path and pays a lz4-compressed cell +
+   ~72 B entry for every one. That is the entire RAM gap -- a missing
+   optimization, not a worse allocator.
+
+7. **The fix design (settled, not yet implemented at time of writing).**
+   For a block device, "written as all-zeros" is indistinguishable from
+   "never written" -- both read back as zeros via the read-miss
+   zero-fill (brd semantics). So an all-zero page needs NO storage.
+   ~20 lines in `cellzram_write_block()`, before the compress+store+alloc:
+
+   ```c
+   if (page_all_zero(src)) {          /* word-at-a-time scan */
+       void *old = xa_erase(&dev->table, block_nr);
+       if (old)
+           cellzram_put_entry(dev, xa_to_value(old));
+       atomic64_add(PAGE_SIZE, &dev->orig_bytes);
+       atomic64_inc(&dev->zero_pages);
+       return 0;
+   }
+   ```
+
+   The `xa_erase`+`put` is byte-identical to `cellzram_bio_discard`
+   (cellzram.c:374) and `slot_free_notify` -- three paths that already
+   converge on "no slot, cell returned inline"; the zero-write is a
+   fourth, the only one that needs no fs cooperation. Net CPU *win*
+   too (a 512-word scan replaces lz4 + store + entry_alloc). No new
+   entry type, no read-path change, no mount option. One new counter
+   `zero_pages` in mm_stat (mirrors zram's `same_pages` so the
+   head-to-head stays legible).
+
+8. **Discard support confirmed** (the user's question): cellzram sets
+   both `.max_hw_discard_sectors` AND `.max_write_zeroes_sectors` +
+   `.max_hw_wzeroes_unmap_sectors` = UINT_MAX (cellzram.c:656-666).
+   The WRITE_ZEROES trio is required because `fallocate(PUNCH_HOLE)`
+   on a block device reaches the driver as WRITE_ZEROES via
+   `BLKDEV_ZERO_NOFALLBACK`, which demands hw write-zeroes offload --
+   discard limits alone get -EOPNOTSUPP. Both route to
+   `cellzram_bio_discard`. The fs-farm run corroborated it:
+   `trim_extra_kb=0` everywhere because ext4's `-o discard` had already
+   freed everything during rm, leaving fstrim nothing to trim.
+
+### What We Learned
+
+#### Technical
+
+- **zram's same-filled fast path is NOT dedup.** `page_same_filled()`
+  (zram_drv.c:333) fires only when every word in the page equals the
+  same value -- all-zeros, all-0xFF. Two identical pages of real text
+  do NOT collapse. A counter named `same_pages` invited the dedup
+  story; the function refuted it. Read the function, not the field
+  name.
+
+- **Filesystem metadata is zero-heavy; file data is not.** ext4 on a
+  256 MB device wrote 2048 zero pages out of 2061 for the munin untar
+  -- unused inode tables, bitmaps, padding. This is the whole reason
+  the block-device zero-page optimization is valuable, AND the reason
+  the tmpfs version is worth much less (tmpfs's workloads are file
+  *data*, which is almost never all-zeros). The hit rate is
+  workload-shaped, and the two surfaces have different workloads.
+
+- **The zero-page trick is free only on a surface whose hole reads
+  back as zeros.** cellzram: read-miss zero-fill (brd). tmpfs:
+  `SGP_READ` zero-fills holes (shmem.c:2576). Both qualify. A page of
+  all-0xFF does NOT -- a hole returns zeros, not 0xFF -- so catching
+  non-zero uniform fills needs a real entry encoding (sentinel length +
+  fill value in the handle), which is the expensive version and not
+  worth it: lz4 already compresses a uniform page to ~15 B.
+
+- **For tmpfs the same idea is strictly more work and less payoff.**
+  The block device skips the `xa_store` (free); tmpfs must
+  *un-materialize* an already-allocated folio (delete from page cache
+  -> hole) under the compress path's guard set (clean, order-0,
+  unmapped, unpinned), and it only gains on ranges *written* with
+  zeros (unwritten ranges are already free holes). Plus an observable
+  behavior change the block device doesn't have: `st_blocks` /
+  SEEK_HOLE would report written-zeros as a hole.
+
+- **zram defaults to LZO unless a backend is explicitly enabled.**
+  `ZRAM_BACKEND_FORCE_LZO` is `def_bool !LZ4 && !LZ4HC && !ZSTD &&
+  !DEFLATE && !842` -- a bare `--enable CONFIG_ZRAM` yields lzo-rle and
+  an unfair comparison against any lz4-default device.
+
+- **mm_stat units are bytes on BOTH cellzram and zram.** A column
+  labeled KB holding bytes produces confidently-wrong numbers ("8.4 GB
+  on a 256 MB disk"). Emit the raw sysfs line next to the parsed value
+  so the transform is auditable.
+
+#### Process
+
+- **The parallel-edit trap did NOT fire this session** -- every
+  edit -> build -> run chain was sequential, and binary provenance was
+  verified with `strings` BEFORE each 300 s boot (the session-20 rule).
+  Caught the mm_stat misparse in one run instead of debugging a stale
+  binary. Keep doing this.
+
+- **An atomic edit batch reverted on one failed hunk** (session 4's
+  lesson, reapplied): a `struct dev` oldText with the wrong comment
+  text failed edits[1] and reverted edits[0] silently. Check exact
+  bytes (the comment block) before batching.
+
+- **Copy-paste across test files brings the wrong constants.**
+  `run_distinct_ram` referenced `BLK`/`N_BLOCKS` from test_randio.c
+  into test_blkdev_fs.c (which uses `PAGE`, `N_COPIES`) -- a clean
+  gcc failure, but only because I compile-check every test standalone
+  (`gcc -Wall -Wextra -static`) before packing the rootfs.
+
+- **A BENCH line interleaved with a kernel printk loses its tail on
+  the serial console** (session 12's two-writers rule). The cellzram
+  `none` config's MemFree columns were eaten by
+  `shmem_comp: destroyed pool...`. Machine-readable results that must
+  survive interleaving want to be short, or parsed by prefix.
+
+### What We Decided
+
+- **cellzram gets the zero-page optimization; tmpfs does not (yet).**
+  cellzram: proven hit rate (2048/2061 on fs metadata), ~20 lines, free
+  (no new entry type, no read change, no option), net CPU win. tmpfs:
+  defer behind a counting probe in the aging walk that measures the
+  zero-page rate on the actual torture workloads first (session 17's
+  rule: don't build on a guessed number).
+
+- **Only the full-zeros case, not zram's general uniform-fill.** The
+  free trick needs hole-reads-as-zeros, which only zeros satisfy.
+  Non-zero uniform fills are rare and already near-optimal under lz4.
+
+- **The optimization is unconditional** (no mount/sysfs option),
+  matching session 8's "no extra grates" rule -- it's always correct
+  and always cheaper, so a knob would only be a new ABI surface.
+
+- **A distinct-data RAM phase was added to `test_blkdev_fs.c`** (writes
+  N_BLOCKS distinct 4K blocks raw, no two alike, so uniform-fill has
+  nothing to catch) to give the pure cell-vs-zsmalloc allocator
+  comparison, separate from the fs-metadata workload where
+  same-filled dominates. NOTE: this phase has NOT yet produced output
+  -- run3 was aborted before reaching it. Pending.
+
+### Rules Added
+
+- **Read the function, not the field name.** A counter's name
+  (`same_pages`) suggests a mechanism; only the implementing function
+  confirms it. Before narrating what a metric means, read its producer.
+
+- **Sysfs-stat transforms must be auditable in the output.** When a
+  test parses a kernel stat line into a BENCH column, emit the raw line
+  alongside the parsed value (or a checksum of it) so a unit/parse bug
+  is visible in the log, not silently wrong.
+
+- **Cross-test copy-paste gets a standalone compile-check.** Any test
+  helper moved between rig test files is compiled with `-Wall -Wextra
+  -static` on its own before it goes into the rootfs -- undefined
+  constants and wrong-scope refs fail there, not in the guest.
+
+### What We'd Do Differently
+
+- Would have dumped the raw mm_stat line in the FIRST version of the
+  fs test. The bytes-vs-KB misparse produced three confidently-wrong
+  BENCH columns before the raw line made it obvious in one glance.
+
+- Would have read `page_same_filled()` before saying "dedup" out loud.
+  The user caught the misattribution; the function is four lines and
+  would have corrected me in thirty seconds.
+
+- Would have set `QEMU_MEMORY` / timeouts with headroom for the
+  distinct-data phase (64 MB of O_DIRECT writes x 4 configs) instead of
+  letting run3 abort at 300 s before it executed.
+
+- The fs-farm MemFree-after-rm column is noisy against slab/page-cache
+  noise and one run went NEGATIVE (cellzram lz4, `delete_return_kb=
+  -7852` in run3 vs `+7160` in run2). If the "does delete return RAM
+  inline" question needs a hard number, sample `Shmem`/device mm_stat
+  rather than raw MemFree, or widen the slack and report the breakdown
+  (session 6's post-storm lesson).
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/scripts/build_kernel.sh` | +EXT4_FS, +EXT4_USE_FOR_EXT2, +ZRAM +LZ4/ZSTD backends, ZRAM_DEF_COMP_LZ4 |
+| `~/tmpfs-compress-test/tests/test_blkdev_fs.c` | new: ext4+discard untar farm on cellzram0 vs zram0; CRC manifest verify; raw-mm_stat BENCH; distinct-data RAM phase (pending) |
+| `~/tmpfs-compress-test/tests/test_randio.c` | new: 4K random IO, buffered + O_DIRECT, raw device + ext4 file, cellzram vs zram |
+| `~/tmpfs-compress-test/guest/init.sh` | test.fsdev=1 / test.randio=1 isolation gates |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_FSDEV / TEST_RANDIO passthrough |
+| `/home/snide/linux/mm/cellzram.c` | (next) zero-page optimization: page_all_zero() + write_block branch + zero_pages counter |
+
+### Test Results
+
+**fsdev gate** (`QEMU_MEMORY=2G TEST_FSDEV=1`), kernel with EXT4+ZRAM:
+
+- All 3 fs configs: **CRC 5712 files verified, 0 mismatch** (8 x 714),
+  all untars succeeded, teardown MemFree recovered near baseline,
+  **exit 0**. ext4 mounted `-o discard` on both devices.
+- Throughput dead even, cellzram vs zram (lz4): untar 20.3 / 20.4,
+  verify 77.2 / 78.0, rm 58.5 / 59.1 MB/s.
+- RAM (fs phase, lz4): cellzram phys 262144 + entry 148392 = ~0.4 MB
+  vs zram mem_used 81920 = ~0.08 MB -- the gap explained entirely by
+  zram's `same_pages=2048` uniform-fill fast path on ext4's zero pages.
+- cellzram `none` (uncompressed cells): verify 71.7 MB/s, RAM 8650752
+  B = 8.4 MB (stores raw, as expected -- the compression-RAM-benefit
+  baseline).
+- `trim_extra_kb=0` on every config: fstrim found nothing because
+  ext4's discard-on-free already released it during rm (discard works).
+- Caveat recorded: one cellzram lz4 `delete_return_kb` was negative
+  (-7852 in run3) -- the MemFree-delta column is noise-dominated.
+
+- **`tests/test_randio.c` has been written and compile-checked but NOT
+  yet run.** Pending.
+- **The distinct-data RAM phase has NOT produced output** (run3 aborted
+  before reaching it). Pending.
+- **The zero-page optimization is designed, not implemented.** Pending.
+
+### Implementation: the zero-page optimization (2026-10-09, same day)
+
+Landed the design from step 7 above. Three edits to `mm/cellzram.c`,
+one commit:
+
+1. `cellzram_page_all_zero()` -- word-at-a-time scan (512 compares on
+   x86_64), placed before the write path.
+2. `struct cellzram` gains `atomic64_t zero_blocks`, zeroed on reset.
+3. Early branch at the top of `cellzram_write_block()`, before the
+   compress+store+alloc: if the source page is all-zero, `xa_erase` the
+   slot, `cellzram_put_entry()` the old id (reusing the discard path's
+   exact protocol), `orig_bytes += PAGE_SIZE`, `zero_blocks++`, return.
+   No cell, no entry, no crypto.  Applies in raw (`none`) mode too.
+4. `mm_stat` emits a 7th field `zero_blocks` (mirrors zram's
+   `same_pages` so the head-to-head stays legible); appended at the end
+   so existing field positions are stable for parsers.
+
+**Result (fsdev gate, all asserts green, exit 0):**
+
+| metric (cellzram lz4, fs-metadata workload) | before | after |
+|---|--:|--:|
+| objects | 2061 | **13** |
+| entry_bytes | 148392 | **936** |
+| compr_bytes | 54118 | **870** |
+| zero_blocks | - | **2048** |
+
+The 2048 zero pages are now free storage.  Cross-validation: cellzram's
+`zero_blocks=2048` matches zram's `same_pages=2048` exactly, and 13
+surviving objects = 2061-2048 -- two independent implementations agree
+on precisely which pages are uniform-fill.  Accounting is consistent
+(orig_bytes unchanged at 8441856; only the stored representation
+collapsed).
+
+**But the headline RAM column did NOT flip, and the reason is the real
+finding.**  cellzram's `phys` is `262144` = exactly ONE 256 KiB cell
+(the `cell_order=6` default).  The 13 surviving real entries pin one
+cell, and that cell's allocation granularity now *dominates* the
+footprint: dev_ram 0.25 MB vs zram's 0.08 MB.  The optimization
+removed the dominant cost (2048 zero pages) and thereby *revealed the
+next bottleneck* -- cell-size granularity at tiny live sets.  This is
+a cell-order-vs-workload artifact, not a zero-page defect: with
+hundreds of real blocks the cell amortizes; with 13 it is 99% empty
+slack.  Options if the small-live-set case ever matters: a smaller
+`cell_order` module param for the device pools, or a tier-1 return of
+under-filled cells.  Not pursued -- the fs-metadata win the
+optimization was built for (2048 blocks) is real and landed; the
+residual is a different (pre-existing) tuning axis.
+
+**The distinct-data phase ran for the first time** (it was aborted in
+run3).  On 64 MiB of incompressible random blocks, no two alike:
+
+| device | algo | dev_ram | ram/orig |
+|---|---|--:|--:|
+| cellzram | lz4 | 65.1 MB | 101.8% |
+| zram | lz4 | 64.0 MB | 100.0% |
+| cellzram | zstd | 65.1 MB | 101.8% |
+| zram | zstd | 64.0 MB | 100.0% |
+
+This is the pure allocator comparison (no uniform-fill pages to catch):
+the **+1.8% is cellzram's per-block entry table** (16384 x 72 B =
+1.18 MB), the spec's known metadata risk now quantified for the first
+time.  zram stores incompressible pages as `huge_pages` (its last two
+mm_stat fields both read 16384) with no comparable per-page table tax
+beyond the page itself.  On incompressible data neither device saves
+RAM (expected -- there is nothing to compress); cellzram pays a small
+table premium over zram.  At 4 KiB blocks that is ~16 MiB per GiB
+written, matching the spec's risk row.
+
+### Next Steps
+
+1. ~~Implement the cellzram zero-page optimization~~ DONE (see above);
+   landed, gated green, `zero_blocks` in mm_stat.  Follow-on IF the
+   small-live-set case ever matters: cell_order tuning or tier-1
+   return of under-filled cells (the residual 0.25 MB floor is one
+   pinned 256 KiB cell, not a zero-page cost).
+2. **Run the randio gate** (`TEST_RANDIO=1`) -- written, never run.
+3. tmpfs zero-page probe: add a counter in the aging walk that
+   counts all-zero folios across the torture workloads; let the
+   measured rate decide whether the tmpfs un-materialize version is
+   worth its complexity.
+4. cellzram phase-3 hardening (spec risk table): bounded ENOMEM retry,
+   concurrent KASAN soak, swap slot-free -> discard path.
+5. Entry-table metadata (+1.8% on incompressible data, measured
+   above) is the spec's batched-entries v2 lever; still gated on its
+   design pass.
