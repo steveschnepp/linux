@@ -3369,3 +3369,73 @@ No new runs; all numbers cited come from:
 - Per-mount comp_stats readers: every "when" row above currently
   leans on global counters or dmesg attribution; per-mount would
   make the guidance operational rather than analytical.
+
+---
+
+## Session 20: the default flip (2026-10-09)
+
+### What We Did
+
+Landed plan step 5: the built-in default compress_watermark flipped
+0:0 (eager) ->50:70 (mm/shmem_compress.c static initializer; the
+sysfs knob initializes from it).  Explicit mount
+compress_watermark=0:0 still restores eager via watermark_seen, so
+the flip is opt-out, not mandatory.
+
+The flip's blast radius was the TEST SUITE, not the kernel: every
+mount without an explicit watermark now starts chill, which breaks
+any test asserting WRITE-TIME compression.  Policy: mechanism tests
+pin eager explicitly (9 test files + the fstools gate in init.sh +
+test_mount_sem's write-time case); the policy stays covered by the
+dedicated gates.  test_torture's classic rows deliberately keep NO
+watermark -- they follow the global default and thereby validate
+inheritance (engage=config(aged) auto-resolution;231/0).
+
+### What We Learned
+
+- The parallel-edit trap fired a THIRD time (edit + build in one
+  tool block; the rebuilt binary lacked the source's fix -- caught
+  this time in seconds by grepping the binary for the new string
+  before booting).  The rule is now reflex: any edit->build->run
+  chain is sequential, and binary provenance is verified BEFORE a
+ 10-min boot, not after a failure.
+- The engage auto-resolution design paid for itself at the flip:
+  config_engage() reading the global knob as fallback meant the
+  classic torture rows needed zero code changes to stay valid under
+  the new default -- and became inheritance tests for free.
+- Flipping a default is cheap in the kernel (a static initializer)
+  and expensive in the tests (10 files) -- the test suite had
+  encoded the default in23 mount option strings.  Worth
+  remembering: when a default lives implicitly in many call sites,
+  the explicit-pin convention for MECHANISM tests is what keeps the
+  default flippable later.
+
+### Test Results (all under the new default)
+
+- Full suite: exit0 (9 mount lines show inherited watermark=50:70)
+- test_watermark_policy:7/7 ALL PASSED
+- entry-race (QEMU_CPUS=4): 0 underflows, quiescent verify PASS,
+  stale_value_retries0
+- torture default boot:231 passed /0 failed (classic rows =
+  inheritance validation)
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem_compress.c` | built-in default wm_low/high =50/70 + rationale comment |
+| `~/tmpfs-compress-test/tests/*.c` (10 files) | mechanism tests pin compress_watermark=0:0 |
+| `~/tmpfs-compress-test/guest/init.sh` | fstools gate explicit eager |
+| `TMPFS_COMPRESSION_PLAN.md` | step-5 status; landing sequence complete |
+
+### Next Steps
+
+The plan's landing sequence is COMPLETE.  Standing items:
+- read-heavy re-compression thrash (gap#3) -- now the default path,
+  worth a dedicated gate before upstream posting
+- group-aware aging (zstd + large files only, per the guidance)
+- per-mount comp_stats readers (the guidance's ops story needs them)
+- upstream posting: tmpfs.rst, help-text wording, sysfs naming
+- re-run the policy matrix under the flipped default if any sweep
+  mixes explicit and inherited mounts (the wmsweep rows are all
+  explicit; classic rows now inherit)
