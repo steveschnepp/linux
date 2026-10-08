@@ -3145,3 +3145,40 @@ Remaining: step 4 (policy matrix on the torture sweep: never / 0:0 /
 then step 5 (default flip 0:0 -> 50:70 + suite + matrix re-run).
 Per-mount comp_stats readers become more valuable once mounts go chill
 by default.
+
+## Status (2026-10-08, later) -- step 4: policy matrix done
+
+Torture sweep x global watermark (init.sh test.wm= hook writes the
+sysfs default knob; the torture configs mount without compress_watermark=,
+so they inherit it). One boot per config, lz4_m1 rows (verify_MBps):
+
+| watermark | T=1     | T=64    | live comp T=64 | comp RAM T=64 |
+|-----------|---------|---------|----------------|---------------|
+| never     | 24.8    | 186.8   | 0              | 0 MB          |
+| eager 0:0 | 18.5    |  98.9   | 80314          | 166 MB        |
+| 50:70     | 24.7    | 188.4   | 298            | 1 MB          |
+| 50:100    | 24.7    | 195.3   | 240            | 1 MB          |
+| plain     | 26.2    | 178.0   | 0              | 0 MB          |
+
+- T=1 prediction CONFIRMED: chill recovers ~80% of the eager->plain
+  gap (24.7 vs 18.5 vs 26.2; plan predicted 26 vs 17.1 toward plain).
+- T=64: chill ~= plain and ~2x eager. Transient-heavy workloads pay
+  nothing for deferral -- pages that die before being read never pay a
+  compression cycle (the workload's own rm phase is the dominant
+  "reader").
+- RAM: the death-before-pop win quantified -- 166 MB live compression
+  RAM (eager) vs 1 MB (chill) at T=64. Ratio for the survivors stays
+  in the ~48% family (the live C/U gauge is bursty under chill: 36-61%
+  at busy instants).
+- 50:70 never flipped hot under this workload (live set << 70% of
+  size=1G): it behaves as pure deferral here. The flip path is covered
+  by test_watermark_policy, not by this workload.
+- Zero CRC/miss/ENOSPC/unexpected failures in all four boots; never's
+  negative invariant (no aging) held; engagement for chill asserted
+  per config via aged_pages (the per-POINT live-gauge check is wrong
+  for deferral -- transient data legitimately shows zero live
+  compressed pages at any sample instant; recorded as a gate-design
+  lesson).
+
+Step 5 (default flip 0:0 -> 50:70) is now unblocked. Per-mount
+comp_stats readers remain the standing carry-over.
