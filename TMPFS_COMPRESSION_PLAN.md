@@ -3182,3 +3182,40 @@ so they inherit it). One boot per config, lz4_m1 rows (verify_MBps):
 
 Step 5 (default flip 0:0 -> 50:70) is now unblocked. Per-mount
 comp_stats readers remain the standing carry-over.
+
+## Status (2026-10-08, later still) -- step 4 v2: one-boot matrix + the size axis
+
+Rebuilt the matrix after the observation that size= (not the
+watermark) is the axis that varies in the field AND the only axis
+that probes the hard-cap boundary.  compress_watermark= is a mount
+option, so the cross product (4 sizes x 4 watermarks) runs as
+per-mount rows in ONE torture boot --23 mounts per boot also
+re-exercises fill_sb/put_super including the Stage 2 teardown.
+
+The policy map (lz4_m1 rows, T=64, untar_fail):
+
+| size | never 100:100 | eager 0:0 | 50:70 | 50:100 |
+|------|---------------|-----------|-------|--------|
+| 192M | capacity death (all) | capacity death | capacity death after flip@91% | capacity death |
+| 384M | fail (9) | marginal (4) | **CLEAN, flip@89%,154 MB/s** | fail (9) |
+| 512M | ok | ok | clean, flip@75%,166 MB/s | ok |
+| 1G   | ok | ok | clean, no flip (31%),187 MB/s | ok |
+
+- The chill BACKLOG inflates usage past the naive peak: eager peak
+  live ~314 MB predicts flips only below ~450 MB, yet512M flips at
+  75% -- deferred-but-not-yet-aged pages charge full blocks.
+- At the384M capacity cliff the adaptive policy WINS: never/50:100
+  (no inline relief) fail, eager is marginal,50:70 flips hot and is
+  clean at1.5x eager throughput.  This is the strongest argument
+  for50:70 as the default: it degrades gracefully at the cliff and
+  behaves as pure deferral when there is headroom.
+-192M is below the workload's live set under ANY policy: deferral
+  cannot fix capacity, only CPU.
+- Instrumentation gap recorded: torture's enospc counter counts
+  mkdir() ENOSPC only; tar(1) write-path capacity deaths surface as
+  untar_fail>0 with enospc=0 (system() gives exit codes, not
+  errnos).  Documented in-code; a classification helper is a
+  follow-up.
+
+Step5 (default flip0:0 ->50:70) has now both the deferral matrix
+(1G) and the cliff matrix (384M/512M) backing it.
