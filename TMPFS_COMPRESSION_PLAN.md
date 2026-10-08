@@ -3334,3 +3334,31 @@ all GLOBAL counters; per-mount readers are the standing gap.
 Open before step 5 (default flip): read-heavy re-compression thrash
 (gap #3); group-aware aging if zstd+large-files becomes a target;
 per-mount stats readers.
+
+## Status (2026-10-09) -- step 5 DONE: default flipped to 50:70
+
+Commit: tmpfs: compression: default compress_watermark 0:0 -> 50:70.
+The built-in default (and the sysfs knob's initial value) is now
+50:70.  Explicit compress_watermark=0:0 on the mount restores eager
+(watermark_seen), 100:100 remains the never sentinel.
+
+Validation under the new default (all green):
+- full suite exit0; 9 mount lines inherit watermark=50:70
+- test_watermark_policy 7/7
+- entry-race gate clean (0 underflows, stale_value_retries0)
+- torture default boot 231/0 -- classic backend rows carry no
+  explicit watermark BY DESIGN and now validate default inheritance
+  (engage=config(aged) auto-resolution)
+
+Rig consequence: every MECHANISM test now pins
+compress_watermark=0:0 explicitly (they test the machinery, not the
+policy); the policy is covered by the dedicated gates.  One
+follow-up from the flip run: test_mount_sem's write-time case needed
+the explicit eager pin; its default-following cases already tracked
+the sysfs knob.
+
+The landing sequence (plan -> machinery -> policy gate -> matrices
+-> guidance -> default flip) is COMPLETE.  Remaining standing items
+(read-heavy re-compression thrash gap#3, group-aware aging for
+zstd+large files, per-mount comp_stats readers, upstream posting:
+tmpfs.rst docs, help-text wording, sysfs naming) are unchanged.
