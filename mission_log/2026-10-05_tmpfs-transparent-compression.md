@@ -2590,3 +2590,94 @@ companions first, cellzram hardening 1-3 as the parallel block-dev
 track, batched entries only once both are green and the design has
 been written down. Upstream posting (tmpfs.rst docs, help-text
 wording, sysfs-group naming) trails all of it.
+
+---
+
+## Session 2: C PID 1 supervisor + the POSIX_TIMERS gotcha (2026-10-08)
+
+### What We Did
+
+The rig's guest `/init` (a 9KB shell script) was redone as a split:
+
+1. `/init` is now a tiny static C program (`~/tmpfs-compress-test/tests/init.c`,
+   ~220 lines). It mounts `/proc`, parses `init.reboot=<seconds>` from the
+   kernel cmdline, forks `/init.sh` once, reaps every child attached to it
+   via a SIGCHLD handler, and calls `reboot(RB_AUTOBOOT)` as soon as the
+   MAIN script exits (stray grandchildren are reaped but never delay the
+   reboot) or when the `alarm()` watchdog fires.
+2. The old script moved to `initrd/init.sh` and lost its `reboot -f`/`sleep`
+   tails: it just prints everything and `exit ${TEST_EXIT}`. The
+   `Test exit code: N` contract that `run_qemu.sh` parses is unchanged.
+3. `run_qemu.sh` gained `INIT_REBOOT=<n>` (passes `init.reboot=<n>`) and a
+   watchdog-kill detection: a reboot before tests finish exits 125 instead
+   of masquerading as success.
+
+Design evolution during the session: first cut was a sigtimedwait reap
+loop; simplified to the user's suggestion -- install handlers, `pause()`,
+reboot from the SIGCHLD handler when the main child's pid is reaped.
+Handler code only uses async-signal-safe calls (write/waitpid/sync/reboot);
+SIGCHLD is blocked across fork() so no exit slips past the
+fork-returns/main_pid-set window (the mask survives execve, so the child
+unblocks it before execl).
+
+### What We Learned
+
+- **The killer finding: this tinyconfig kernel has `CONFIG_POSIX_TIMERS`
+  off.** tinyconfig runs with EXPERT=y, which exposes POSIX_TIMERS as an
+  opt-out; without it the kernel links `kernel/time/posix-stubs.o` and
+  `alarm()`/`setitimer()`/`nanosleep()` silently do nothing. Symptoms were
+  bizarre until the config was checked: the `init.reboot=N` watchdog armed
+  ("watchdog armed: reboot in 3 s") but never fired across three boots, and
+  a `sleep 30` init.sh "exited with code 0" within 3 seconds. **Never blame
+  your C code for a silent timer twice -- check CONFIG_POSIX_TIMERS first.**
+- `kernel/time/Makefile` in this tree builds `hrtimer.o` as `obj-y`
+  (HIGH_RES_TIMERS only upgrades precision), so enabling POSIX_TIMERS has
+  no HRT dependency and is safe on the tick. Fixed in the rig's
+  `scripts/build_kernel.sh` (`--enable CONFIG_POSIX_TIMERS`).
+- PID 1 signal rules: the kernel drops default-disposition signals sent to
+  the unkillable init, but signals WITH an installed handler are delivered
+  normally (the SIGNAL_UNKILLABLE drop in `get_signal()` only applies to
+  the default-action path -- see kernel/signal.c around line 3037).
+- `/proc/cmdline` ends with `\n`: a parser that requires the token to be
+  followed by `\0` or space silently rejects the last (or only) parameter.
+  This exact bug made `init.reboot=5` never parse while `init.reboot=3`
+  with a trailing token did -- watch for `\n`, `\t` in cmdline parsers.
+- Serial interleaving is normal: kernel printks and PID 1's untimestamped
+  printf share the console, so lines like "init: launched /  with
+  arguments:" are two writers crossing mid-line, not corruption.
+- `run_qemu.sh` exit-code contract: guest result = last
+  "Test exit code: N" in the serial log; watchdog kill = 125; QEMU
+  `-no-reboot` exit = pass-through.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/tests/init.c` | new PID 1 supervisor (reap + watchdog) |
+| `~/tmpfs-compress-test/initrd/init.sh` | old init script, now a supervised child; reboot/sleep tails removed |
+| `~/tmpfs-compress-test/initrd/init` | now the compiled static supervisor binary |
+| `~/tmpfs-compress-test/scripts/build_kernel.sh` | `--enable CONFIG_POSIX_TIMERS` (watchdog + guest sleep need it) |
+| `~/tmpfs-compress-test/scripts/build_initrd.sh` | old sh-heredoc fallback removed; builds/validates C init + init.sh |
+| `~/tmpfs-compress-test/scripts/build_tests.sh` | builds tests/init.c -> initrd/init |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | INIT_REBOOT passthrough; watchdog kill -> exit 125 |
+| `~/tmpfs-compress-test/README.md` | init/init.sh split documented |
+
+### Test Results
+
+- Normal path: `TEST_MERGE=1` sweep boot -> "init: /init.sh exited: exit
+  code 0" -> RB_AUTOBOOT -> QEMU exits -> run_qemu propagates 0.
+- Watchdog path: `INIT_REBOOT=3` with the full suite -> "init: watchdog
+  armed: reboot in 3 s" then "init: watchdog expired ... -- rebooting"
+  mid-suite -> QEMU exits -> run_qemu exits 125.
+- Isolation trick that found it: swapped init.sh for `sleep 30` only; its
+  instant "exit code 0" proved guest nanosleep was dead too, which pointed
+  at the kernel config rather than the supervisor.
+
+### Next Steps
+
+- Consider re-adding `sleep 1` in init.sh before exit now that
+  nanosleep works again (probably unnecessary; the supervisor reboots
+  immediately).
+- If the rig kernel config is ever regenerated from scratch, POSIX_TIMERS
+  must be re-enabled or both the watchdog and guest sleeps break again
+  silently.
