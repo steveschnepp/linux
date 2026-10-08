@@ -3811,3 +3811,218 @@ written, matching the spec's risk row.
 5. Entry-table metadata (+1.8% on incompressible data, measured
    above) is the spec's batched-entries v2 lever; still gated on its
    design pass.
+
+---
+
+## Session 22: the randio gate finds a real cellzram bug -- the 256-cell directory cap (2026-10-09)
+
+### What We Did
+
+Ran the new `test_randio` gate (session 21, written but never run) and
+it failed on cellzram while zram passed the identical workload.  Spent
+the session driving the failure to a confirmed root cause, using the
+A/B + trace discipline accumulated over the project.  The bug is
+pre-existing (NOT the zero-page commit) and is a genuine capacity bug
+in the cell allocator.
+
+1. **The failure.**  `TEST_RANDIO=1`: cellzram raw O_DIRECT phase
+   passes clean (16384 written, bad=0, rderr=0), then the ext4 file
+   phase dies with `BLK_STS_IOERR` on writes (blk status 10), ext4
+   "I/O error while writing superblock", ~2500 bad blocks on readback.
+   zram: 0 bad, both phases.  Exit 1.
+
+2. **A/B against the pre-change kernel** (session 9's gate rule, applied
+   before touching my own diff): built `be3f32e6acc4` (pre-zero-page)
+   in a throwaway `git worktree` + ccache, ran the same gate.  **Same
+   failure, same shape** -- cellzram fs phase fails (2503 bad, 64 I/O
+   errors), zram passes.  Verdict: pre-existing, not a regression from
+   the zero-page optimization.  (Which makes sense: that change only
+   *reduces* cell demand and never touches cell allocation.)
+
+3. **Two wrong theories, killed by measurement.**
+   - *Order-6 fragmentation*: hypothesized the `cell_order=6` (256 KiB)
+     contiguous `alloc_pages` fails under fs-workload memory churn
+     where zram's page-granular zsmalloc does not.  Tested by adding a
+     `TEST_CELLORDER=2` cmdline passthrough (`cellzram.cell_order=`).
+     **Refuted**: IOERR count identical (64) at order-2 and order-6.
+     (Also noted: at order-2 the *raw* phase degraded to written=1024
+     with a `clocksource ... read timed out`, so order-2 has its own
+     problem -- not a clean comparison.)
+   - Stopped guessing after two misses; switched to instrumentation.
+
+4. **The trace named it** (session-2 methodology: pr_err on each
+   failure path -> one build cycle -> the culprit).  Added a distinct
+   `pr_err` to all three ENOMEM paths in `cellzram_write_block` (bounce
+   kmalloc / shmem_comp_store / entry_alloc).  Result: **every failure
+   is `FAIL=comp_store len=4096`** -- `shmem_comp_store` returning 0 for
+   a *full 4096-byte* block (the randio test writes xorshift-random
+   data, so lz4 cannot shrink it -> `-ENOSPC` -> stored raw at exactly
+   PAGE_SIZE).  Instrumentation removed after; tree back to committed
+   state (empty diff verified).
+
+5. **Root cause: the 256-cell directory cap.**  Following the chain:
+   `shmem_comp_store` -> `cell_store` (pool->use_cells) ->
+   `cell_make_active` returning NULL.  `cell_make_active`
+   (cell_store.c:133) returns NULL when either the `alloc_pages` fails
+   OR **no free directory slot exists** (`for slot < max_cells`).  And
+   `max_cells` is **hardcoded to 256** in `cell_pool_create`
+   (cell_store.c:53) -- it is NOT sized from `disksize` or from the
+   amount of data the device is asked to hold.
+
+   The arithmetic seals it: capacity = `max_cells` x cell_size =
+   256 x (1<<cell_order) x 4 KiB.
+   - order-6: 256 x 256 KiB = **64 MiB**; the fs phase writes 16384 x
+     4 KiB = 64 MiB of incompressible data -> exactly fills the
+     directory -> the next `cell_make_active` finds no slot -> NULL ->
+     ENOMEM -> IOERR.
+   - order-2 (the "refutation" run, re-read): the raw phase stopped at
+     **written=1024 = 4 MiB = 256 x 16 KiB** -- again exactly 256
+     cells.  Both orders independently hit the same 256-cell wall.
+     That cross-order identity is what proves the directory cap (not
+     fragmentation, which would not scale with cell size this way).
+
+   Root cause CONFIRMED: **cellzram silently caps physical storage at
+   `max_cells(256) x cell_size` regardless of `disksize`; a workload
+   storing more incompressible data than that gets BLK_STS_IOERR on
+   writes.**  The device advertised disksize=256M but can only hold 64
+   MiB at the default cell_order=6.
+
+6. **Why the other gates never caught it.**  The fs-farm gate (session
+   21) untars the munin tree -- highly compressible, so the *stored*
+   footprint is tiny and never approaches 64 MiB.  test_cellzram
+   (session 5) round-trips a few MiB.  Only the randio gate's
+   64 MiB of *incompressible* data reaches the cap.  This is exactly
+   the "import an independent oracle" lesson: a new workload class
+   (random/incompressible at scale) found a bug every prior workload
+   missed.
+
+### What We Learned
+
+#### Technical
+
+- **`max_cells` is a fixed 256, not derived from disksize.**  The cell
+  pool directory is a statically-allocated array of 256 slots
+  (`cell_pool_create`), so the *physical* capacity of any cell-backed
+  store is `256 x cell_size`, independent of the logical `disksize`.
+  For tmpfs this never surfaced (mounts hold compressible page cache,
+  and the shrinker/GC + size= accounting bound it); for a block device
+  that promises 256 MiB and must store incompressible sectors, it is a
+  hard, silent wall.
+
+- **The failure is deterministic, not pressure.**  The tell I nearly
+  missed: the IOERR count was EXACTLY 64 every run, across cell_order
+  values.  Random ENOMEM under memory pressure varies run to run; an
+  exact reproducible count is the signature of a *capacity* limit.  If
+  a "memory" failure is suspiciously deterministic, suspect a fixed
+  array/counter, not the allocator.
+
+- **Cross-order identity localizes a cap.**  That order-2 stopped at
+  exactly 256 x 16 KiB and order-6 at exactly 256 x 256 KiB is what
+  turned "it fails" into "the directory is 256 slots."  When a limit
+  changes proportionally with a sizing parameter, the parameter *is*
+  the limit.
+
+- **Incompressible-at-scale is a distinct workload class.**  Compressed
+  storage bugs live in the ratio; capacity bugs live in the
+  incompressible tail (lz4 `-ENOSPC` -> raw store at full PAGE_SIZE).
+  A test suite that only feeds compressible data cannot find the
+  second kind.
+
+- **`-ENOSPC` -> raw-at-PAGE_SIZE is the path that hits the cap.**
+  Every `FAIL=comp_store len=4096` was a block lz4 could not shrink.
+  Compressed blocks (len < 4096) amortize the directory far better;
+  the raw path is what races to 256 cells.
+
+#### Process
+
+- **Gate A/B before blaming the diff -- again paid off.**  Without the
+  `be3f32e6acc4` baseline I would have hunted my own zero-page commit
+  for a bug that predates it by a day.  The worktree+ccache baseline
+  cost ~3 minutes.
+
+- **Two wrong theories then instrumentation.**  I theorized dedup
+  (session 21, wrong), then order-6 fragmentation (wrong), before
+  reverting to the pr_err trace that named the function in ONE build
+  cycle.  The lesson from session 2 applies to myself: stop theorizing
+  after a miss or two and instrument.
+
+- **A negative result ("lowering cell_order did not fix it") still
+  carries the answer if you re-read it.**  I initially read the order-2
+  run as a pure refutation; only on review did written=1024 = 4 MiB =
+  256 cells jump out as *positive* evidence for the directory cap.
+  Re-read failed experiments for the shape of the truth, not just
+  pass/fail.
+
+### What We Decided
+
+- **This is a REAL pre-existing cellzram bug, confirmed, to fix.**  Not
+  a test bug, not memory pressure, not the zero-page commit.  The fix
+  direction (NOT yet implemented): size `max_cells` from the device's
+  required capacity (`disksize / cell_size`, with headroom), or make
+  the directory grow dynamically.  The cleanest is to pass a cell
+  count hint into `cell_pool_create` from cellzram's disksize-set path
+  (tmpfs pools keep a bounded default).
+
+- **The randio gate stays red until fixed** -- it is correctly reporting
+  a capacity bug, so "fix the test to pass" would be wrong.  Recorded
+  as a known-open failure with a confirmed root cause.
+
+### Rules Added
+
+- **Deterministic "memory" failures are capacity bugs.**  An exact,
+  reproducible failure count under a nominal OOM points at a fixed
+  array/counter/limit, not the page allocator.  Check sizing
+  parameters before theorizing about pressure.
+
+- **Cross-parameter identity localizes the cap.**  If the failure point
+  scales exactly proportionally with a sizing knob (cell order, block
+  size), that knob multiplied by a constant IS the limit.
+
+- **Incompressible-at-scale is a required test class** for any
+  compressed store.  Feed random data at the device's advertised
+  capacity, not just compressible datasets, or capacity walls stay
+  invisible.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | +TEST_CELLORDER= -> cellzram.cell_order= cmdline passthrough (the A/B instrument) |
+| `/home/snide/linux/mm/cellzram.c` | (instrumented then reverted; empty diff) DBGCELL pr_errs named comp_store, then removed |
+| `/home/snide/linux/mm/cell_store.c` | (read-only) root cause: max_cells=256 hardcoded at cell_pool_create |
+
+### Test Results
+
+- **randio gate, cellzram: FAIL (real bug).**  Raw phase 16384 written,
+  bad=0.  fs phase: ~2500 bad blocks, 64 I/O errors, BLK_STS_IOERR on
+  writes, ext4 superblock write error.  zram identical workload: PASS,
+  0 bad, both phases.
+- **A/B baseline (be3f32e6acc4, pre-zero-page): identical failure** --
+  cellzram fs phase 2503 bad / 64 errors, zram clean.  Confirms
+  pre-existing.
+- **DBGCELL trace: 100% `FAIL=comp_store len=4096`** across all
+  failures; zero cbuf_kmalloc, zero entry_alloc.
+- **Capacity math confirmed at two orders**: order-6 raw+fs reaches
+  64 MiB = 256 x 256 KiB; order-2 raw stops at 4 MiB = 256 x 16 KiB.
+  Both = exactly max_cells(256) x cell_size.
+- fsdev/fstrim gate (same session, after zero-page): **exit 0**, fstrim
+  verified working on both devices (259,993,600 B trimmed each), all
+  CRC pass.  The zero-page optimization and fstrim are green; the
+  randio failure is orthogonal and older.
+
+### Next Steps
+
+1. **Fix the 256-cell cap**: pass a cell-count hint (disksize/cell_size
+   + headroom) into `cell_pool_create` from cellzram's disksize-set
+   path, OR grow the directory dynamically.  tmpfs pools keep a bounded
+   default so their memory cost does not change.  Re-run the randio
+   gate (cellzram fs phase must go green, zram unchanged).
+2. **Decide the tmpfs side**: does a large tmpfs cell= mount hit the
+   same 256-cell wall?  Likely not (compressible + size= accounting),
+   but a targeted test (big incompressible file on a cell= tmpfs) would
+   confirm the blast radius before the fix.
+3. Re-verify the distinct-data phase (session 21) under the fix -- the
+   64 MiB incompressible set is *exactly* the cap, so it likely
+   under-counted cellzram's true cost by failing to store everything.
+4. The randio gate should join the standing per-commit rotation once
+   green (it is the only gate feeding incompressible-at-capacity data).
