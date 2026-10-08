@@ -2765,3 +2765,109 @@ watchdog kill mid-suite -> run_qemu exit 125.
 - `setup_test_env.sh` still hardcodes the rig path like everything
   else; a REPO="$(cd "$(dirname "$0")/.." && pwd)" sweep across the
   scripts would make the repo relocatable.
+
+---
+
+## Session 14: Stage 2 machinery completed and gated (2026-10-08)
+
+### What We Did
+
+Finished Stage 2 (walk-based aging / death-before-pop) from the
+half-done working tree (+408 uncommitted lines) to a landed, gated
+kernel commit `c893c70b4ba8`, following the plan's landing sequence
+(steps 2+3; the default stays 0:0 until the matrix validates 50:70).
+
+What the WIP already had (read before writing a line -- it was ~90%):
+struct fields, mounts list + mutex, fill_sb/put_super skeleton,
+hot-flag consult, arm_aging, note_unmap, comp_stats lines, gc_now
+extension, the compress_one(allow_clean) refactor, and a single-round
+maintain walk.
+
+What was missing, and what I added:
+
+1. **Rounds + re-arm.** The WIP aged 128 pages once per trigger. The
+   plan calls for up to 4 rounds x 128 pages with a cell-GC batch per
+   round (~4:1 aging:GC), and re-arming the delayed work when the last
+   round hit its budget. Extracted the walk into
+   shmem_comp_age_round() (re-walks per round; already-compressed
+   pages are xarray values, skipped cheaply).
+2. **Teardown order amended.** The WIP's "cancel_sync before list_del"
+   is safe only because nothing re-armed. With re-arm, a concurrent
+   gc_now/pressure pass could re-arm a comp that put_super is about to
+   free: cancel returns, list_del, kfree, then the re-armed work fires
+   on freed memory. Fix: delist under the mutex FIRST, cancel outside
+   the mutex after (the work takes the mutex, so holding it across the
+   cancel would deadlock).
+3. **Shrinker trigger.** The plan's "triggered by the shrinker" became
+   shmem_comp_pressure_work: the shrinker only schedules (atomic-safe,
+   coalescing); passes run in kworker context where GFP_KERNEL is
+   honest -- the recorded deviation, and now the code comment says so.
+   It arms ALL compressed mounts; the per-pass budget bounds the cost.
+4. **The gate**: tests/test_watermark_policy.c + init.sh
+   test.watermark=1 + run_qemu TEST_WATERMARK=1.
+
+### What We Learned
+
+- Reading the existing WIP before planning saved the session: the
+  diff answered most design questions (locking contract, teardown
+  rationale, walk structure) that would otherwise have been re-derived
+  from the plan text -- and the plan-vs-WIP delta (re-arm, rounds,
+  shrinker) fell out precisely because both were fresh.
+- The re-arm race is the classic delayed_work teardown trap: "cancel
+  then free" is only correct if NOBODY can re-schedule after your last
+  check. Delist-then-cancel is the standard shape when a work item can
+  re-arm itself or its siblings.
+- Test-writing trap (caught by re-reading the draft before building):
+  verify_pages() initially memcmp'd its read buffer against ITSELF --
+  always equal. A verification helper that cannot fail is worse than
+  none; the two-buffer (got/want) rewrite is the pattern.
+- ENOENT on mount() in the guest means the MOUNTPOINT is missing, not
+  the filesystem type: gates must mkdir their mountpoints (the fstools
+  gate learned this in session 11; test_watermark_policy now mkdirs in
+  try_mount() to be self-contained).
+- gc_now running maintain() synchronously inside the sysfs write makes
+  the test deterministic WITHOUT polling: stat deltas measured around
+  one write(2) are exact, provided the 1s armed work cannot interleave
+  -- measurement windows of microseconds against a 1s delay.
+- Hysteresis flips are observable in TWO independent ways, which
+  cross-validate: dmesg pr_info ("compression hot (usage 72%)") and
+  behavior (inline compression resuming). The gate asserts behavior;
+  the log line is free corroboration.
+- The off-n build gate (CONFIG_TMPFS_COMPRESSION=n) keeps earning its
+  keep: shmem.c hooks are ifdef'd, and one mechanical mistake there
+  breaks every non-compression config -- cheap to check, expensive to
+  discover downstream.
+
+### Test Results
+
+- test_watermark_policy: 7/7 PASS (chill writes uncompressed; gc_now
+  aged delta >= 32; aged data round-trips; skipped_dead >= 16;
+  sub-threshold pages aged despite threshold=1M; hot flip at 72%
+  resumes inline compression; chill flip resumes skipped_dead).
+- Entry-race gate (QEMU_CPUS=4): 0 underflows, stale_value_retries 0,
+  quiescent verify PASS, exit 0.
+- Default suite: exit 0 -- eager 0:0 behavior unchanged as designed.
+- dmesg flips: "compression hot (usage 72%)" / "compression chill
+  (usage 0%)" x2.
+- CONFIG_TMPFS_COMPRESSION=n off-gate build: clean.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem_compress.c` | rounds/re-arm in maintain, age_round helper, pressure work, teardown reorder |
+| `mm/shmem.c`, `include/linux/shmem_compress.h` | (from WIP) hooks + fill_sb(sb) signature |
+| `TMPFS_COMPRESSION_PLAN.md` | Status 2026-10-08: steps 2+3 landed |
+| `~/tmpfs-compress-test/tests/test_watermark_policy.c` | the policy gate |
+| `~/tmpfs-compress-test/guest/init.sh` | test.watermark=1 isolation gate |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_WATERMARK passthrough |
+
+### Next Steps
+
+- Step 4: policy matrix on the torture sweep -- never / 0:0 / 50:70 /
+  50:100 vs the session-7 eager numbers (T=1 throughput, survivor
+  ratio, Shmem overshoot, stale_value_retries).
+- Step 5: default flip 0:0 -> 50:70 + suite + matrix re-run.
+- Per-mount comp_stats readers (standing gap) matter more once mounts
+  are chill by default; the matrix currently works around this with
+  global deltas and one mount per boot.
