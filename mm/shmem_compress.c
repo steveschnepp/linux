@@ -1586,8 +1586,26 @@ static DEFINE_MUTEX(shmem_comp_defaults_lock);
 static bool shmem_comp_default_enabled;
 static char *shmem_comp_default_compressor;
 static unsigned int shmem_comp_default_merge = 1;
-static unsigned int shmem_comp_default_wm_low;	/* built-in default 0:0 = eager */
-static unsigned int shmem_comp_default_wm_high;
+static unsigned int shmem_comp_default_wm_low = 50;	/* Stage 5 flip
+							 * (2026-10-08): built-in
+							 * default 50:70 -- chill
+							 * below 50% usage, hot at
+							 * or above 70%, hysteresis
+							 * band between.  Measured
+							 * rationale in
+							 * TMPFS_COMPRESSION_PLAN.md
+							 * "Configuration guidance":
+							 * free at low concurrency,
+							 * ~2x eager at high, 1MB vs
+							 * 166MB live compression RAM
+							 * on transient workloads,
+							 * and the only policy that
+							 * relieves inline at the
+							 * capacity cliff.  Explicit
+							 * compress_watermark=0:0 on
+							 * the mount restores eager
+							 * (watermark_seen). */
+static unsigned int shmem_comp_default_wm_high = 70;
 
 static const char *shmem_comp_off_reason_str(enum shmem_comp_off_reason reason)
 {
