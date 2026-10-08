@@ -3100,3 +3100,48 @@ TEST_ENTRYRACE=1 QEMU_CPUS=4 -- 0 underflows, quiescent verify
 POSIX truncate-vs-read TOCTOU, not corruption; the verdict is the
 quiescent verify (mission log session 10 has the full story).
 Stage 2 (machinery + default flip to 50:70) is next.
+
+## Status (2026-10-08) -- Stage 2 machinery landed (steps 2+3)
+
+Machinery (landing step 2) is complete and rig-validated; the built-in
+default STAYS 0:0 (step 5 pending, gated on the policy matrix):
+
+- hot flag consulted on the write path (single READ_ONCE); eager 0:0
+  mounts start hot, any positive HIGH starts chill
+- shmem_comp_arm_aging() from the write_end else-branch; no-op on
+  uncompressed mounts, coalescing schedule otherwise
+- shmem_comp_maintain(): hysteresis flip (pr_info once per flip), then
+  up to SHMEM_COMP_AGE_MAX_ROUNDS (4) rounds x 128 pages of walk-aging
+  (single-page entries, threshold ignored -- grate #2 dissolved), one
+  cell-GC batch per round (~4:1 alternation); RE-ARMS the delayed work
+  when the last round hit its budget
+- triggers: armed delayed_work (1 s), gc_now (synchronous pass per
+  mount), shrinker via the ASYNC shmem_comp_pressure_work (recorded
+  deviation from "triggered by the shrinker": the shrinker only
+  schedules; passes run in kworker context where GFP_KERNEL is honest;
+  it arms ALL compressed mounts, per-pass budget bounds the cost)
+- skipped_dead counted per full uncompressed-folio removal while chilled
+  (both shmem_undo_range loops; partial large-folio truncates are not
+  deaths)
+- teardown ORDER AMENDED vs the plan sketch: delist under the mounts
+  mutex BEFORE cancel_delayed_work_sync(). The original cancel-first
+  order races the re-arm: a concurrent gc_now/pressure pass could
+  re-arm a comp that put_super is about to free.
+- comp_stats gained aged_pages + skipped_dead (global sums; per-mount
+  readers remain the standing gap)
+
+Gate (landing step 3): tests/test_watermark_policy.c, guest/init.sh
+gate test.watermark=1, run_qemu.sh TEST_WATERMARK=1. 7/7 PASS:
+chill writes land uncompressed; gc_now ages them and data round-trips
+through decompress; unlink counts skipped_dead; eager sub-threshold
+pages age despite threshold=1M; 50:70 flips hot at 72% usage (inline
+compression resumes, pr_info in dmesg) and back to chill at 0%.
+Entry-race gate clean (0 underflows, stale_value_retries 0, quiescent
+verify 12/12). Default suite exit 0 (eager behavior unchanged).
+CONFIG_TMPFS_COMPRESSION=n off-gate build clean.
+
+Remaining: step 4 (policy matrix on the torture sweep: never / 0:0 /
+50:70 / 50:100 vs session-7 eager numbers; watch stale_value_retries),
+then step 5 (default flip 0:0 -> 50:70 + suite + matrix re-run).
+Per-mount comp_stats readers become more valuable once mounts go chill
+by default.

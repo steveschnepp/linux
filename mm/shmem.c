@@ -1198,8 +1198,13 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 				continue;
 			}
 
-			if (!unfalloc || !folio_test_uptodate(folio))
+			if (!unfalloc || !folio_test_uptodate(folio)) {
+#ifdef CONFIG_TMPFS_COMPRESSION
+				/* full removal of an uncompressed folio */
+				shmem_comp_note_unmap(inode);
+#endif
 				truncate_inode_folio(mapping, folio);
+			}
 			folio_unlock(folio);
 		}
 		folio_batch_remove_exceptionals(&fbatch);
@@ -1303,6 +1308,10 @@ whole_folios:
 						folio);
 
 				if (!folio_test_large(folio)) {
+#ifdef CONFIG_TMPFS_COMPRESSION
+					/* full removal of an uncompressed folio */
+					shmem_comp_note_unmap(inode);
+#endif
 					truncate_inode_folio(mapping, folio);
 				} else if (truncate_inode_partial_folio(folio, lstart, lend)) {
 					/*
@@ -3378,9 +3387,16 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	 * Compression runs after folio_unlock: shmem_compress_folio()
 	 * takes the lock itself and folio_lock() is not recursive.
 	 * The caller's reference keeps the folio alive.
+	 *
+	 * Stage 2: when the write does NOT compress inline (chill mode,
+	 * or a sub-threshold write in hot mode), arm the mount's aging
+	 * pass -- the page it left behind is a survivor the maintenance
+	 * pass may compress later (death-before-pop).
 	 */
 	if (shmem_comp_should_compress(inode))
 		shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
+	else
+		shmem_comp_arm_aging(inode);
 #endif
 
 	folio_put(folio);
@@ -5221,7 +5237,7 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 
 #ifdef CONFIG_TMPFS_COMPRESSION
 	/* Compression state for this mount is owned by mm/shmem_compress.c */
-	error = shmem_comp_fill_sb(sbinfo, &ctx->comp_opts,
+	error = shmem_comp_fill_sb(sb, sbinfo, &ctx->comp_opts,
 				   (ctx->blocks ?:
 				    shmem_default_max_blocks()) << PAGE_SHIFT);
 	if (error)

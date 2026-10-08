@@ -79,10 +79,14 @@
 #include <linux/zsmalloc.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/workqueue.h>
+#include <linux/rwsem.h>
+#include <linux/pagemap.h>
 #include <crypto/acompress.h>
 #include <linux/shmem_compress.h>
 #include <linux/shmem_fs.h>
 #include <linux/cell_store.h>
+#include "internal.h"	/* find_get_entries() */
 
 #define cell_dbg(fmt, ...) \
 	pr_debug("shmem_comp: " fmt "\n", ##__VA_ARGS__)
@@ -93,6 +97,10 @@ static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
 					   struct shrink_control *sc);
 static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
 					  struct shrink_control *sc);
+
+/* Stage 2: walk-based aging (deferred compression) */
+static void shmem_comp_maintain(struct shmem_comp_sb *comp);
+static void shmem_comp_age_work(struct work_struct *work);
 
 /*
  * Per-CPU compression context.
@@ -128,6 +136,11 @@ struct shmem_comp_pcpu {
  * Per-mount compression state. Created by shmem_comp_fill_sb(), freed
  * by shmem_comp_put_super(); reachable from mm/shmem.c only through
  * the opaque pointer shmem_sb_info.comp.
+ *
+ * Stage 2 (walk-based aging) adds the deferred-compression policy
+ * state: a hot/chill mode flag read on the write path, and a periodic
+ * maintenance pass that ages eligible survivors. See
+ * TMPFS_COMPRESSION_PLAN.md "Stage 2 machinery".
  */
 struct shmem_comp_sb {
 	bool enabled;
@@ -140,6 +153,14 @@ struct shmem_comp_sb {
 	struct shmem_comp_pool *pool;	/* compression pool */
 	atomic_long_t pages;		/* compressed pages (this mount) */
 	atomic_long_t bytes;		/* compressed bytes stored (this mount) */
+	/* Stage 2: deferred-compression policy state */
+	struct super_block *sb;		/* owning sb (inode walk, usage, s_umount) */
+	bool hot;			/* mode flag: WRITE_ONCE in maintain,
+					 * READ_ONCE on the write path */
+	struct delayed_work age_work;	/* per-mount maintenance pass */
+	struct list_head list;		/* on shmem_comp_mounts */
+	atomic_long_t aged_pages;	/* pages compressed by the aging pass */
+	atomic_long_t skipped_dead;	/* chilled pages freed without compression */
 };
 
 struct shmem_comp_pool {
@@ -161,6 +182,38 @@ static LIST_HEAD(shmem_comp_pools);
 static DEFINE_SPINLOCK(shmem_comp_pools_lock);
 /* Counter for generating unique pool names */
 static atomic_t shmem_comp_pools_count = ATOMIC_INIT(0);
+
+/*
+ * Global list of compressed mounts (struct shmem_comp_sb.list), used by
+ * gc_now to run a maintenance pass on every participating mount. A
+ * MUTEX (not a spinlock): shmem_comp_maintain() sleeps (crypto, page
+ * cache walks). Taken by the aging work, gc_now, and put_super -- never
+ * by a shrinker or any reclaim path, so holding it across a GFP_KERNEL
+ * allocation inside maintain() cannot deadlock against reclaim.
+ */
+static LIST_HEAD(shmem_comp_mounts);
+static DEFINE_MUTEX(shmem_comp_mounts_lock);
+
+/*
+ * Async shrinker trigger (see shmem_comp_pressure_pass definition for
+ * the why).
+ */
+static void shmem_comp_pressure_pass(struct work_struct *work);
+static DECLARE_WORK(shmem_comp_pressure_work, shmem_comp_pressure_pass);
+
+/* Global tallies for the aging policy (comp_stats output) */
+static atomic_long_t shmem_comp_aged_pages;
+static atomic_long_t shmem_comp_skipped_dead;
+
+/*
+ * Aging-pass tuning. The budget bounds the crypto work per maintenance
+ * pass so a mount full of incompressible data cannot monopolize the
+ * CPU; the batch bounds how many inodes are pinned at once.
+ */
+#define SHMEM_COMP_AGE_BUDGET		128U	/* pages per round */
+#define SHMEM_COMP_AGE_BATCH_INODES	64U	/* inodes pinned per pass */
+#define SHMEM_COMP_AGE_DELAY_MS		1000U	/* armed-work delay */
+#define SHMEM_COMP_AGE_MAX_ROUNDS	4U	/* rounds per pass (~2 MiB) */
 
 /* Global statistics */
 static struct shmem_comp_stats shmem_comp_global_stats = {
@@ -1255,6 +1308,13 @@ static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
 	if (!(sc->gfp_mask & __GFP_DIRECT_RECLAIM))
 		return SHRINK_STOP;
 
+	/*
+	 * Stage 2: reclaim pressure triggers aging asynchronously --
+	 * scheduling is atomic-safe and coalescing, the actual passes
+	 * run later in kworker context (see shmem_comp_pressure_pass).
+	 */
+	schedule_work(&shmem_comp_pressure_work);
+
 	/* One pass per scan invocation; the shrinker re-invokes if
 	 * more sparse cells remain.  "Objects" are sparse cells. */
 	mutex_lock(&cp->gc_lock);
@@ -1722,7 +1782,8 @@ static inline struct shmem_sb_info *shmem_comp_get_sb(struct super_block *sb)
  * off without the WHAT layer. After fill_sb() the sysfs globals are
  * never read again for this mount.
  */
-int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
+int shmem_comp_fill_sb(struct super_block *sb,
+		       struct shmem_sb_info *sbinfo,
 		       struct shmem_comp_opts *opts,
 		       unsigned long tmpfs_bytes)
 {
@@ -1830,6 +1891,20 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
 		      (shmem_comp_default_merge_get() ?: 1);
 	atomic_long_set(&comp->pages, 0);
 	atomic_long_set(&comp->bytes, 0);
+	/* Stage 2: deferred-compression policy state */
+	comp->sb = sb;
+	/*
+	 * Initial mode: eager (0:0) mounts start hot so today's inline
+	 * behavior is unchanged. Any positive HIGH watermark starts chill
+	 * (usage at mount is 0) -- the first maintenance pass flips it.
+	 */
+	comp->hot = (wm_high == 0);
+	INIT_DELAYED_WORK(&comp->age_work, shmem_comp_age_work);
+	atomic_long_set(&comp->aged_pages, 0);
+	atomic_long_set(&comp->skipped_dead, 0);
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_add(&comp->list, &shmem_comp_mounts);
+	mutex_unlock(&shmem_comp_mounts_lock);
 	sbinfo->comp = comp;
 
 	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u "
@@ -1849,21 +1924,96 @@ int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
  */
 void shmem_comp_put_super(struct shmem_sb_info *sbinfo)
 {
-	if (sbinfo->comp) {
-		if (sbinfo->comp->pool)
-			shmem_comp_pool_put(sbinfo->comp->pool);
-		kfree(sbinfo->comp->compressor);
-		kfree(sbinfo->comp);
-		sbinfo->comp = NULL;
-	}
+	struct shmem_comp_sb *comp = sbinfo->comp;
+
+	if (!comp)
+		return;
+
+	/*
+	 * Stage 2 teardown ordering, revised for the re-arm race.  The
+	 * maintain pass RE-ARMS age_work when its budget is exhausted,
+	 * so "cancel first, delist later" would leave a window where a
+	 * concurrent gc_now/pressure pass re-arms a comp that put_super
+	 * is about to free (cancel returns, list_del, kfree -- then the
+	 * re-armed work fires on freed memory).  Delist FIRST so no
+	 * caller can find this comp again, then cancel outside the
+	 * mutex: the work takes shmem_comp_mounts_lock, so holding it
+	 * across the cancel would deadlock (work waits for the lock,
+	 * put_super waits for the work).  A concurrent pass that already
+	 * found this comp finishes (and may re-arm) before put_super
+	 * gets the mutex -- and the cancel below then removes that
+	 * re-armed pending work.  After list_del + completed cancel no
+	 * path can schedule age_work for this comp: write_end arms are
+	 * excluded anyway (the sb is shutting down under s_umount
+	 * write) and maintain itself can no longer be reached.
+	 */
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_del(&comp->list);
+	mutex_unlock(&shmem_comp_mounts_lock);
+	cancel_delayed_work_sync(&comp->age_work);
+
+	if (comp->pool)
+		shmem_comp_pool_put(comp->pool);
+	kfree(comp->compressor);
+	kfree(comp);
+	sbinfo->comp = NULL;
 }
 
 bool shmem_comp_should_compress(struct inode *inode)
 {
 	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
 
+	/*
+	 * Stage 2: the write path consults the hot/chill mode flag with a
+	 * single READ_ONCE. In chill mode (usage below the LOW watermark)
+	 * writes land uncompressed; the maintenance pass ages them later
+	 * (death-before-pop). Eager mounts (0:0) keep hot=true always.
+	 */
 	return comp && comp->enabled && comp->pool &&
+		READ_ONCE(comp->hot) &&
 		i_size_read(inode) >= comp->threshold_bytes;
+}
+
+/*
+ * shmem_comp_arm_aging - Ask for a maintenance pass on this mount
+ * @inode: an inode on a compressed mount
+ *
+ * Called from shmem_write_end() when a write did NOT compress inline
+ * (chill mode, or a sub-threshold write in hot mode). The page it left
+ * behind is a candidate for the aging pass. Scheduling an already-
+ * pending delayed_work is cheap (test-and-set), so this stays off the
+ * hot path's critical section. No-op on uncompressed mounts.
+ */
+void shmem_comp_arm_aging(struct inode *inode)
+{
+	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
+
+	if (!comp || !comp->pool)
+		return;
+	schedule_delayed_work(&comp->age_work,
+			      msecs_to_jiffies(SHMEM_COMP_AGE_DELAY_MS));
+}
+
+/*
+ * shmem_comp_note_unmap - Record an uncompressed page leaving the cache
+ * @inode: inode whose folio was truncated/evicted
+ *
+ * Called from shmem_undo_range() next to each full folio removal. When
+ * the mount is chilled, such a page died without ever paying a
+ * compression cycle -- the CPU death-before-pop saved. Counted only
+ * while chilled: an eager-mode death is not a policy win (that page
+ * was already attempted at write time and was incompressible, mapped,
+ * or below threshold). Covers unlink, truncate, fallocate punch and
+ * evict (all route through shmem_undo_range).
+ */
+void shmem_comp_note_unmap(struct inode *inode)
+{
+	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
+
+	if (!comp || !comp->pool || READ_ONCE(comp->hot))
+		return;
+	atomic_long_inc(&comp->skipped_dead);
+	atomic_long_inc(&shmem_comp_skipped_dead);
 }
 
 /*
@@ -2034,6 +2184,8 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		"compress_fails: %lu\n"
 		"decompress_fails: %lu\n"
 		"stale_value_retries: %lu\n"
+		"aged_pages: %lu\n"
+		"skipped_dead: %lu\n"
 		"ram_pool_bytes: %lu\n"
 		"ram_merged_bytes: %lu\n"
 		"ram_entry_bytes: %lu\n"
@@ -2048,6 +2200,8 @@ static ssize_t comp_stats_show(struct kobject *kobj,
 		stats.compress_fails,
 		stats.decompress_fails,
 		stats.stale_value_retries,
+		(unsigned long)atomic_long_read(&shmem_comp_aged_pages),
+		(unsigned long)atomic_long_read(&shmem_comp_skipped_dead),
 		stats.ram_pool_bytes,
 		stats.ram_merged_bytes,
 		stats.ram_entry_bytes,
@@ -2153,14 +2307,30 @@ static ssize_t gc_now_store(struct kobject *kobj,
 			    struct kobj_attribute *attr,
 			    const char *buf, size_t count)
 {
+	struct shmem_comp_sb *comp;
 	bool v;
 	int ret;
 
 	ret = kstrtobool(buf, &v);
 	if (ret)
 		return ret;
-	if (v)
-		shmem_comp_cell_gc_all();
+	if (!v)
+		return count;
+
+	/*
+	 * Stage 2: gc_now runs one maintenance pass on every compressed
+	 * mount (aging + per-pool GC), then the pool-wide cell GC. The
+	 * mount pass is the deterministic test trigger for the policy
+	 * matrix -- it exercises aging without waiting for the armed work.
+	 * Held under shmem_comp_mounts_lock so the pass is serialized
+	 * against put_super's teardown.
+	 */
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_for_each_entry(comp, &shmem_comp_mounts, list)
+		shmem_comp_maintain(comp);
+	mutex_unlock(&shmem_comp_mounts_lock);
+
+	shmem_comp_cell_gc_all();
 	return count;
 }
 static struct kobj_attribute gc_now_attr = __ATTR(gc_now, 0200, NULL,
@@ -2351,7 +2521,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	if (unlikely(dlen != (unsigned int)nr_pages * PAGE_SIZE))
 		panic("shmem_comp: group decompressed %u bytes, expected "
 		      "%u -- compressed data corrupt (id=%u)",
-		      dlen, (unsigned int)nr_pages * PAGE_SIZE, id);
+		      dlen, (unsigned int)((unsigned int)nr_pages * PAGE_SIZE), id);
 
 	for (slice = 0; slice < nr_pages; slice++) {
 		pgoff_t sidx = head + slice;
@@ -2806,7 +2976,7 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (unlikely(dlen != PAGE_SIZE))
 		panic("shmem_comp: decompressed %u bytes, expected %u "
 		      "-- compressed data corrupt (id=%u)",
-		      dlen, PAGE_SIZE, id);
+		      dlen, (unsigned int)PAGE_SIZE, id);
 
 	folio_mark_uptodate(folio);
 
@@ -2867,8 +3037,8 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
  * - The compression pool is not available
  * - Memory allocation fails
  */
-int shmem_compress_folio(struct inode *inode, pgoff_t index,
-				struct folio *folio)
+static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
+				   struct folio *folio, bool allow_clean)
 {
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
@@ -2882,17 +3052,6 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 
 	if (!sbinfo->comp)
 		return -ENOTSUPP;
-
-	/*
-	 * merge_pages > 1: compress only when a full group has just
-	 * been written (index is the last page of the group). Tail
-	 * pages that do not fill a group remain uncompressed.
-	 */
-	if (sbinfo->comp->merge_pages > 1) {
-		if ((index + 1) % sbinfo->comp->merge_pages == 0)
-			return shmem_compress_group(inode, index);
-		return 0;
-	}
 
 	/* Lock folio to ensure stability during compression */
 	folio_lock(folio);
@@ -2912,11 +3071,14 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	 * before mapping), so folio_mapped() is stable here. A pinned
 	 * folio may be under DMA. Order-0 only: the compress and
 	 * replace paths below assume a single page. write_end just
-	 * dirtied this folio; clean means the state changed under us.
-	 * Skipping is not an error: the page simply stays uncompressed.
+	 * dirtied this folio; clean means the state changed under us
+	 * (allow_clean=false). The aging pass allows clean pages: a
+	 * decompressed-on-read survivor is exactly the cold data worth
+	 * re-compressing. Skipping is not an error: the page simply
+	 * stays uncompressed.
 	 */
 	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
-	    folio_order(folio) || !folio_test_dirty(folio)) {
+	    folio_order(folio) || (!allow_clean && !folio_test_dirty(folio))) {
 		folio_unlock(folio);
 		return 0;
 	}
@@ -2994,12 +3156,283 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 	shmem_comp_update_stats(true, PAGE_SIZE, comp_len);
 
 	/*
-	 * The folio has left the page cache; the caller (write_end)
-	 * still owns a reference and releases it after we return.
+	 * The folio has left the page cache; the caller still owns a
+	 * reference and releases it after we return. Return 1 = compressed,
+	 * 0 = skipped, negative = error (the aging budget counts 1 as work
+	 * done).
 	 */
 	folio_unlock(folio);
 
-	return 0;
+	return 1;
+}
+
+/*
+ * shmem_compress_folio - Compress a freshly-written folio (write path)
+ * @inode: shmem inode
+ * @index: page index
+ * @folio: the uncompressed folio (unlocked; caller holds a reference)
+ *
+ * Write-path wrapper around shmem_comp_compress_one(): dispatches the
+ * merge_pages>1 group case and requires dirty (allow_clean=false --
+ * write_end just dirtied the folio). Returns 0 on success or skip; the
+ * write path does not distinguish the two.
+ */
+int shmem_compress_folio(struct inode *inode, pgoff_t index,
+			struct folio *folio)
+{
+	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
+	int ret;
+
+	if (!sbinfo->comp)
+		return -ENOTSUPP;
+
+	/*
+	 * merge_pages > 1: compress only when a full group has just
+	 * been written (index is the last page of the group). Tail
+	 * pages that do not fill a group remain uncompressed.
+	 */
+	if (sbinfo->comp->merge_pages > 1) {
+		if ((index + 1) % sbinfo->comp->merge_pages == 0)
+			return shmem_compress_group(inode, index);
+		return 0;
+	}
+
+	ret = shmem_comp_compress_one(inode, index, folio, false);
+	return ret < 0 ? ret : 0;
+}
+
+/*
+ * shmem_comp_age_round - One bounded aging round over an inode batch
+ * @comp: per-mount compression state
+ * @batch: pinned shmem inodes (owned and released by the caller)
+ * @nb: batch length
+ * @budget: in/out page budget; decremented per compressed page
+ *
+ * Walks each inode's page cache from the start.  Already-compressed
+ * pages come back as xarray values and are skipped cheaply, so
+ * re-walking per round costs only the value scan.  Returns the number
+ * of pages compressed; stops early when *budget hits 0.
+ */
+static unsigned int shmem_comp_age_round(struct shmem_comp_sb *comp,
+					 struct inode **batch,
+					 unsigned int nb,
+					 unsigned int *budget)
+{
+	unsigned int aged = 0;
+	unsigned int i;
+
+	for (i = 0; i < nb && *budget; i++) {
+		struct address_space *mapping = batch[i]->i_mapping;
+		struct folio_batch fbatch;
+		pgoff_t indices[FOLIO_BATCH_SIZE];
+		pgoff_t index = 0;
+		unsigned int j;
+
+		folio_batch_init(&fbatch);
+		while (*budget &&
+		       find_get_entries(mapping, &index, (pgoff_t)-1,
+					&fbatch, indices)) {
+			for (j = 0; j < folio_batch_count(&fbatch); j++) {
+				struct folio *folio = fbatch.folios[j];
+				int ret;
+
+				if (xa_is_value(folio))
+					continue;	/* compressed entry or swap */
+				ret = shmem_comp_compress_one(batch[i],
+							       indices[j], folio, true);
+				if (ret > 0) {
+					aged++;
+					(*budget)--;
+				}
+				if (!*budget)
+					break;
+			}
+			/*
+			 * find_get_entries() leaves xa_is_value entries (swap
+			 * and compression entries) in the batch.
+			 * folio_batch_release() -> folios_put() would
+			 * folio_put_refs() them, treating the small value as
+			 * a folio pointer (wild-memory-access in
+			 * folios_put_refs). Prune them first -- same pattern
+			 * as shmem_undo_range().
+			 */
+			folio_batch_remove_exceptionals(&fbatch);
+			folio_batch_release(&fbatch);
+			cond_resched();
+		}
+	}
+	return aged;
+}
+
+/*
+ * shmem_comp_maintain - One walk-based aging pass for a mount
+ * @comp: the per-mount compression state
+ *
+ * Walks the mount's inodes (sb->s_inodes, prune_icache pinning pattern)
+ * and compresses eligible uncompressed survivors via
+ * shmem_comp_compress_one(allow_clean=true). This is the deferred-
+ * compression half of death-before-pop: chill-mode writes land
+ * uncompressed and are aged here instead of at write time.
+ *
+ * Concurrency contract (TMPFS_COMPRESSION_PLAN.md "Stage 2 machinery"):
+ * the caller (shmem_comp_age_work, gc_now, or the shrinker's
+ * pressure pass) holds
+ * shmem_comp_mounts_lock. This function additionally takes s_umount
+ * READ via down_read_trylock -- never a blocking down_read -- so it
+ * cannot deadlock with put_super()'s cancel_delayed_work_sync (which
+ * runs under s_umount write). Holding s_umount read excludes
+ * evict_inodes for exactly as long as we hold inode references, so a
+ * chilled file deleted under memory pressure cannot leave a busy inode
+ * after unmount. Every __iget is balanced by an iput before return.
+ *
+ * Rounds: up to SHMEM_COMP_AGE_MAX_ROUNDS rounds of
+ * SHMEM_COMP_AGE_BUDGET pages each (the round budget bounds the
+ * per-pass cost regardless of data compressibility), with one cell-GC
+ * batch after every round -- the ~4:1 aging:GC alternation:
+ * compression raises cell density, which is what makes GC cheaper.
+ *
+ * Re-arm (plan step 4): if the last round hit its budget, candidates
+ * likely remain, so schedule age_work again; otherwise idle until the
+ * next write (or the shrinker) arms it.
+ */
+static void shmem_comp_maintain(struct shmem_comp_sb *comp)
+{
+	struct super_block *sb = comp->sb;
+	struct inode *inode;
+	struct inode *batch[SHMEM_COMP_AGE_BATCH_INODES];
+	unsigned int nb = 0, i, r;
+	bool more = false;
+
+	if (!comp->pool || !sb)
+		return;
+
+	/*
+	 * Mode flip with hysteresis. usage = used_blocks * 100 /
+	 * max_blocks. The band (LOW, HIGH) keeps the current mode. For
+	 * 0:0 (eager) the hot condition always holds -> permanently hot,
+	 * never flips to chill (1 page on a large tmpfs reads usage 0;
+	 * the sentinel must not flinch).
+	 */
+	if (comp->watermark_high == 0) {
+		WRITE_ONCE(comp->hot, true);
+	} else {
+		struct shmem_sb_info *sbinfo = sb->s_fs_info;
+		unsigned long max_blocks = sbinfo->max_blocks;
+		unsigned long used = percpu_counter_sum(&sbinfo->used_blocks);
+		unsigned int usage = max_blocks ? (used * 100 / max_blocks) : 0;
+		bool hot = READ_ONCE(comp->hot);
+
+		if (usage >= comp->watermark_high)
+			hot = true;
+		else if (usage <= comp->watermark_low)
+			hot = false;
+		/* else: usage in the hysteresis band, keep current mode */
+		if (hot != READ_ONCE(comp->hot)) {
+			WRITE_ONCE(comp->hot, hot);
+			pr_info("tmpfs: mount %s compression %s (usage %u%%)\n",
+				sb->s_id, hot ? "hot" : "chill", usage);
+		}
+	}
+
+	if (!down_read_trylock(&sb->s_umount))
+		return;	/* unmount in progress; skip this pass */
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		if (nb >= SHMEM_COMP_AGE_BATCH_INODES)
+			break;
+		if (!shmem_mapping(inode->i_mapping))
+			continue;
+		spin_lock(&inode->i_lock);
+		if (icount_read(inode) == 0 ||
+		    (inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW))) {
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
+		__iget(inode);
+		spin_unlock(&inode->i_lock);
+		batch[nb++] = inode;
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+
+	for (r = 0; r < SHMEM_COMP_AGE_MAX_ROUNDS; r++) {
+		unsigned int budget = SHMEM_COMP_AGE_BUDGET;
+		unsigned int aged = shmem_comp_age_round(comp, batch, nb,
+							 &budget);
+
+		if (aged) {
+			atomic_long_add(aged, &comp->aged_pages);
+			atomic_long_add(aged, &shmem_comp_aged_pages);
+		}
+		/* ~4:1 alternation: one GC batch per round of aging --
+		 * compression raises cell density, which is what makes
+		 * the next GC cheaper */
+		if (comp->pool->use_cells)
+			shmem_comp_cell_gc(comp->pool);
+		if (budget) {
+			/* candidates exhausted within the budget: done */
+			break;
+		}
+		more = true;	/* round hit its budget: likely more remain */
+	}
+
+	/* batch is shared by all rounds; release once at the end */
+	for (i = 0; i < nb; i++)
+		iput(batch[i]);
+
+	up_read(&sb->s_umount);
+
+	/*
+	 * Re-arm while still holding shmem_comp_mounts_lock: put_super
+	 * delists under the same mutex BEFORE canceling the work (see the
+	 * teardown ordering comment), so this schedule can no longer
+	 * target a comp on its way out.
+	 */
+	if (more)
+		schedule_delayed_work(&comp->age_work,
+				      msecs_to_jiffies(SHMEM_COMP_AGE_DELAY_MS));
+}
+
+/*
+ * shmem_comp_age_work - delayed_work callback: run one aging pass
+ *
+ * Runs on system_wq (process context; GFP_KERNEL is honest here --
+ * unlike a shrinker, which is why the shrinker only arms this work and
+ * never compresses inline). Holds shmem_comp_mounts_lock so the pass is
+ * serialized against gc_now and against put_super's teardown.
+ */
+static void shmem_comp_age_work(struct work_struct *work)
+{
+	struct shmem_comp_sb *comp = container_of(to_delayed_work(work),
+						  struct shmem_comp_sb, age_work);
+
+	mutex_lock(&shmem_comp_mounts_lock);
+	shmem_comp_maintain(comp);
+	mutex_unlock(&shmem_comp_mounts_lock);
+}
+
+/*
+ * shmem_comp_pressure_pass - async shrinker trigger for aging
+ *
+ * The shrinker runs under fs_reclaim; taking shmem_comp_mounts_lock
+ * there would deadlock against maintain()'s own GFP_KERNEL
+ * allocations (crypto contexts, kmalloc buffers, cell alloc_pages) --
+ * the reclaim-recursion hazard session 3 hit once. So the shrinker
+ * only schedules this work (atomic-safe, coalescing); the passes run
+ * in kworker context where GFP_KERNEL is honest. Recorded deviation
+ * from the plan's "triggered by the shrinker": the trigger is
+ * asynchronous, and it runs ALL compressed mounts, not just those on
+ * the pressuring pool -- the per-pass budget bounds the cost either
+ * way, and pool membership is not worth a lock on the shrinker path.
+ */
+static void shmem_comp_pressure_pass(struct work_struct *work)
+{
+	struct shmem_comp_sb *comp;
+
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_for_each_entry(comp, &shmem_comp_mounts, list)
+		shmem_comp_maintain(comp);
+	mutex_unlock(&shmem_comp_mounts_lock);
 }
 
 /*

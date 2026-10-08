@@ -369,7 +369,8 @@ int shmem_comp_opts_set_watermark(struct shmem_comp_opts *opts, const char *val)
  * put_super: release the pool and free the comp; safe to call on a
  * partially initialized or NULL comp (mount-failure path).
  */
-int shmem_comp_fill_sb(struct shmem_sb_info *sbinfo,
+int shmem_comp_fill_sb(struct super_block *sb,
+		       struct shmem_sb_info *sbinfo,
 		       struct shmem_comp_opts *opts,
 		       unsigned long tmpfs_bytes);
 void shmem_comp_put_super(struct shmem_sb_info *sbinfo);
@@ -384,10 +385,26 @@ void shmem_comp_show_options(struct seq_file *seq,
 
 /*
  * Write-path hook (shmem_write_end): true when this inode's mount has
- * an enabled pool and the file is at/over the compression threshold
- * (threshold_bytes).
+ * an enabled pool, the mount is in hot mode, and the file is at/over
+ * the compression threshold (threshold_bytes). In chill mode this
+ * returns false and the write lands uncompressed (see arm_aging).
  */
 bool shmem_comp_should_compress(struct inode *inode);
+
+/*
+ * Write-path hook (shmem_write_end): arm the mount's aging pass when a
+ * write did NOT compress inline (chill mode or sub-threshold write).
+ * No-op on uncompressed mounts; scheduling an already-pending work is
+ * cheap.
+ */
+void shmem_comp_arm_aging(struct inode *inode);
+
+/*
+ * Truncate hook (shmem_undo_range): record an uncompressed folio
+ * leaving the page cache while the mount is chilled -- a page that
+ * died without paying a compression cycle (death-before-pop's saving).
+ */
+void shmem_comp_note_unmap(struct inode *inode);
 
 /*
  * Eviction hook (shmem_free_swap): release one compressed page-cache
