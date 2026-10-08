@@ -3269,3 +3269,32 @@ results (lz4_m1, T=64 unless noted):
 
 Step5 (default flip) unchanged and still unblocked; the sweep adds
 no reason to move the default levels.
+
+## Status (2026-10-08, last for today) -- step 4 v4: merge_pages x watermark
+
+merge_pages is a WRITE-TIME-only knob, confirmed by the cross
+(merge 1..32 x {eager, 50:70} + never anchor, one boot, 512M,
+534/0):
+
+- Eager: live compressed pages collapse 78k (merge=1) -> 512
+  (merge=32) -- munin's small files never fill a group at EOF, so
+  bigger merges stop compressing almost everything.  Stored ratio of
+  the subset that DOES compress degrades 47.9% -> 70.5%; throughput
+  gains only modestly (108 -> 140 MB/s) -- CPU amortization cannot
+  pay back near-zero engagement on this workload.
+- 50:70: merge is largely irrelevant (145-190 MB/s, no monotone
+  trend, live comp pages ~200-2000 at every merge) because the
+  aging pass compresses SINGLES and bypasses group dispatch by
+  design.  50:70 beats eager at every merge size.
+- Never anchor: 194 MB/s at T=64 (plain ceiling for this boot).
+
+Conclusion: with Stage 2 deferral as the default, merge_pages
+defaults to 1 and the knob is only meaningful for eager mounts with
+large-file workloads.  Session-1's ratio/speed tension analysis now
+has a policy dimension: deferral dissolves most of the merge
+question for transient workloads.
+
+Also landed: test.tsw= thread-axis override (T up to 256) -- ready
+for the oversubscription sweep; the T-curves already show eager
+plateauing at T=4 (inline lz4 saturates the vCPUs) while deferral
+keeps scaling (T=64: 99 vs 178 MB/s).
