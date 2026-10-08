@@ -3219,3 +3219,53 @@ The policy map (lz4_m1 rows, T=64, untar_fail):
 
 Step5 (default flip0:0 ->50:70) has now both the deferral matrix
 (1G) and the cliff matrix (384M/512M) backing it.
+
+## Status (2026-10-08, even later) -- step 4 v3: the watermark axis, and a correction
+
+Watermark sweep at fixed size (12 per-mount rows in one boot:
+anchors + LOW@HIGH=70 + HIGH@LOW=50 + 25:90).  Two sizes measured;
+one interpretation corrected.
+
+**Correction to the v2 map**: the "384M cliff" row is NOT a policy
+result.  Repeating the identical384M sweep showed the untar-failure
+pattern reshuffling boot-to-boot (never clean->4, 25:70 4->0,
+50:100 8->0, ...): every mode at384M/T=64 lives within +/-5% of the
+98304-block cap (compressed entries charge 1 block each, swap-style:
+eager's comp_pages=82k + in-flight ~= cap).  Capacity roulette
+dominates; only the robust rows survive as findings: 192M is below
+the live set under EVERY policy, >=512M has headroom, and the
+384M "50:70 wins the cliff" reading was luck.  Rule: **measure the
+policy axis only where capacity is not the dominant variable.**
+
+**512M sweep (466/0, capacity noise-free)** -- the actual watermark
+results (lz4_m1, T=64 unless noted):
+
+| watermark | flip usage | MB/s | comp pages | note |
+|-----------|-----------|------|-----------|------|
+| 0:0 eager | always hot | 99.1 | 82351 | pays inline CPU everywhere |
+| 100:100 never | never | 154.8 | 0 | |
+| 0:70 | 77% | 178.0 | 3157 | one-way (LOW=0); late flip |
+| 25:70 | 77% | 177.8 | 4204 | late flip |
+| 50:70 | 72% | 165.2 | 5468 | the default candidate |
+| 70:70 | 77% | 167.0 | 2796 | zero-width band: stable |
+| 50:50 | 60% | 144.9 | 9842 | early flip = more time hot |
+| 50:60 | 67% | 131.3 | 9685 | slowest: earliest flip |
+| 50:80 | no flip | 161.0 | 568 | usage peaks ~77% < 80 |
+| 50:90 | no flip | 175.8 | 383 | near-deferral |
+| 50:100 | never | 169.4 | 269 | pure deferral |
+| 25:90 | no flip | 165.4 | 262 | wide band, late flip unreachable |
+
+- T=1: deferral is free at EVERY level (26.2-27.8 vs eager 18.5 =
+  plain speed); the CPU bill only appears once a flip makes writes
+  compress inline.
+- Throughput at T=64 tracks TIME SPENT HOT, not the level itself:
+  earliest flip (50:60) is slowest, late flips (0:70, 25:70)
+  fastest, never-flip levels cluster with deferral.
+- Zero-width bands (50:50, 70:70) flap without breaking anything --
+  the hysteresis mechanics survive their degenerate case.
+- 50:70 at headroom sizes flips only under real pressure (72% peak)
+  and defers otherwise: the designed behavior, and the reason it
+  remains the default candidate.
+
+Step5 (default flip) unchanged and still unblocked; the sweep adds
+no reason to move the default levels.
