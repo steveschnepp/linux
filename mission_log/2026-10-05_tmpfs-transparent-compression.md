@@ -2871,3 +2871,103 @@ What was missing, and what I added:
 - Per-mount comp_stats readers (standing gap) matter more once mounts
   are chill by default; the matrix currently works around this with
   global deltas and one mount per boot.
+
+---
+
+## Session 15: the policy matrix -- deferral costs nothing here (2026-10-08)
+
+### What We Did
+
+Plan landing step 4: ran the Stage 2 policy matrix -- the torture
+sweep once per GLOBAL watermark config (never100:100 / eager 0:0 /
+50:70 / 50:100), driven through the Stage 1 sysfs default knob: the
+torture configs mount WITHOUT compress_watermark=, so init.sh writing
+/sys/fs/tmpfs/compression/compress_watermark from test.wm= on the
+cmdline reaches every config without touching test_torture's table.
+
+One boot per config (one mount alive at a time keeps the global
+comp_stats deltas unambiguous), `scripts/matrix_watermark.sh` extracts
+the T=1/T=64 comparison rows.
+
+### Results (lz4_m1 rows, verify MB/s)
+
+| watermark | T=1 | T=64 | live comp T=64 | comp RAM T=64 |
+|-----------|-----|------|----------------|---------------|
+| never 100:100 | 24.8 | 186.8 | 0 | 0 MB |
+| eager 0:0 | 18.5 | 98.9 | 80314 | 166 MB |
+| 50:70 | 24.7 | 188.4 | 298 | 1 MB |
+| 50:100 | 24.7 | 195.3 | 240 | 1 MB |
+| plain (same boots) | 26.2 | 178.0 | 0 | 0 MB |
+
+- **T=1 prediction confirmed**: chill recovers ~80% of the eager->
+  plain gap (24.7 vs 18.5 vs 26.2).  The plan predicted "toward
+  plain (26 vs 17.1)"; landed at 24.7 vs 18.5.
+- **T=64: chill ~= plain, ~2x eager** (188-195 vs 161-178 vs 98.9).
+  Deferral costs nothing at high concurrency on a transient-heavy
+  workload -- the workload's own rm phase is the dominant "reader",
+  so pages that die before being read never pay a compression cycle.
+- **RAM: the death-before-pop win, quantified**: 166 MB live
+  compression RAM (eager) vs 1 MB (chill) at T=64.
+- All four boots: 0 CRC/miss/short/ENOSPC/unexpected failures.
+- 50:70 never flipped hot under this workload (live set far below
+  70% of size=1G): here it behaves as pure deferral.  The flip path
+  is covered by test_watermark_policy instead.
+
+### What We Learned
+
+- **Gate-design lesson (the session's real finding)**: the first
+  matrix run failed 7 assertions per chill boot -- all "compression
+  engaged (comp_pages > 0)" per-point checks.  comp_stats
+  compressed_pages is a LIVE gauge, and a transient workload
+  (untar -> verify -> rm) legitimately shows ZERO live compressed
+  pages at any sampled instant in chill mode: pages either died
+  before aging (death-before-pop working as designed) or were aged
+  and then immediately decompressed by the verify read.  The
+  assertion was measuring eager-mode engagement semantics.  Fix:
+  per-CONFIG cumulative check (aged_pages grew across the config)
+  for chill; negative invariant (no aging) for never; per-point
+  gauge kept only for eager.  Rule: a deferral policy's engagement
+  is a cumulative property, never an instantaneous one.
+- A live gauge and a cumulative counter answer different questions;
+  comp_stats has both (compressed_pages live, aged_pages cumulative)
+  and the FIRST matrix run mixed them up.  Name the axis you are
+  asserting on.
+- The sysfs default knob (Stage 1) earned its keep: the entire
+  matrix required zero mount-option plumbing -- one knob write in
+  init.sh.
+- Chill T=64 measured slightly ABOVE plain T=64 in the same boots
+  (188-195 vs 161-178): plausible (smaller live footprint -> less
+  shmem lock contention) but within the plain run-to-run spread
+  (161-186 across boots); do not quote the exact number without
+  stability runs.
+- 3s windows x one boot per config are enough for policy validation
+  (the deltas are 2x), not for publishing throughput numbers.
+
+### Test Results / Benchmarks
+
+- Matrix run 1: never 226/0, eager 261/0, 50:70 254/7, 50:100
+  254/7 (the 7 = per-point engagement, gate bug, see above).
+- Matrix run 2 (corrected gate): never 232/0, eager 261/0, 50:70
+  231/0, 50:100 231/0 -- all green, including never's no-aging
+  negative invariant and chill's per-config aged_pages growth.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/tests/test_torture.c` | policy-aware engagement checks (point/config/none) |
+| `~/tmpfs-compress-test/guest/init.sh` | test.wm= hook -> sysfs default knob |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_WM passthrough |
+| `~/tmpfs-compress-test/scripts/matrix_watermark.sh` | the matrix runner |
+| `TMPFS_COMPRESSION_PLAN.md` | step-4 status + numbers |
+
+### Next Steps
+
+- Step 5: default flip 0:0 -> 50:70, then suite + matrix re-run.
+  The matrix says the flip is safe for transient-heavy workloads;
+  the read-heavy recompression-thrash gap (#3 in the plan's known
+  gaps) is the one to watch in the re-run.
+- Stability runs (N boots per config) before quoting T=64 numbers
+  anywhere.
+- Per-mount comp_stats readers (standing gap) -- more valuable with
+  every step toward chill-by-default.
