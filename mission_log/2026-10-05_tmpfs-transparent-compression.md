@@ -3256,3 +3256,116 @@ Two additions to the torture gate, then the merge sweep:
   can push 512M back toward the knife edge -- check untar_fail.
 - Step 5 (default flip) remains the next kernel change.
 - Per-mount comp_stats readers (standing gap).
+
+---
+
+## Session 19: the analysis -- what config when (2026-10-08)
+
+### What We Did
+
+No new boots: synthesized the four measurement sessions (15-18, plus
+1/7 backend work) into the standing "Configuration guidance" section
+of TMPFS_COMPRESSION_PLAN.md -- a decision table + rules, each row
+traceable to a measured matrix row.  This entry mirrors it with the
+full reasoning trail.
+
+### The findings, by decision
+
+**1. The default: lz4 + compress_watermark=50:70 + headroomed size=.**
+The only configuration that wins in all three regimes measured:
+free at low concurrency (T=1-2: 26.2-26.3 MB/s = plain speed vs
+eager 18.5, i.e. eager's -30% CPU bill vanishes), ~2x eager at high
+concurrency (T=64: 165-190 vs 99), and 1 MB vs 166 MB live
+compression RAM (the death-before-pop win: transient pages die
+before paying a compression cycle -- skipped_dead is the metric).
+At the capacity cliff (384M) it was the most robust policy
+observed: flips hot and relieves inline where never/50:100 died.
+
+**2. merge_pages: eager/large-file niche only.** The cross
+(merge 1..32 x {eager, 50:70}, 534/0) showed the asymmetry with
+numbers: write-time group dispatch vs aging-pass SINGLES.  Eager:
+engagement collapses 78k -> 512 live comp pages (m1 -> m32; small
+files never fill a group at EOF), the compressing subset's ratio
+degrades 47.9% -> 70.5%, and CPU amortization buys only 108 -> 140.
+Under 50:70: statistically irrelevant (145-190 band, no trend).
+Default merge=1 stands; group-aware aging is a follow-up reserved
+for zstd + long-lived large files (lz4's ratio is merge-insensitive
+per session 1).
+
+**3. zstd: ratio-bound, large-file, long-lived only.** +10-12%
+ratio (36-38% vs ~48% stored) but 12.4 vs 18.5 MB/s at T=1, and
+under deferral its write-side edge disappears entirely -- the aging
+path does the work (as singles, in kworker, off the workload's
+critical path, which is a feature for throughput but means zstd
+buys nothing but ratio under the default policy).
+
+**4. compress_threshold: leave at 64K.** Write-time gate only; the
+aging pass ignores it by design (grate #2 dissolved -- sub-threshold
+survivors age, asserted by test_watermark_policy).  Under the
+default policy the knob is decorative; under eager it only tunes
+how much inline CPU small files cost.
+
+**5. size= is the one hard constraint.** Within ~10% of peak live
+set EVERY policy dies stochastically (384M: failures reshuffled
+across identical boots; compressed entries charge ~1 block each,
+swap-style, so compression buys RAM-pressure relief, not size=
+capacity).  Rule: size= >= 1.5-2x peak live set, and never tune or
+measure policy inside the noise band.  The 192M row (death under
+all policies) and >=512M rows (clean under all policies) are the
+only robust capacity conclusions; the 384M row was discarded.
+
+**6. Throughput tracks time-spent-hot, not the level.** HIGH sweep
+at 512M: early flip (50:60, flip@67%) slowest at 131; 50:50 144.9;
+50:70 (flip@72%) 165.2; late flips (0:70, 25:70, flip@77%) ~178;
+never-flip levels (50:80/90/100, 25:90 -- usage peaks ~77%) cluster
+161-176 = deferral.  50:70 sits in the fast cluster AND relieves
+pressure -- the reason it is the default candidate, not 0:70 (a
+one-way switch: LOW=0 can only leave hot at usage 0) or 50:60
+(relieves too early, pays too much CPU).
+
+**7. Robustness findings that de-risk the flip.** Degenerate bands
+(50:50, 70:70 flapping) are stable; 22+ fill_sb/put_super cycles
+per boot including Stage 2 teardown are clean; entry-race gate 0
+underflows / stale_value_retries 0; eager plateaus at vCPU count
+(T=4 of 4) while deferral scales -- the eager penalty GROWS with
+concurrency, so the flip's benefit is workload-dependent in the
+right direction.
+
+### What We Learned
+
+- Synthesis is a session-shaped deliverable: the decision table
+  forced three restatements (the 384M caveat moved from "finding"
+  to "rule"; merge demoted from "knob" to "niche"; zstd qualified)
+  that no single matrix run would have produced.
+- Every recommendation row traces to a specific matrix row; where
+  the data was noise (384M) or single-boot (the 145-190 band), the
+  table says so instead of smoothing it.
+- The guidance section in the PLAN doc (not the mission log) is the
+  right home for durable recommendations; this entry is the
+  provenance.
+
+### Test Results
+
+No new runs; all numbers cited come from:
+- session 15/17: watermark sweeps 1G and 512M
+- session 16: size x watermark one-boot matrix (882/11 -> corrected
+  interpretation in 17)
+- session 18: merge x watermark (534/0) + T-curves
+- session 14: test_watermark_policy (7/7), entry-race (0 underflows)
+- sessions 1/7: backend parity, compressor behavior
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `TMPFS_COMPRESSION_PLAN.md` | "Configuration guidance -- what config when" section |
+
+### Next Steps
+
+- Step 5: default flip 0:0 -> 50:70, then suite + the guidance
+  tables re-validated under the new default.
+- Read-heavy re-compression thrash (gap #3) remains the one open
+  behavioral question the matrices did not exercise.
+- Per-mount comp_stats readers: every "when" row above currently
+  leans on global counters or dmesg attribution; per-mount would
+  make the guidance operational rather than analytical.
