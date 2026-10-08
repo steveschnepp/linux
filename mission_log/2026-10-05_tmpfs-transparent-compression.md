@@ -3159,3 +3159,100 @@ Ran the sweep at 384M twice, then at 512M.
   result gets ONE rerun before it enters the plan.
 - The untar-fail-as-capacity-death classification (standing) --
   would have flagged the 384M confound earlier.
+
+---
+
+## Session 18: merge x watermark, and the parallel-edit trap (2026-10-08)
+
+### What We Did
+
+Two additions to the torture gate, then the merge sweep:
+
+1. Thread axis: test.tsw=1,2,...,128 (TORTURE_TSWEEP; MAX_THREADS
+   64->256) -- prepared for oversubscription sweeps.  The T-curves
+   from the existing 512M watermark sweep already answer most of it:
+   eager plateaus at T=4 (inline lz4 saturates the 4 vCPUs: 74
+   MB/s at T=4, 99 at T=64) while deferral keeps scaling (105 ->
+   178).  Full curve table (512M, lz4_m1): eager 18.5/38.6/74.4/
+   74.1/80.7/99.2/99.1 vs 50:70 26.3/51.2/99.1/107.1/119.5/140.9/
+   165.2 and never 26.2/52.6/103.7/108.2/118.9/127.3/154.8
+   (T=1..64).  Deferral is free at T=1-2 and its advantage GROWS
+   with T.
+
+2. Merge axis: TORTURE_MERGESWEEP=1 (test.mergesweep=1) --
+   merge 1/2/4/8/16/32 x {eager 0:0, 50:70} + never anchor as
+   per-mount rows at test.tsize= (sweep_merge_wm.sh).  Clean run
+   534/0 at 512M:
+   - Eager: engagement collapses with merge (live comp pages 78k ->
+     512 from m1 to m32; munin's small files never fill groups at
+     EOF), stored ratio of the compressing subset degrades 47.9% ->
+     70.5%, throughput gains modestly (108 -> 140).  CPU
+     amortization cannot pay back near-zero engagement.
+   - 50:70: merge irrelevant (145-190 band, no trend, comp pages
+     ~200-2000) -- the aging pass compresses SINGLES, bypassing
+     groups by design.  50:70 beats eager at EVERY merge.
+   - Conclusion: with deferral as the default, merge_pages belongs
+     at 1; the knob is meaningful only for eager mounts with
+     large-file workloads.
+
+### What We Learned
+
+- **THE PARALLEL-EDIT TRAP (the session's big process lesson).**
+  The never-anchor row initially mounted with an EMPTY name and
+  options (a real bug: `all[n++] = { mnames[n], mopts[n], 1 }` --
+  unspecified evaluation order; the increment can sequence before
+  the RHS reads n, pointing the row at the next, empty slot).  I
+  fixed it with the k=n pattern -- but issued the `edit` tool call
+  and the `gcc + repack + sweep` bash call IN THE SAME PARALLEL
+  BLOCK.  The compiler read the pre-fix source.  The rerun showed
+  the identical failure -- and I misread that as "the fix didn't
+  work" and went down a multi-step detour: strings(1) on a binary
+  where -O2 had folded snprintf into immediate stores (literal
+  legitimately absent from .rodata!), objdump archaeology of glibc
+  pthread internals after a bad sed range, a host repro that
+  PROVED the logic correct (the strongest clue -- it compiled the
+  CURRENT source separately), until first principles produced the
+  answer: THREE runs with byte-identical results (534/7 every time)
+  was the tell that NOTHING was changing.  Sequential rebuild +
+  repack: 534/0, green.
+- Rules extracted:
+  1. Dependent tool calls (edit -> build) are SEQUENTIAL, always --
+     the same trap fired twice this session (write+chmod earlier).
+  2. Identical results across "different" runs means the experiment
+     did not change, not that the system is deterministic.
+  3. strings(1) proving a literal "missing" proves nothing about
+     -O2 codegen: constant snprintf/strcpy get folded into
+     immediates.  Disassemble or run; don't grep bytes.
+  4. A standalone repro compiled from the CURRENT source is the
+     fastest oracle when binary-vs-source provenance is in doubt --
+     and it bisects the problem into "environment" vs "code" in one
+     step.
+- merge_pages and the policy model compose: write-time group
+  dispatch vs aging-pass singles is now an OBSERVED asymmetry with
+  numbers, not just a design note.
+
+### Test Results
+
+- sweep_merge_wm 512M: 534 passed / 0 failed (clean after the
+  rebuild); earlier runs: 533/7 x3 (the anchor bug, all identical).
+- T-curves extracted from the 512M watermark sweep (see above).
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/tests/test_torture.c` | mergesweep rows, tsw override, anchor fix, MAX_THREADS 256 |
+| `~/tmpfs-compress-test/guest/init.sh` | test.mergesweep=, test.tsw= hooks |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_MERGESWEEP, TEST_TSW passthrough |
+| `~/tmpfs-compress-test/scripts/sweep_wm.sh` | watermark sweep runner + flip attribution |
+| `~/tmpfs-compress-test/scripts/sweep_merge_wm.sh` | merge x watermark runner |
+| `TMPFS_COMPRESSION_PLAN.md` | step-4 v4 status |
+
+### Next Steps
+
+- The oversubscription sweep is one boot away (test.tsw=64,128 at
+  512M): does T=128 push usage past HIGH=80 and flip the
+  never-flip levels?  Watch capacity: T=128 grows the live set and
+  can push 512M back toward the knife edge -- check untar_fail.
+- Step 5 (default flip) remains the next kernel change.
+- Per-mount comp_stats readers (standing gap).
