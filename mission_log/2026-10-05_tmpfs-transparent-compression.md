@@ -2971,3 +2971,104 @@ the T=1/T=64 comparison rows.
   anywhere.
 - Per-mount comp_stats readers (standing gap) -- more valuable with
   every step toward chill-by-default.
+
+---
+
+## Session 16: one-boot policy matrix, and the size axis (2026-10-08)
+
+### What We Did
+
+Two rounds on the matrix, both driven by sharp user observations:
+
+**Round 1 -- size, not watermark.** The first matrix (session 15)
+ran size=1G mounts and50:70 never flipped: the band was never
+exercised. Asked whether to move the watermark levels or the tmpfs
+size: equivalent for reaching the band, but size is the axis that
+varies in the field AND the only one probing the hard-cap boundary.
+Wrote scripts/sweep_size.sh (20 boots:5 sizes x4 watermarks), started
+it -- then killed it after the next observation.
+
+**Round 2 -- one boot, not twenty.** compress_watermark= is a MOUNT
+option; only the global sysfs knob was boot-global. So the whole
+cross product became per-mount rows inside ONE torture boot:
+test_torture.c generates16 policy rows (192M/384M/512M/1G x
+never/0:0/50:70/50:100) under TORTURE_POLICY=1 (init.sh
+test.policy=1), next to the6 classic backend rows. Engagement mode
+is resolved per config from its own options (config_engage()), with
+the sysfs knob only as fallback default. Win: one ~10-min boot
+instead of ~2h, and23 mounts/22 umounts per boot -- every row
+re-exercises fill_sb/put_super including the Stage 2 teardown
+(delist + cancel_delayed_work_sync), which one-boot-per-combo never
+touched after the first mount.
+
+### The policy map (lz4_m1, T=64, untar failures)
+
+| size | never | eager 0:0 | 50:70 | 50:100 |
+|------|-------|-----------|-------|--------|
+| 192M | death | death | death after flip@91% | death |
+| 384M | fail (9) | marginal (4) | **CLEAN, flip@89%, 154 MB/s** | fail (9) |
+| 512M | ok | ok | clean, flip@75%, 166 MB/s | ok |
+| 1G | ok | ok | clean, no flip (31%), 187 MB/s | ok |
+
+Flip attributions (dmesg, in-stream + final dmesg re-dump = x2 each):
+50:70 goes hot at 192M (91%), 384M (89%), 512M (75%); never at 1G.
+
+### What We Learned
+
+- **The chill backlog inflates usage past the naive peak.** Eager's
+  peak live set (~314 MB: comp_pages=80314 x 4K, NOT 674 MB --
+  session 15 double-divided by the ratio) predicts flip boundaries
+  below ~450 MB, yet 512M flips at 75%: deferred-but-not-yet-aged
+  pages charge FULL size= blocks. The backlog is exactly the
+  quantity the flip exists to drain -- now visible as the flip's
+  usage number.
+- **At the capacity cliff the adaptive policy wins.** At 384M/T=64:
+  never and 50:100 (no inline relief) fail untars, eager is
+  marginal, 50:70 flips hot and is CLEAN at 1.5x eager throughput.
+  This is the strongest evidence yet for 50:70 as the default: it
+  degrades gracefully exactly where eager is fragile, and behaves as
+  pure deferral where there is headroom.
+- **Deferral cannot fix capacity, only CPU**: 192M is below the live
+  set under every policy, including after the flip.
+- The enospc column was lying by omission: it counts mkdir() ENOSPC
+  only; tar(1)'s write-path capacity deaths surface as untar_fail>0
+  with enospc=0 (system() yields exit codes, not errnos). Documented
+  in-code; the "clean vs fail" pattern across identical capacities
+  was only interpretable after spotting this.
+- fs_parse takes the FIRST value of a duplicated key: a config row
+  embedding size= under run_config's unconditional "size=%s,%s" prep
+  would silently keep the default size. The row format must own the
+  whole options string (the test now skips the prep when options
+  already carry size=).
+- Background-launching a long sweep with nohup inside the agent
+  harness works (survives the tool-call boundary), and mid-flight
+  pkill of script+QEMU is clean. The earlier "head: cannot open"
+  was a filesystem-sync race, same class as the write-tool one --
+  sleep before reading freshly created files.
+
+### Test Results
+
+- One-boot matrix: 882 passed / 11 failed (all11 = untar_fail at
+  192M and the 384M cliff rows -- the map itself, not gate bugs).
+- Post-storm: Shmem back to baseline across22 mount/umount cycles;
+  zero live compressed pages; Stage 2 teardown survived22 cycles.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `~/tmpfs-compress-test/tests/test_torture.c` | policy rows, per-config engage, size= ownership, enospc docs |
+| `~/tmpfs-compress-test/guest/init.sh` | test.policy=1 -> TORTURE_POLICY=1 |
+| `~/tmpfs-compress-test/scripts/run_qemu.sh` | TEST_POLICY passthrough |
+| `~/tmpfs-compress-test/scripts/matrix_watermark.sh` | rewritten: one-boot runner + digest |
+| `TMPFS_COMPRESSION_PLAN.md` | step-4 v2 status + the map |
+
+### Next Steps
+
+- Step 5: default flip 0:0 -> 50:70. Both matrices (deferral at 1G,
+  cliff at 384M/512M) now back it.
+- Classify untar failures as capacity deaths in-test (read
+  used_blocks vs max after a failed untar) so the enospc column
+  stops lying by omission.
+- Per-mount comp_stats readers (standing gap) -- the one-boot matrix
+  works around them with per-config deltas on global counters.
