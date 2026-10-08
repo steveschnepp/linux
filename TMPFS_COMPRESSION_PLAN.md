@@ -67,8 +67,9 @@ Unlike zram and zswap, this implementation provides **proactive, transparent com
 │                               │                             │
 │                               ▼                             │
 │                          Compressed RAM pool                │
-│                          (reserved upfront)                  │
-│                                                             │\�─────────────────────────────────────────────────────────────┘
+│                          (reserved upfront)                 │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │              tmpfs Compression Approach                     │
