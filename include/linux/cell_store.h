@@ -74,12 +74,14 @@
 
 struct cell {
 	/*
-	 * Only pages[0] is used: the pages are physically contiguous
-	 * (single alloc_pages() call), so the page_address of the head
-	 * page is the base of the entire cell.  The array exists to
-	 * hold the allocation so __free_pages() can find the head.
+	 * Exactly one slot: a cell is one physically-contiguous compound
+	 * page (a single alloc_pages(order) call), so the head page
+	 * reference describes the whole allocation -- page_address() for
+	 * the data, __free_pages(head, order) to release it.  No tail
+	 * page needs its own slot; the head is stored so the free path
+	 * can find it.
 	 */
-	struct page	*pages[1 << CELL_ORDER_MAX];
+	struct page	*pages[1];
 	void		*base;		/* virtual base = page_address(pages[0]) */
 	u32		next_free;	/* bump offset; monotonic during cell life */
 	u32		live_bytes;	/* sum of live block lengths */
