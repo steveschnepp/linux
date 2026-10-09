@@ -310,7 +310,7 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 	id = shmem_comp_entry_alloc(dev->pool, handle, len_bytes, 1, NULL, 0,
 				    NULL);
 	if (!id) {
-		u16 cellid;
+		u32 cellid;
 		u32 offset_bytes;
 
 		/* pack_loc biases cellid +1: unpack, never raw shifts */

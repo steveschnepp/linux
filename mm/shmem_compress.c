@@ -729,7 +729,7 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	 * groups are stored as a single block.
 	 */
 	if (pool->use_cells) {
-		u16 cellid;
+		u32 cellid;
 		u32 offset;
 
 		if (cell_store(pool->cells, data, len, &cellid, &offset))
@@ -778,7 +778,7 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 	 * has not been returned to the buddy allocator.
 	 */
 	if (pool->use_cells) {
-		u16 cellid;
+		u32 cellid;
 		u32 offset;
 
 		shmem_comp_unpack_loc(handle, &cellid, &offset);
@@ -981,7 +981,7 @@ static void shmem_comp_entry_free(unsigned int id)
 	 * called directly here rather than through shmem_comp_free().	 * The zsmalloc free path does not need the length — zs_free()	 * recovers it from the size class encoded in the handle.	 */
 	if (ent->handle) {
 		if (ent->pool->use_cells) {
-			u16 cellid;
+			u32 cellid;
 			u32 offset;
 
 			shmem_comp_unpack_loc(ent->handle,
@@ -1234,10 +1234,10 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 	/* One scan relocates blocks from every victim */
 	xa_for_each(&shmem_comp_entries, id, ent) {
 		unsigned long h;
-		u16 cellid;
+		u32 cellid;
 		u32 offset;
 		unsigned int len;
-		u16 nc;
+		u32 nc;
 		u32 no;
 		struct cell *vic = NULL;
 		int ret;
@@ -1376,7 +1376,7 @@ int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len)
 
 	while (budget--) {
 		unsigned long h = READ_ONCE(ent->handle);
-		u16 cellid;
+		u32 cellid;
 		u32 offset;
 		struct cell *c;
 		u32 cell_size;
@@ -1514,7 +1514,7 @@ int shmem_comp_cell_stats_show(char *buf, size_t size)
 	spin_lock(&shmem_comp_pools_lock);
 	list_for_each_entry(pool, &shmem_comp_pools, list) {
 		struct cell_pool *cp = pool->cells;
-		u16 i;
+		u32 i;
 
 		if (!pool->use_cells || !cp)
 			continue;
@@ -2745,7 +2745,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 		id = shmem_comp_entry_alloc(sbinfo->comp->pool, handle,
 					     comp_len, nr, NULL, 0, &gen);
 		if (!id) {
-			u16 cellid;
+			u32 cellid;
 			u32 offset;
 
 			shmem_comp_unpack_loc(handle, &cellid, &offset);

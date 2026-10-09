@@ -159,26 +159,46 @@ struct shmem_comp_entry {
 /*
  * Encode/decode a cell location into the handle field.
  *
+ * The offset field is 22 bits because a valid offset is always
+ * < cell_size and the largest cell is 4 MiB (CELL_ORDER_MAX); the
+ * cellid field takes the next 33 bits (u32 + the +1 bias).
+ */
+#define CELL_LOC_OFFSET_BITS	22
+#define CELL_LOC_OFFSET_MAX	(1UL << CELL_LOC_OFFSET_BITS)
+
+/*
+ * Encode/decode a cell location into the handle field.
+ *
  * cellid is biased by +1 so that the first object of the first cell
  * (cellid=0, offset=0) never encodes to handle 0.  Handle 0 is the
  * universal "storage failed" sentinel in the compression paths —
  * without the bias, that object would be silently discarded on every
  * fresh pool.
  *
- * Lossless because cellid never exceeds 16 bits (max_cells is 256)
- * and offset never exceeds 22 bits (max cell size is 4 MiB); the
- * biased cellid fits comfortably in the upper 32 bits.
+ * Layout: [63..55 unused][cellid+1, 33 bits at 22][offset, 22 bits].
+ * offset never exceeds 22 bits (max cell size is 4 MiB, so a valid
+ * offset is < 2^22); cellid+1 needs up to 33 bits because cellid is
+ * a u32 (a directory can hold up to UINT_MAX cells, though the
+ * kvcalloc fails long before that).  The handle is a full unsigned
+ * long stored in entry.handle -- not a swp_entry -- so all 64 bits
+ * are available (see the 55-bit {id,gen} packing in swapops.h, which
+ * is a separate, tighter encoding for tmpfs xarray values).
+ *
+ * When widening or narrowing the fields, re-price THIS encoding, not
+ * the struct cell declaration: the u16 cellid wall was never in the
+ * type, it was here.
  */
-static inline unsigned long shmem_comp_pack_loc(u16 cellid, u32 offset)
+static inline unsigned long shmem_comp_pack_loc(u32 cellid, u32 offset)
 {
-	return ((unsigned long)(cellid + 1) << 32) | offset;
+	return ((unsigned long)(cellid + 1) << CELL_LOC_OFFSET_BITS) |
+		(offset & (CELL_LOC_OFFSET_MAX - 1));
 }
 
 static inline void shmem_comp_unpack_loc(unsigned long handle,
-					 u16 *cellid, u32 *offset)
+					 u32 *cellid, u32 *offset)
 {
-	*cellid = (handle >> 32) - 1;
-	*offset = handle & 0xFFFFFFFFUL;
+	*cellid = (handle >> CELL_LOC_OFFSET_BITS) - 1;
+	*offset = handle & (CELL_LOC_OFFSET_MAX - 1);
 }
 
 /**

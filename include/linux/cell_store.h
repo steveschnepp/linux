@@ -99,8 +99,8 @@ struct cell {
 	void		*base;		/* virtual base = page_address(pages[0]) */
 	u32		next_free;	/* bump offset; monotonic during cell life */
 	u32		live_bytes;	/* sum of live block lengths */
-	u16		live_objects;	/* count of live blocks */
-	u16		cellid;		/* index into pool->cells[] */
+	u32		live_objects;	/* count of live blocks */
+	u32		cellid;		/* index into pool->cells[] */
 	/*
 	 * Held for read during block access, for write during
 	 * compaction.  Compaction must not run concurrently with a
@@ -128,8 +128,8 @@ struct cell_pool {
 	struct mutex	gc_lock;
 	struct cell	*active;	/* current allocation target, or NULL */
 	struct cell	*cells;		/* directory array, indexed by cellid */
-	u16		nr_cells;	/* high-water mark of directory use */
-	u16		max_cells;	/* directory capacity */
+	u32		nr_cells;	/* high-water mark of directory use */
+	u32		max_cells;	/* directory capacity */
 	u8		cell_order;	/* alloc_pages order, same for all cells */
 	bool		use_thp;	/* request THP-backed pages */
 	struct list_head sparse;	/* cells below SPARSE_THRESHOLD objects */
@@ -152,7 +152,8 @@ struct cell_pool {
  * than nr_cells x cell_size of stored blocks, so a caller that knows
  * its worst case (incompressible data up to a device's disksize)
  * must size it accordingly, with headroom for COW churn.  Zero uses
- * CELL_DEFAULT_MAX_CELLS.  Counts above U16_MAX are clamped.
+ * CELL_DEFAULT_MAX_CELLS.  Counts above UINT_MAX are clamped (the
+ * handle encoding itself would also stop at cellid < 2^32).
  */
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 				   unsigned int nr_cells);
@@ -166,7 +167,7 @@ void cell_pool_destroy(struct cell_pool *cp);
  * this (typically by leaving the page uncompressed).
  */
 int cell_store(struct cell_pool *cp, const void *data, unsigned int len,
-	       u16 *cellid_out, u32 *offset_out);
+	       u32 *cellid_out, u32 *offset_out);
 
 /*
  * Account for @len bytes being freed from cell @cellid.
@@ -177,7 +178,7 @@ int cell_store(struct cell_pool *cp, const void *data, unsigned int len,
  * retained partially-free pool, so system-wide MemFree reflects
  * actual tmpfs usage without waiting for a shrinker.
  */
-void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
+void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	       unsigned int len);
 
 /*
@@ -189,7 +190,7 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
  * The caller must hold an entry reference pin to guarantee the cell
  * has not been returned to the buddy allocator.
  */
-int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
+int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	      void *dst, unsigned int *len);
 
 /*
@@ -200,7 +201,7 @@ int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 struct cell *cell_pool_pick_victim(struct cell_pool *cp);
 int cell_relocate_one(struct cell_pool *cp, struct cell *victim,
 		      const void *data, unsigned int len,
-		      u16 *new_cellid, u32 *new_offset);
+		      u32 *new_cellid, u32 *new_offset);
 void cell_pool_release_victim(struct cell_pool *cp, struct cell *victim);
 
 #endif /* _LINUX_CELL_STORE_H */

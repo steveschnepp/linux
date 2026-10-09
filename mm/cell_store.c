@@ -37,7 +37,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 				   unsigned int nr_cells)
 {
 	struct cell_pool *cp;
-	u16 i;
+	u32 i;
 
 	if (order < CELL_ORDER_MIN || order > CELL_ORDER_MAX)
 		return NULL;
@@ -54,20 +54,13 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	 *
 	 * Zero means "caller has no capacity bound" (tmpfs: the page cache
 	 * is compressible and bounded by size= accounting, so the legacy
-	 * default suffices).  The count is clamped to the u16 directory
-	 * index: beyond 65535 cells the incompressible-data cap at this
-	 * order is the ceiling, not memory.
+	 * default suffices).  @nr_cells is already unsigned int, so no
+	 * clamp is needed here: the caller owns any wider arithmetic
+	 * (cellzram sizes from a u64 disksize and truncates before the
+	 * call).
 	 */
 	if (!nr_cells)
 		nr_cells = CELL_DEFAULT_MAX_CELLS;
-	if (nr_cells > U16_MAX) {
-		pr_warn("cell_store: %u cells requested, capping at %u; "
-			"incompressible storage on this pool is limited to "
-			"%u x %lu KiB\n",
-			nr_cells, U16_MAX, U16_MAX,
-			(PAGE_SIZE << order) / 1024);
-		nr_cells = U16_MAX;
-	}
 
 	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
 	if (!cp)
@@ -108,7 +101,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 
 void cell_pool_destroy(struct cell_pool *cp)
 {
-	u16 i;
+	u32 i;
 
 	if (!cp)
 		return;
@@ -194,7 +187,7 @@ static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len)
 	/* Find a free directory slot (GC returns cells for reuse) */
 	c = NULL;
 	{
-		u16 slot;
+		u32 slot;
 
 		for (slot = 0; slot < cp->max_cells; slot++) {
 			if (!cp->cells[slot].pages[0]) {
@@ -262,7 +255,7 @@ static void cell_pool_return(struct cell_pool *cp, struct cell *c)
 }
 
 int cell_store(struct cell_pool *cp, const void *data,
-	       unsigned int len, u16 *cellid_out, u32 *offset_out)
+	       unsigned int len, u32 *cellid_out, u32 *offset_out)
 {
 	struct cell *c;
 	u32 off;
@@ -317,7 +310,7 @@ int cell_store(struct cell_pool *cp, const void *data,
 	return 0;
 }
 
-void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
+void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	       unsigned int len)
 {
 	struct cell *c;
@@ -385,7 +378,7 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	up_read(&c->lock);
 }
 
-int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
+int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	      void *dst, unsigned int *len)
 {
 	struct cell *c;
@@ -480,7 +473,7 @@ struct cell *cell_pool_pick_victim(struct cell_pool *cp)
 
 int cell_relocate_one(struct cell_pool *cp, struct cell *victim,
 		      const void *data, unsigned int len,
-		      u16 *new_cellid, u32 *new_offset)
+		      u32 *new_cellid, u32 *new_offset)
 {
 	struct cell *a;
 	u32 off;
