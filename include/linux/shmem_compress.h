@@ -533,6 +533,7 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool);
  */
 bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
 struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
+unsigned long shmem_comp_pool_gc_recoveries(struct shmem_comp_pool *pool);
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 
 /*

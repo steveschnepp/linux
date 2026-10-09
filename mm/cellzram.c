@@ -120,7 +120,30 @@ MODULE_PARM_DESC(cell_order,
  * buddy, so overwrite churn transiently needs more cells than the
  * live set.  This percentage is that buffer.
  */
-static int cell_headroom_pct = 30;
+/*
+ * Directory headroom over the incompressible worst case.  disksize /
+ * cell_size cells store disksize of incompressible data exactly, but
+ * the store path COW-allocates before the old block is freed and an
+ * emptied cell (not a partially freed one) is what returns to the
+ * buddy, so overwrite churn transiently needs more cells than the
+ * live set.  This percentage is that buffer.
+ *
+ * MEASURED (sweep_headroom.sh, the churn gate at 0/10/30/50/100):
+ * compaction-on-exhaustion (94d78f6ae3da) makes this a PERFORMANCE
+ * knob, not a correctness one -- every value from 0 to 100 passes the
+ * gate, and what changes is how often a store has to pay a GC pass.
+ * Exhaustion events fall monotonically with headroom (76/58/43/37/23)
+ * while peak cell storage for the same 8 MiB live set RISES
+ * (12.75/10.25/20/23.25/24 MiB) and throughput moves only ~6% across
+ * the whole range (121 -> 129 MB/s, reproduced within 1 MB/s).
+ *
+ * 10% is the knee: ~123 of the available ~129 MB/s (96%) for 10.25 MiB
+ * of cell storage instead of the 20 MiB that 30% held.  Going from 10
+ * to 100 buys 4% more throughput for 2.3x the peak RAM.  All the
+ * standing gates are green at 10% (cellzram 77/0, randio 4/0, fsdev
+ * 19/0, torture 231/0).
+ */
+static int cell_headroom_pct = 10;
 module_param(cell_headroom_pct, int, 0444);
 MODULE_PARM_DESC(cell_headroom_pct,
 		 "Cell directory headroom over disksize (percent)");
@@ -613,11 +636,13 @@ static ssize_t mm_stat_show(struct device *dev,
 	struct cellzram *cz = disk->private_data;
 	unsigned long long orig_bytes, compr_bytes, phys_bytes = 0, objects, entry_bytes;
 	unsigned long long zero_blocks;
+	unsigned long long gc_recoveries;
 
 	orig_bytes = atomic64_read(&cz->orig_bytes);
 	compr_bytes = atomic64_read(&cz->compr_bytes);
 	objects = atomic64_read(&cz->objects);
 	zero_blocks = atomic64_read(&cz->zero_blocks);
+	gc_recoveries = shmem_comp_pool_gc_recoveries(cz->pool);
 	if (cz->pool && shmem_comp_pool_uses_cells(cz->pool))
 		phys_bytes = (unsigned long long)
 			atomic_long_read(&shmem_comp_pool_cells(cz->pool)->
@@ -631,10 +656,10 @@ static ssize_t mm_stat_show(struct device *dev,
 	 */
 	entry_bytes = objects * sizeof(struct shmem_comp_entry);
 
-	return sysfs_emit(buf, "%llu %llu %llu %llu %llu %llu %llu\n",
+	return sysfs_emit(buf, "%llu %llu %llu %llu %llu %llu %llu %llu\n",
 			  orig_bytes, compr_bytes, phys_bytes, objects, entry_bytes,
 			  compr_bytes ? compr_bytes * 10000 / orig_bytes : 0,
-			  zero_blocks);
+			  zero_blocks, gc_recoveries);
 }
 static DEVICE_ATTR_RO(mm_stat);
 

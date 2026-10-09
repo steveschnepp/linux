@@ -173,6 +173,14 @@ struct shmem_comp_pool {
 	struct shmem_comp_pcpu __percpu *pcpu;	/* per-CPU compression contexts */
 	char algo_name[CRYPTO_MAX_ALG_NAME];	/* algorithm name */
 	atomic_t refcount;			/* shared across mounts using this pool */
+	/*
+	 * Writes that ran out of directory slots and were saved by the
+	 * exhaustion GC pass.  A counter, not a gauge: it answers "how
+	 * often would this write have failed before session 25", which
+	 * is the number a headroom sweep needs.  Appended to cellzram's
+	 * mm_stat so the field order of existing parsers stays stable.
+	 */
+	atomic64_t gc_recoveries;
 	struct list_head list;			/* global pools list */
 };
 
@@ -497,6 +505,17 @@ struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool)
 	return pool ? pool->cells : NULL;
 }
 
+/*
+ * shmem_comp_pool_gc_recoveries - writes saved by the exhaustion pass
+ * Cumulative since pool creation; see the field's comment.
+ */
+unsigned long shmem_comp_pool_gc_recoveries(struct shmem_comp_pool *pool)
+{
+	if (!pool)
+		return 0;
+	return (unsigned long)atomic64_read(&pool->gc_recoveries);
+}
+
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool)
 {
 	if (!pool || !pool->use_cells || !pool->cells)
@@ -764,6 +783,7 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 		mutex_lock(&pool->cells->gc_lock);
 		shmem_comp_cell_gc(pool);
 		mutex_unlock(&pool->cells->gc_lock);
+		atomic64_inc(&pool->gc_recoveries);
 
 		if (cell_store(pool->cells, data, len, &cellid, &offset))
 			return 0;
