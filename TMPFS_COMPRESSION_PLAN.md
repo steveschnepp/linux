@@ -2005,6 +2005,13 @@ struct cell_pool {
 };
 ```
 
+> **Stale listing -- do not implement from this.**  Written at spec
+> time; `nr_cells`/`max_cells` are now `u32` (cellzram widening,
+> session 24), the per-cell `order` and `active` shadows are gone, and
+> `cell_pool` gained `nslots` = `max_cells + 1`, a compaction-only
+> directory slot (session 25, `94d78f6ae3da`).  The authoritative
+> definition is `include/linux/cell_store.h`.
+
 ### Location encoding
 
 Each compressed block is addressed by `{cellid, offset, length}`.
