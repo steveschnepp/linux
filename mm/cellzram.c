@@ -85,21 +85,16 @@ struct cellzram {
 	u64			logical_bytes;	/* bytes; 0 until disksize set */
 	bool			compressed;	/* false when algo == none */
 	char			algo[CRYPTO_MAX_ALG_NAME];
-	/* stats for mm_stat / stat */
-	atomic64_t		orig_bytes;
-	atomic64_t		compr_bytes;
-	atomic64_t		objects;
+	/*
+	 * Event counters for io_stat: cumulative, one increment per
+	 * completed operation, safe to sample at any time.  The storage
+	 * figures (mm_stat) carry no counters at all -- they are walked
+	 * from the block table on read; see mm_stat_show.
+	 */
 	atomic64_t		io_reads;
 	atomic64_t		io_writes;
 	atomic64_t		failed_writes;
 	atomic64_t		discarded_blocks;
-	/*
-	 * all-zero writes stored as nothing (see cellzram_write_block):
-	 * a zero block reads back identically to an unwritten one via the
-	 * read-miss zero-fill, so no slot/entry/cell is held. Reported in
-	 * mm_stat to mirror zram's same_pages for the head-to-head.
-	 */
-	atomic64_t		zero_blocks;
 	struct mutex		io_lock;	/* serialises reset + sysfs */
 };
 
@@ -176,24 +171,17 @@ static int cellzram_major;
 static struct cellzram **cellzram_devs;
 
 /*
- * Drop one block-table reference on @id: account the stored length
- * (read under the entry pin, which cannot fail -- we own the table
- * reference) then release the table reference, which frees the cell
- * region when it was the last one.
+ * Drop the block table's reference on @old (a stored table value):
+ * frees the entry, which frees the cell region when it was the last
+ * reference.  Sentinel zero-blocks (xa_mk_value(0)) hold no entry,
+ * so there is nothing to free for those.
  */
-static void cellzram_put_entry(struct cellzram *dev, unsigned int id)
+static void cellzram_put_slot(void *old)
 {
-	unsigned int len_bytes = 0;
+	unsigned int id = xa_to_value(old);
 
-	/* get() cannot fail: the caller owns the table reference */
-	if (shmem_comp_entry_get(id, NULL, &len_bytes, NULL, NULL, NULL)) {
-		atomic64_sub(len_bytes, &dev->compr_bytes);
-		shmem_comp_entry_put(id);	/* drop the pin */
-	}
-	atomic64_dec(&dev->objects);
-	/* every entry represents one logical block (nr_pages == 1) */
-	atomic64_sub(PAGE_SIZE, &dev->orig_bytes);
-	shmem_comp_entry_put(id);		/* drop the table reference */
+	if (id)
+		shmem_comp_entry_put(id);
 }
 
 /*
@@ -217,6 +205,12 @@ static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
 			return 0;
 		}
 		id = xa_to_value(entry);
+		if (!id) {
+			/* zero-block sentinel: nothing stored, reads zero */
+			rcu_read_unlock();
+			memset(dst, 0, len_bytes);
+			return 0;
+		}
 		/*
 		 * Pin before touching storage: a concurrent overwrite
 		 * (xa_exchange + put) may be freeing this entry and its
@@ -305,22 +299,29 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 				const void *src)
 {
 	/*
-	 * all-zero page: store nothing, exactly as discard does (erase the
-	 * slot, drop the ref, cell returns to the buddy inline).  A zero
-	 * block reads back as zeros via the read-miss path, indistinguishable
-	 * from an unwritten block, so we hold no slot/entry/cell for it.
-	 * Filesystem metadata (unused inode tables, bitmaps, padding) is
-	 * zero-heavy, so this turns ext4's own zero writes into free storage
-	 * without the fs having to issue a discard.  Net win: a 512-word scan
-	 * replaces lz4 + store + entry_alloc.  Applies in raw (none) mode too.
+	 * all-zero page: store a sentinel slot (xa_mk_value(0); entry ids
+	 * are never 0), no entry/cell -- a zero block reads back as zeros
+	 * via the sentinel check in cellzram_read_block, indistinguishable
+	 * from an unwritten block to the reader.  Filesystem metadata
+	 * (unused inode tables, bitmaps, padding) is zero-heavy, so this
+	 * turns ext4's own zero writes into an xarray value slot instead
+	 * of lz4 + a cell + an entry.  Net win: a 512-word scan replaces
+	 * the whole store path.  Applies in raw (none) mode too.
+	 *
+	 * The slot is held (rather than erased, as before) so the block
+	 * table stays the complete picture of what is written: overwrite
+	 * and discard can see the old state, and mm_stat is an exact
+	 * table walk instead of four counters that drifted on every
+	 * repeated zero write.
 	 */
 	if (cellzram_page_all_zero(src)) {
-		void *old = xa_erase(&dev->table, block_nr);
+		void *old = xa_store(&dev->table, block_nr, xa_mk_value(0),
+				     GFP_NOIO);
 
+		if (IS_ERR(old))
+			return PTR_ERR(old);
 		if (old)
-			cellzram_put_entry(dev, xa_to_value(old));
-		atomic64_add(PAGE_SIZE, &dev->orig_bytes);
-		atomic64_inc(&dev->zero_blocks);
+			cellzram_put_slot(old);
 		return 0;
 	}
 	unsigned long handle;
@@ -368,19 +369,21 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 	}
 	kfree(cbuf);
 
-	/* live accounting: one logical block, @len_bytes stored bytes */
-	atomic64_add(PAGE_SIZE, &dev->orig_bytes);
-	atomic64_add(len_bytes, &dev->compr_bytes);
-	atomic64_inc(&dev->objects);
-
 	/*
 	 * Atomic replace-and-return-old (this tree has no xa_exchange):
 	 * readers may see either value; the pin protocol in
-	 * cellzram_read_block() covers the swap.
+	 * cellzram_read_block() covers the swap.  On ENOMEM the old slot
+	 * is left untouched; free the entry just made (its teardown
+	 * releases the cell region) rather than leaking it, and never
+	 * feed an XA_ERROR pointer to xa_to_value().
 	 */
 	old = xa_store(&dev->table, block_nr, xa_mk_value(id), GFP_NOIO);
+	if (IS_ERR(old)) {
+		shmem_comp_entry_put(id);
+		return PTR_ERR(old);
+	}
 	if (old)
-		cellzram_put_entry(dev, xa_to_value(old));
+		cellzram_put_slot(old);
 	return 0;
 }
 
@@ -478,7 +481,7 @@ static void cellzram_bio_discard(struct cellzram *dev, struct bio *bio)
 		void *old = xa_erase(&dev->table, block_nr);
 
 		if (old) {
-			cellzram_put_entry(dev, xa_to_value(old));
+			cellzram_put_slot(old);
 			atomic64_inc(&dev->discarded_blocks);
 		}
 	}
@@ -521,7 +524,7 @@ static void cellzram_slot_free_notify(struct block_device *bdev,
 	void *old = xa_erase(&dev->table, block_nr);
 
 	if (old) {
-		cellzram_put_entry(dev, xa_to_value(old));
+		cellzram_put_slot(old);
 		atomic64_inc(&dev->discarded_blocks);
 	}
 }
@@ -657,20 +660,56 @@ static ssize_t mm_stat_show(struct device *dev,
 {
 	struct gendisk *disk = dev_to_disk(dev);
 	struct cellzram *cz = disk->private_data;
-	unsigned long long orig_bytes, compr_bytes, phys_bytes = 0, objects, entry_bytes;
-	unsigned long long zero_blocks;
+	unsigned long long orig_bytes, compr_bytes = 0, phys_bytes = 0;
+	unsigned long long objects = 0, entry_bytes, zero_blocks = 0;
 	unsigned long long gc_recoveries;
+	unsigned long idx;
+	void *entry;
 
-	orig_bytes = atomic64_read(&cz->orig_bytes);
-	compr_bytes = atomic64_read(&cz->compr_bytes);
-	objects = atomic64_read(&cz->objects);
-	zero_blocks = atomic64_read(&cz->zero_blocks);
+	/*
+	 * The block table is the state; these numbers are walked from
+	 * it, not maintained on the write path.  Incremental accounting
+	 * here drifted: the zero-block path erased the slot and added
+	 * orig_bytes, so a repeated zero write added it again with
+	 * nothing to subtract, a data write over a zero block
+	 * double-counted, and zero_blocks never decremented on
+	 * overwrite or discard.  The walk is O(live blocks) and a
+	 * sysfs read is rare -- correctness beats speed on this path.
+	 *
+	 * io_lock serialises against reset and remove, which free the
+	 * pool; the walk itself runs under RCU against concurrent
+	 * bios, and an entry freed mid-walk is skipped by its failed
+	 * pin (the snapshot is consistent per entry, not atomic across
+	 * them -- nothing in the write path takes a lock covering all
+	 * blocks).
+	 */
+	mutex_lock(&cz->io_lock);
+	rcu_read_lock();
+	xa_for_each(&cz->table, idx, entry) {
+		unsigned int id = xa_to_value(entry);
+		unsigned int len;
+
+		if (!id) {	/* zero-block sentinel */
+			zero_blocks++;
+			continue;
+		}
+		if (shmem_comp_entry_get(id, NULL, &len, NULL, NULL, NULL)) {
+			objects++;
+			compr_bytes += len;
+			shmem_comp_entry_put(id);
+		}
+	}
+	rcu_read_unlock();
+
 	gc_recoveries = shmem_comp_pool_gc_recoveries(cz->pool);
 	if (cz->pool && shmem_comp_pool_uses_cells(cz->pool))
 		phys_bytes = (unsigned long long)
 			atomic_long_read(&shmem_comp_pool_cells(cz->pool)->
 							     pages_used)
 			<< PAGE_SHIFT;
+	mutex_unlock(&cz->io_lock);
+
+	orig_bytes = (objects + zero_blocks) << PAGE_SHIFT;
 	/*
 	 * entry_bytes is reported separately from phys_used: phys_used
 	 * is cell storage only, so the vs-zram comparison stays
@@ -736,7 +775,7 @@ static ssize_t reset_store(struct device *dev,
 		void *old = xa_erase(&cz->table, block_nr);
 
 		if (old)
-			cellzram_put_entry(cz, xa_to_value(old));
+			cellzram_put_slot(old);
 	}
 
 	if (cz->pool) {
@@ -744,14 +783,10 @@ static ssize_t reset_store(struct device *dev,
 		cz->pool = NULL;
 	}
 
-	atomic64_set(&cz->orig_bytes, 0);
-	atomic64_set(&cz->compr_bytes, 0);
-	atomic64_set(&cz->objects, 0);
 	atomic64_set(&cz->io_reads, 0);
 	atomic64_set(&cz->io_writes, 0);
 	atomic64_set(&cz->failed_writes, 0);
 	atomic64_set(&cz->discarded_blocks, 0);
-	atomic64_set(&cz->zero_blocks, 0);
 
 	blk_mq_unfreeze_queue(cz->disk->queue, memflags);
 	mutex_unlock(&cz->io_lock);
@@ -853,7 +888,7 @@ static void cellzram_remove(struct cellzram *cz)
 		void *old = xa_erase(&cz->table, block_nr);
 
 		if (old)
-			cellzram_put_entry(cz, xa_to_value(old));
+			cellzram_put_slot(old);
 	}
 	if (cz->pool) {
 		shmem_comp_pool_put(cz->pool);
