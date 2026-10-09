@@ -132,31 +132,39 @@ MODULE_PARM_DESC(cell_order,
  * exhaustion (94d78f6ae3da) makes this a PERFORMANCE knob, not a
  * correctness one -- every value from 0 to 100 passes the gate, and
  * what changes is how often a store has to pay for a GC pass.
- * Exhaustion events (mm_stat field 8) fall monotonically with
- * headroom; cell storage for the same 8 MiB live set does NOT.
  *
- * Fine sweep, 0..30 by 5, twice -- cells and exhaustions reproduced
- * exactly, throughput moved +-2 MB/s (so MB/s cannot resolve steps
- * this small; the two integer columns can):
+ * EXHAUSTIONS (mm_stat field 8) is the column that measures this knob.
+ * It falls monotonically with headroom at EVERY workload length tried
+ * (10/15/20% x 32..80 passes), so it is a genuine headroom effect:
  *
- *   pct  cells  exhaustions  MiB stored  MB/s
- *    0     51        76         9.75     116.6 / 114.9
- *    5     39        64         9.75     118.5 / 120.6
- *   10     41        58        10.25     119.4 / 118.3
- *   15     64        53        16.00     119.8 / 120.7
- *   20     60        49        15.00     119.5 / 120.9
- *   25     62        46        15.50     121.3 / 120.8
- *   30     80        43        20.00     121.1 / 120.9
+ *   pct    passes=32 / 48 / 64 / 80
+ *   10          28 / 43 / 58 / 73
+ *   15          26 / 40 / 53 / 67
+ *   20          24 / 36 / 49 / 62
  *
- * 10% is the knee.  Per +5% step, exhaustions avoided per extra cell:
- * 5->10 = 3.00, then it collapses -- 10->15 = 0.22, 25->30 = 0.17.
- * 15% is the one value in the range worth AVOIDING: it is dominated
- * by 20%, which has fewer exhaustions AND less storage.  Storage is
- * non-monotonic in headroom (reproduced exactly, mechanism not
- * established -- the compaction pass triggers on a full directory, so
- * its peak occupancy depends on the fragment pattern at that instant).
- * All standing gates green at 10% (cellzram 77/0, randio 4/0, fsdev
- * 19/0, torture 231/0).
+ * DO NOT read cell storage as a headroom metric.  An earlier revision
+ * of this comment ranked headroom values by end-of-churn cell storage
+ * and called 15% the value to avoid; that was a measurement artifact,
+ * and the ranking is the reverse of what it claimed.
+ *
+ * Storage depends on WHERE a fixed-size workload stops inside the
+ * fill -> exhaust -> compact -> refill cycle.  The compaction pass
+ * only runs when the directory is full, so occupancy climbs to the
+ * pool limit, drops in one batch, and climbs again -- end-of-churn
+ * occupancy is (post-GC floor) + (writes since the last GC), and the
+ * latter is essentially arbitrary mod the cycle length.  Measured at
+ * FIXED headroom (15%, pool 74 cells), varying only the pass count:
+ * 51, 49, 41, 70, 64, 56, 52 cells -- a 38-cell spread that swamps the
+ * 5-cell difference between the 10% and 20% means.
+ *
+ *   pct    mean cells (7 pass counts)   sd
+ *   10              52.1               11.1
+ *   15              54.7                9.7
+ *   20              57.3               11.9
+ *
+ * 10% stays the default on the exhaustion curve alone, which is the
+ * column that reproduces.  All standing gates green (cellzram 77/0,
+ * randio 4/0, fsdev 19/0, torture 231/0).
  */
 static int cell_headroom_pct = 10;
 module_param(cell_headroom_pct, int, 0444);
