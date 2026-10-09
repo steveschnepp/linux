@@ -128,19 +128,34 @@ MODULE_PARM_DESC(cell_order,
  * buddy, so overwrite churn transiently needs more cells than the
  * live set.  This percentage is that buffer.
  *
- * MEASURED (sweep_headroom.sh, the churn gate at 0/10/30/50/100):
- * compaction-on-exhaustion (94d78f6ae3da) makes this a PERFORMANCE
- * knob, not a correctness one -- every value from 0 to 100 passes the
- * gate, and what changes is how often a store has to pay a GC pass.
- * Exhaustion events fall monotonically with headroom (76/58/43/37/23)
- * while peak cell storage for the same 8 MiB live set RISES
- * (12.75/10.25/20/23.25/24 MiB) and throughput moves only ~6% across
- * the whole range (121 -> 129 MB/s, reproduced within 1 MB/s).
+ * MEASURED (sweep_headroom.sh, the churn gate): compaction-on-
+ * exhaustion (94d78f6ae3da) makes this a PERFORMANCE knob, not a
+ * correctness one -- every value from 0 to 100 passes the gate, and
+ * what changes is how often a store has to pay for a GC pass.
+ * Exhaustion events (mm_stat field 8) fall monotonically with
+ * headroom; cell storage for the same 8 MiB live set does NOT.
  *
- * 10% is the knee: ~123 of the available ~129 MB/s (96%) for 10.25 MiB
- * of cell storage instead of the 20 MiB that 30% held.  Going from 10
- * to 100 buys 4% more throughput for 2.3x the peak RAM.  All the
- * standing gates are green at 10% (cellzram 77/0, randio 4/0, fsdev
+ * Fine sweep, 0..30 by 5, twice -- cells and exhaustions reproduced
+ * exactly, throughput moved +-2 MB/s (so MB/s cannot resolve steps
+ * this small; the two integer columns can):
+ *
+ *   pct  cells  exhaustions  MiB stored  MB/s
+ *    0     51        76         9.75     116.6 / 114.9
+ *    5     39        64         9.75     118.5 / 120.6
+ *   10     41        58        10.25     119.4 / 118.3
+ *   15     64        53        16.00     119.8 / 120.7
+ *   20     60        49        15.00     119.5 / 120.9
+ *   25     62        46        15.50     121.3 / 120.8
+ *   30     80        43        20.00     121.1 / 120.9
+ *
+ * 10% is the knee.  Per +5% step, exhaustions avoided per extra cell:
+ * 5->10 = 3.00, then it collapses -- 10->15 = 0.22, 25->30 = 0.17.
+ * 15% is the one value in the range worth AVOIDING: it is dominated
+ * by 20%, which has fewer exhaustions AND less storage.  Storage is
+ * non-monotonic in headroom (reproduced exactly, mechanism not
+ * established -- the compaction pass triggers on a full directory, so
+ * its peak occupancy depends on the fragment pattern at that instant).
+ * All standing gates green at 10% (cellzram 77/0, randio 4/0, fsdev
  * 19/0, torture 231/0).
  */
 static int cell_headroom_pct = 10;
