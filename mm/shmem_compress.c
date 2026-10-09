@@ -2229,9 +2229,10 @@ void shmem_comp_free_swap(struct address_space *mapping, void *radswap)
  *
  * The "compression", "compressor" and "merge_pages" attributes are the
  * global defaults for mounts that do not override them; "comp_stats",
- * "cell_stats" and "gc_now" expose the live state of every pool.
- * Registered by tmpfs_sysfs_init() in mm/shmem.c with the tmpfs
- * kobject as parent.
+ * "cell_stats" and "gc_now" expose the live state of every pool, and
+ * "mount_stats" breaks the per-mount counters out so several compressed
+ * mounts can be observed in one boot.  Registered by
+ * tmpfs_sysfs_init() in mm/shmem.c with the tmpfs kobject as parent.
  */
 static ssize_t compression_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -2432,6 +2433,60 @@ static struct kobj_attribute compress_watermark_attr =
 	__ATTR(compress_watermark, 0644, compress_watermark_show,
 	       compress_watermark_store);
 
+/*
+ * Per-mount counters.  comp_stats above aggregates every pool, so on a
+ * boot with several compressed mounts it cannot attribute anything to
+ * a single one -- the policy matrix worked around that by running one
+ * mount per boot and reading global deltas (sessions 15-18), which
+ * cost a boot per configuration.  This file removes the workaround.
+ *
+ * One line per compressed mount.  @dev is sb->s_dev in decimal, the
+ * same number `stat -c %d <mountpoint>` prints, so a test can pick out
+ * its own mount:
+ *
+ *   grep "^dev=$(stat -c %d /mnt/x) " /sys/fs/tmpfs/compression/mount_stats
+ *
+ * Chosen over a per-mount kobject because the only consumer is a
+ * reader; a kobject tree would add lifetime management tied to
+ * fill_sb/put_super to serve one grep.
+ */
+static ssize_t mount_stats_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct shmem_comp_sb *comp;
+	int len = 0;
+
+	/*
+	 * The list mutex serialises against put_super's teardown, same
+	 * as gc_now.  Only atomic counter reads happen inside -- no
+	 * allocation, no sleeping call -- so this is safe from a sysfs
+	 * read regardless of what the mount is doing.
+	 */
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_for_each_entry(comp, &shmem_comp_mounts, list) {
+		unsigned int major = MAJOR(comp->sb->s_dev);
+		unsigned int minor = MINOR(comp->sb->s_dev);
+
+		len += sysfs_emit_at(buf, len,
+			"dev=%u:%u stat_dev=%lu mode=%s wm=%u:%u "
+			"pages=%ld bytes=%ld aged=%ld skipped=%ld "
+			"cells=%d\n",
+			major, minor,
+			(unsigned long)comp->sb->s_dev,
+			READ_ONCE(comp->hot) ? "hot" : "chill",
+			comp->watermark_low, comp->watermark_high,
+			atomic_long_read(&comp->pages),
+			atomic_long_read(&comp->bytes),
+			atomic_long_read(&comp->aged_pages),
+			atomic_long_read(&comp->skipped_dead),
+			comp->pool && shmem_comp_pool_uses_cells(comp->pool));
+	}
+	mutex_unlock(&shmem_comp_mounts_lock);
+
+	return len;
+}
+static struct kobj_attribute mount_stats_attr = __ATTR_RO(mount_stats);
+
 static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
 
 static ssize_t cell_stats_show(struct kobject *kobj,
@@ -2485,6 +2540,7 @@ static struct attribute *tmpfs_comp_attrs[] = {
 	&merge_pages_attr.attr,
 	&compress_watermark_attr.attr,
 	&comp_stats_attr.attr,
+	&mount_stats_attr.attr,
 	&cell_stats_attr.attr,
 	&gc_now_attr.attr,
 	NULL,
