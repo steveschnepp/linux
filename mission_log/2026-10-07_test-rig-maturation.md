@@ -17,6 +17,13 @@ shell /init with a static C PID 1 supervisor (and the CONFIG_POSIX_TIMERS
 gotcha that made alarm() silently dead), and restructuring the rig repo into
 tracked guest/ vs disposable build/.
 
+> **Note (2026-10-09):** session 11's "What We'd Do Differently" and
+> sessions 12-13's "What We Decided" / "What We'd Do Differently"
+> sections were NOT written contemporaneously.  They were reconstructed
+> on 2026-10-09 from the pi session transcripts and the sessions' own
+> text, when the linter started enforcing the template.  Content is
+> grounded; in-the-moment hindsight is by definition missing.
+
 - Previous: `2026-10-07_compression-policy-option-surface.md`
 
 ## Session 11: Apple's fstools in the guest -- fsx + fstorture on compressed tmpfs (2026-10-07)

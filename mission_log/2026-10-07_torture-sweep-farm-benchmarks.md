@@ -17,6 +17,13 @@ rig environment (KVM acceleration, ACPI/SMP), correcting the cell256k
 mis-comparison, and the steady-state analysis that concluded lz4 +
 merge_pages=1 is the Pareto default for small-file farms.
 
+> **Note (2026-10-09):** session 6's "What We'd Do Differently" and
+> session 7's "What We Decided" / "What We'd Do Differently" sections
+> were NOT written contemporaneously.  They were reconstructed on
+> 2026-10-09 from the pi session transcripts and the sessions' own
+> text, when the linter started enforcing the template.  Content is
+> grounded; in-the-moment hindsight is by definition missing.
+
 - Previous: `2026-10-07_cellzram-block-device.md`
 
 ## Session 6: the torture sweep -- munin untar farm, 1..64 threads (2026-10-07)

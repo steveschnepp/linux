@@ -17,6 +17,13 @@ maintenance-pass machinery, the policy matrices across watermark/size/merge
 axes (including the 384M correction), the configuration guidance, and the
 default flip 0:0 -> 50:70 that completed the plan's landing sequence.
 
+> **Note (2026-10-09):** the "What We Decided" / "What We'd Do
+> Differently" sections of sessions 14-20 were NOT written
+> contemporaneously.  They were reconstructed on 2026-10-09 from the
+> pi session transcripts and the sessions' own text, when the linter
+> started enforcing the template.  Content is grounded; in-the-moment
+> hindsight is by definition missing.
+
 - Previous: `2026-10-07_test-rig-maturation.md`
 
 ## Roadmap addendum: the open-work expansion -- Stage 2 machinery and cellzram hardening (recorded 2026-10-07, between sessions 11 and 12)
