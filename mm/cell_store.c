@@ -121,7 +121,7 @@ void cell_pool_destroy(struct cell_pool *cp)
 		struct cell *c = &cp->cells[i];
 
 		if (c->pages[0])
-			__free_pages(c->pages[0], c->order);
+			__free_pages(c->pages[0], cp->cell_order);
 	}
 
 	kvfree(cp->cells);
@@ -216,8 +216,6 @@ static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len)
 	c->next_free = 0;
 	c->live_bytes = 0;
 	c->live_objects = 0;
-	c->order = cp->cell_order;
-	c->active = true;
 	INIT_LIST_HEAD(&c->node);
 	/* rwsem initialised once at pool create — slots are reused */
 
@@ -249,15 +247,14 @@ static void cell_pool_return(struct cell_pool *cp, struct cell *c)
 		return;
 
 	list_del_init(&c->node);
-	__free_pages(c->pages[0], c->order);
+	__free_pages(c->pages[0], cp->cell_order);
 	c->pages[0] = NULL;
 	c->base = NULL;
-	c->active = false;
 
-	atomic_long_sub(1UL << c->order, &cp->pages_used);
+	atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
 
 	cell_dbg("return cell %u: freed %lu KiB, %ld pages left",
-		 c->cellid, (PAGE_SIZE << c->order) / 1024,
+		 c->cellid, (PAGE_SIZE << cp->cell_order) / 1024,
 		 atomic_long_read(&cp->pages_used));
 
 	if (cp->active == c)
@@ -312,7 +309,7 @@ int cell_store(struct cell_pool *cp, const void *data,
 
 	cell_dbg("store: cell=%u offset=%u len=%u (next_free=%u/%lu, %u objects)",
 		 c->cellid, off, len,
-		 c->next_free, (1UL << c->order) * PAGE_SIZE,
+		 c->next_free, (1UL << cp->cell_order) * PAGE_SIZE,
 		 c->live_objects);
 
 	*cellid_out = c->cellid;
@@ -346,11 +343,13 @@ void cell_free(struct cell_pool *cp, u16 cellid, u32 offset,
 	cell_dbg("free: cell=%u offset=%u len=%u (live_bytes=%u, objects=%u)%s",
 		 cellid, offset, len, c->live_bytes, c->live_objects,
 		 empty ? " -> empty" :
-		 CELL_IS_SPARSE(c->live_bytes, 1UL << c->order << PAGE_SHIFT) ?
+		 CELL_IS_SPARSE(c->live_bytes,
+				1UL << cp->cell_order << PAGE_SHIFT) ?
 		 " -> sparse" : "");
 
 	if (!empty &&
-	    CELL_IS_SPARSE(c->live_bytes, 1UL << c->order << PAGE_SHIFT)) {
+	    CELL_IS_SPARSE(c->live_bytes,
+			   1UL << cp->cell_order << PAGE_SHIFT)) {
 		/*
 		 * Sparse: hand to the async GC.  Evacuation never runs in
 		 * the freeing thread's context — one GC pass batches many
@@ -411,7 +410,7 @@ int cell_load(struct cell_pool *cp, u16 cellid, u32 offset,
 		return -EINVAL;
 	}
 
-	cell_size = (1UL << c->order) * PAGE_SIZE;
+	cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
 	if (offset >= cell_size) {
 		up_read(&c->lock);
 		return -EINVAL;
@@ -537,7 +536,7 @@ void cell_pool_release_victim(struct cell_pool *cp, struct cell *victim)
 		cell_pool_return(cp, victim);
 	} else if (victim->pages[0] &&
 		   CELL_IS_SPARSE(victim->live_bytes,
-				  1UL << victim->order << PAGE_SHIFT)) {
+				  1UL << cp->cell_order << PAGE_SHIFT)) {
 		if (list_empty(&victim->node))
 			list_add(&victim->node, &cp->sparse);
 	}

@@ -1264,7 +1264,7 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 			continue;
 
 		len = ent->length;
-		if (offset + len > (1UL << vic->order) * PAGE_SIZE) {
+		if (offset + len > (1UL << cp->cell_order) * PAGE_SIZE) {
 			shmem_comp_entry_put(id);
 			continue;
 		}
@@ -1405,7 +1405,7 @@ int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len)
 			continue;
 		}
 
-		cell_size = (1UL << c->order) * PAGE_SIZE;
+		cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
 		if (offset + *len > cell_size)
 			*len = cell_size - offset;
 		memcpy(dst, c->base + offset, *len);
@@ -1533,9 +1533,9 @@ int shmem_comp_cell_stats_show(char *buf, size_t size)
 			off += scnprintf(buf + off, size - off,
 				"  cell %u: offset=%u/%lu live=%u/%u %s%s\n",
 				c->cellid, c->next_free,
-				(1UL << c->order) * PAGE_SIZE,
+				(1UL << cp->cell_order) * PAGE_SIZE,
 				c->live_objects, c->live_bytes,
-				c->active ? "ACTIVE" : "",
+				c == cp->active ? "ACTIVE" : "",
 				list_empty(&c->node) ? "" : " SPARSE");
 
 			if (off >= size - 1)

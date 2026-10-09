@@ -34,6 +34,12 @@
  *      callers must ensure the source buffer remains valid until the
  *      memcpy completes.  In the compression path this is guaranteed
  *      by the entry reference pin.
+ *
+ *   5. A cell carries no pool-wide state: the allocation order is
+ *      cp->cell_order (identical for every cell in the pool) and the
+ *      allocation target's identity is cp->active.  Both used to be
+ *      cached per-cell as well; a shadow copy can drift from the
+ *      authoritative pool field, and every reader already holds cp.
  */
 #ifndef _LINUX_CELL_STORE_H
 #define _LINUX_CELL_STORE_H
@@ -95,8 +101,6 @@ struct cell {
 	u32		live_bytes;	/* sum of live block lengths */
 	u16		live_objects;	/* count of live blocks */
 	u16		cellid;		/* index into pool->cells[] */
-	u8		order;		/* alloc_pages order for this cell */
-	bool		active;		/* is this the allocation target? */
 	/*
 	 * Held for read during block access, for write during
 	 * compaction.  Compaction must not run concurrently with a
