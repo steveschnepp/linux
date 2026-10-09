@@ -4026,3 +4026,164 @@ in the cell allocator.
    under-counted cellzram's true cost by failing to store everything.
 4. The randio gate should join the standing per-commit rotation once
    green (it is the only gate feeding incompressible-at-capacity data).
+
+---
+
+## Session 23: bootstrap for the capacity fix -- pages[1] landed, widen-vs-slice settled (2026-10-09)
+
+**Purpose of this entry: let a fresh session implement the fix without
+re-deriving anything.**  Read this, then go to "Implementation Plan".
+
+### What We Did
+
+1. **Landed the metadata prerequisite** (`152a30027085`):
+   `struct cell.pages[1 << CELL_ORDER_MAX]` -> `pages[1]`.  The array
+   was dead -- every access in both TUs is `pages[0]`, never indexed,
+   never `sizeof`/`memset`'d.  A cell is one physically-contiguous
+   compound page (single `alloc_pages(order)`), so the head reference
+   alone is the allocation.  `sizeof(struct cell)` 8296 -> 112 B; a
+   1024-cell directory drops 8.1 MB -> 112 KB.  This is what makes a
+   capacity-sized directory affordable instead of trading the
+   correctness bug for a memory bug.
+
+2. **Gates re-run post-change, all as expected**: cellzram 77/0,
+   fsdev exit 0, randio byte-identical pre-existing failure (25915
+   verified, errno=5, 64 I/O errors).  The randio failure is untouched
+   -- correct, this commit touched no allocation logic.
+
+3. **Settled widen-vs-slice** (user question: "can we slice per 64k
+   cells?"): the u16 cellid ceiling is SOFT, but the answer is widen,
+   not slice.  Verified bit budget of the live handle:
+
+   ```c
+   shmem_comp_pack_loc(u16 cellid, u32 offset)
+       return ((unsigned long)(cellid + 1) << 32) | offset;
+   // bits  63        48 47     32 31     22 21    0
+   //       [ unused 16b][cellid+1][unused 10b][offset 22b]
+   ```
+
+   The handle is a full `unsigned long` (64 b), stored in
+   `entry.handle` -- NOT a swp_entry, so no 55-bit squeeze.  26 spare
+   bits sit in it today (offset needs 22 of its 32; cellid+1 uses bits
+   32-47, leaving 48-63 empty).  The u16 is a *type choice*:
+   `cellid` is declared u16 in struct cell, `max_cells`, and ~15
+   function signatures -- that is the only wall.  A two-level
+   {slice, within-slice} directory would need a slice index in those
+   same spare bits AND add a second indirection + slice-aware GC.
+   Widening cellid u16->u32 uses the bits directly: one flat directory,
+   ~15 signature changes, +2 B in struct cell.  24-bit cellid = 16.7M
+   cells = 256 GB at order-2.
+
+4. **Confirmed the ceiling is not the bug.**  `max_cells=256`
+   (cell_store.c:53) is the bug.  u16's 65535 = 64x what a 256 MiB
+   device needs (1024 cells); the ceiling only binds above 15 GB
+   (order-6) or 1 TB (order-2) of incompressible data on one device.
+   So: derive max_cells (fixes the failure); widen cellid LATER if a
+   >15 GB device ever appears -- cheap, self-contained, not a
+   prerequisite.
+
+### What We Learned
+
+- **`struct page` cannot be embedded by value.**  It is a slot in the
+  kernel's `vmemmap`, indexed by PFN (`pfn_to_page(pfn) = vmemmap +
+  pfn`); that slot IS the page's authoritative state (refcount,
+  mapcount, buddy flags) and `__free_pages()` mutates that exact slot.
+  A copy in struct cell would be a second inert object.  Only a
+  reference (pointer or PFN) is meaningful.
+
+- **But the pointer was redundant with `base` anyway.**  `base =
+  page_address(page)` and `page = virt_to_page(base)` are bijective for
+  direct-map pages.  Checked the precondition: `cell_gfp()` returns
+  `GFP_KERNEL`/`GFP_TRANSHUGE`, never `__GFP_HIGHMEM`, so every cell is
+  direct-map and the equivalence holds (on highmem `page_address()`
+  returns NULL and it breaks -- worth checking, not assuming).  The
+  `pages[]` field could be DELETED (recover with `virt_to_page(c->base)`
+  at the two `__free_pages` sites); user chose the conservative
+  `pages[1]` instead, deferring the derivation until it is understood
+  cold.  Right call: smallest mechanical change, identical semantics.
+
+- **A type used in ~15 signatures is a wall you can see; a type used
+  in one inline packing function is a wall you can route around.**  The
+  u16 looked hard until the bit budget showed the handle was half
+  empty.  When a ceiling surprises you, price the ENCODING, not the
+  declaration.
+
+- **Style rule (user, standing):** terse but always motivated -- every
+  claim carries its mechanism.  "Otherwise it's cult not science."
+
+### Files / Commits
+
+| commit | what |
+|--------|------|
+| `152a30027085` | cell_store: pages[1024] -> pages[1] (8296 -> 112 B/cell) |
+| `1511001` (rig) | test_randio + TEST_CELLORDER passthrough + EXT4/ZRAM config |
+| `5cb7a6e2b98c` | cellzram zero-page optimization (session 21, green) |
+
+| location | fact |
+|----------|------|
+| `mm/cell_store.c:53` | `cp->max_cells = 256;` -- THE BUG |
+| `mm/cell_store.c:36` | `cell_pool_create(unsigned int order, bool use_thp)` -- add capacity param here |
+| `include/linux/cell_store.h:139` | its prototype |
+| `mm/cellzram.c:517` | `shmem_comp_pool_create(algo, cell_order)` -- disksize IS known here (`size_bytes`, set 2 lines below to `cz->logical_bytes`) |
+| `mm/shmem_compress.c:1891` | tmpfs call site -- must stay BOUNDED (no disksize; keep a default) |
+| `include/linux/cell_store.h` | struct cell (now 112 B), struct cell_pool (max_cells u16) |
+
+### Implementation Plan (for the next session)
+
+**Goal:** derive `max_cells` from device capacity so cellzram can store
+its advertised `disksize` in incompressible data.  Fixes the randio
+gate.
+
+1. **Thread a cell-count hint** through the two create layers:
+   `cell_pool_create(order, use_thp, nr_cells)` ->
+   `shmem_comp_pool_create(algo, cell_order, nr_cells)`.
+   - cellzram (`cellzram.c:517`): pass
+     `DIV_ROUND_UP(size_bytes, cell_size) + headroom`.
+   - tmpfs (`shmem_compress.c:1891`): pass 0 / a bounded default --
+     behavior unchanged; tmpfs page cache is compressible and bounded
+     by size= accounting, never hit this.
+
+2. **Open decision #1 -- the u16 ceiling.**  Clamp `nr_cells` to
+   `U16_MAX` and let incompressible writes past `65535 x cell_size`
+   fail IOERR (recommended: matches zram, which also cannot store
+   unbounded incompressible data; compressed data needs far fewer
+   cells so it is unaffected), OR reject the `disksize` with EINVAL at
+   set time if it needs >65535 cells at the chosen order (cleaner
+   contract, but rejects valid compressed workloads).  RECOMMENDED:
+   clamp + one `pr_warn` stating the incompressible cap at this order.
+
+3. **Open decision #2 -- headroom, and the gap derivation cannot
+   close.**  The write path COW-allocates the new block before
+   `xa_store` frees the old, AND a freed block only returns a cell to
+   the buddy when the whole cell empties (`live_bytes == 0`), else it
+   waits for GC.  So overwrite churn accumulates partially-filled cells
+   past `live_data / cell_size`.  Two separable options:
+   a. Fixed multiplier headroom (e.g. +25%) -- simple, arbitrary.
+   b. **GC-on-exhaustion**: `cell_make_active` currently returns
+      `-ENOMEM` when no free slot exists, WITHOUT trying GC.  Make it
+      run one GC pass to drain sparse cells, and fail only if that
+      also comes up empty.  This is the more robust half: a bigger
+      directory reduces how OFTEN exhaustion happens; this fixes WHY
+      exhaustion is fatal.  Recommend (b), possibly with (a) as a
+      small safety margin.
+
+4. **Acceptance:** randio gate cellzram fs phase must go GREEN (was
+   25915 verified / ~2500 bad / errno=5); zram unchanged; cellzram
+   77/0; fsdev exit 0; config-off build clean.  Then re-run the
+   distinct-data phase (session 21) -- its 64 MiB incompressible set
+   is EXACTLY the old cap, so it likely under-counted cellzram's true
+   cost and its 101.8%-of-zram number needs re-measuring under the fix.
+
+5. **Do NOT widen cellid in this change.**  It is a separate,
+   self-contained follow-up, only needed above 15 GB/device.  Keep the
+   capacity fix bisectable on its own.
+
+### Next Steps (ordered)
+
+1. Implement the plan above (one bisectable commit; rig gates green).
+2. Re-measure distinct-data RAM under the fix (the 101.8% may move).
+3. Optional follow-up: widen cellid u16->u32 using the handle's spare
+   bits, IF a >15 GB cellzram device is ever a target.
+4. Optional: delete `pages[]` entirely (recover via `virt_to_page(c->base)`);
+   deferred until understood cold.
+5. randio joins the per-commit rotation once green.
