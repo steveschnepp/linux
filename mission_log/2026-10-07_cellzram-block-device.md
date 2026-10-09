@@ -17,7 +17,6 @@ bugs the rig found, which landed the mandatory unit-suffix naming rule and
 the O_DIRECT-for-block-devices rule.
 
 - Previous: `2026-10-07_tmpfs-upstream-carve.md`
-- Next in series: `2026-10-07_torture-sweep-farm-benchmarks.md`
 
 ## Session 5: cellzram -- the block device, and a parade of unit bugs (2026-10-07)
 

@@ -15,8 +15,6 @@ Covers session 4 (2026-10-07): the five-commit carve that moved sysfs, option
 parsing, and the 755-line data path out of mm/shmem.c into
 mm/shmem_compress.c, with the config-off build as a per-commit gate.
 
-- Previous: `2026-10-05_tmpfs-compression-foundation.md`
-- Next in series: `2026-10-07_cellzram-block-device.md`
 
 ## Session 4: the upstream carve -- shmem.c from +1283 to +250 (2026-10-07)
 

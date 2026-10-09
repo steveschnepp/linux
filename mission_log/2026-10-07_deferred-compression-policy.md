@@ -18,7 +18,6 @@ axes (including the 384M correction), the configuration guidance, and the
 default flip 0:0 -> 50:70 that completed the plan's landing sequence.
 
 - Previous: `2026-10-07_test-rig-maturation.md`
-- Next in series: `2026-10-09_cellzram-workloads-and-capacity.md`
 
 ## Roadmap addendum: the open-work expansion -- Stage 2 machinery and cellzram hardening (recorded 2026-10-07, between sessions 11 and 12)
 
@@ -235,6 +234,28 @@ What was missing, and what I added:
   breaks every non-compression config -- cheap to check, expensive to
   discover downstream.
 
+### What We Decided
+
+- Stage 2 shape: candidate markers for chill-mode writes;
+  shmem_comp_maintain() per mount -- mandatory survivor compression,
+  then sparse-cell evacuation, then mode flips -- with ~4:1
+  compression:GC budget alternation (survivors first also raises
+  cell density, making later GC cheaper).
+- Teardown is delist-then-cancel: delayed_work can re-arm itself or
+  siblings, so "cancel then free" races the re-schedule.
+- gc_now runs maintain() synchronously inside the sysfs write,
+  making stat deltas exact without polling.
+
+### What We'd Do Differently
+
+- Re-read verification helpers before building on them:
+  verify_pages() memcmp'd its read buffer against itself -- a
+  helper that cannot fail is worse than none; two-buffer got/want
+  is the pattern.
+- mkdir gate mountpoints unconditionally: ENOENT on mount() names
+  the mountpoint, not the fs, and session 11 had already taught
+  this.
+
 ### Test Results
 
 - test_watermark_policy: 7/7 PASS (chill writes uncompressed; gc_now
@@ -340,6 +361,21 @@ the T=1/T=64 comparison rows.
 - 3s windows x one boot per config are enough for policy validation
   (the deltas are 2x), not for publishing throughput numbers.
 
+### What We Decided
+
+- The matrix asserts engagement per-CONFIG on the CUMULATIVE
+  aged_pages counter for chill (death-before-pop means the live
+  gauge is legitimately zero); per-point live gauges stay only for
+  eager, never keeps the no-aging negative invariant.
+- 3s windows x one boot per config validate POLICY (the deltas are
+  2x); they are not throughput publication numbers.
+
+### What We'd Do Differently
+
+- Name the assertion axis (live gauge vs cumulative counter) before
+  writing the gate: the first run failed 7 assertions per chill
+  boot, all measuring eager-mode engagement semantics.
+
 ### Test Results / Benchmarks
 
 - Matrix run 1: never 226/0, eager 261/0, 50:70 254/7, 50:100
@@ -443,6 +479,23 @@ Flip attributions (dmesg, in-stream + final dmesg re-dump = x2 each):
   was a filesystem-sync race, same class as the write-tool one --
   sleep before reading freshly created files.
 
+### What We Decided
+
+- compress_watermark= is a MOUNT option (only the sysfs knob is
+  boot-global); the cross product runs as 16 per-mount rows in ONE
+  boot (23 mounts / 22 umounts) instead of ~20 boots / ~2h -- every
+  row re-exercises fill_sb/put_super including the Stage 2
+  teardown, which one-boot-per-combo never touched again.
+- A config row embedding size= owns the whole options string:
+  fs_parse keeps the FIRST value of a duplicated key, so the
+  unconditional size= prep is skipped when the row carries one.
+
+### What We'd Do Differently
+
+- Check an option's scope (mount vs boot-global) before building a
+  sweep around it; the 20-boot sweep script was written and
+  deleted the same day.
+
 ### Test Results
 
 - One-boot matrix: 882 passed / 11 failed (all11 = untar_fail at
@@ -529,6 +582,24 @@ Ran the sweep at 384M twice, then at 512M.
 - 50:70 at headroom sizes flips only under real pressure (72% peak)
   and defers otherwise.  No reason to move the default levels; step
   5 (the flip) stands.
+
+### What We Decided
+
+- The 384M row is DISCARDED: at 98304 blocks every mode lives
+  within +/-5% of the cap at T=64, so untar outcomes are
+  scheduling noise (identical boots reshuffle every failure); the
+  watermark axis is measured at 512M instead (466/0).
+- Rule: one cheap identical-boot rerun before interpreting any
+  cliff-shaped result; two boots disagreeing is the tell.
+- The real watermark map: T=64 throughput tracks TIME SPENT HOT,
+  not the level; 50:70 sits in the fast cluster AND relieves
+  pressure -- the reason it is the default candidate.
+
+### What We'd Do Differently
+
+- Run the repeatability check before narrating a cliff; the
+  session-16 "50:70 wins the 384M cliff" reading was luck and cost
+  the next session to retract.
 
 ### Test Results
 
@@ -627,6 +698,29 @@ Two additions to the torture gate, then the merge sweep:
 - merge_pages and the policy model compose: write-time group
   dispatch vs aging-pass singles is now an OBSERVED asymmetry with
   numbers, not just a design note.
+
+### What We Decided
+
+- merge_pages stays default 1: under 50:70 the aging pass does
+  singles, so write-time group dispatch is an eager/large-file
+  niche; the cross (534/0) measured the asymmetry with numbers.
+- The empty-anchor row bug is fixed with the k=n pattern; the
+  all[n++] = { mnames[n], ... } form relies on unspecified
+  evaluation order.
+
+### What We'd Do Differently
+
+- THE PARALLEL-EDIT TRAP: the `edit` and the `gcc + repack + sweep`
+  went out in one parallel tool block; the compiler read pre-fix
+  source.  Dependent tool calls are SEQUENTIAL, always -- the same
+  class of trap bit twice in this session.
+- Three byte-identical "different" runs (534/7) meant the
+  experiment never changed, not that the system is deterministic;
+  identical results across runs is the tell.
+- strings(1) proving a literal absent proves nothing at -O2
+  (constant folding); disassemble or run.
+- A standalone repro compiled from the CURRENT source bisects
+  binary-vs-source doubt in one step.
 
 ### Test Results
 
@@ -741,6 +835,23 @@ right direction.
   right home for durable recommendations; this entry is the
   provenance.
 
+### What We Decided
+
+- Durable recommendations live in TMPFS_COMPRESSION_PLAN.md's
+  "Configuration guidance" section; this log is the provenance
+  trail (every row traces to the matrix that produced it).
+- The decision set: lz4 + 50:70 + headroomed size= (>= 1.5-2x peak
+  live set) is the default answer; merge/zstd/threshold are eager
+  or large-file niches; size= is the one hard constraint;
+  throughput tracks time-spent-hot, not the level.
+
+### What We'd Do Differently
+
+- Synthesis is a session-shaped deliverable: schedule it after the
+  matrices instead of squeezing it in; it forced three
+  restatements (384M caveat -> rule, merge demoted to niche, zstd
+  qualified) that no single matrix run would have produced.
+
 ### Test Results
 
 No new runs; all numbers cited come from:
@@ -806,6 +917,29 @@ inheritance (engage=config(aged) auto-resolution;231/0).
   remembering: when a default lives implicitly in many call sites,
   the explicit-pin convention for MECHANISM tests is what keeps the
   default flippable later.
+
+### What We Decided
+
+- The built-in default flips 0:0 -> 50:70 as a static initializer;
+  explicit compress_watermark=0:0 restores eager via
+  watermark_seen (opt-out, not mandatory), 100:100 stays the never
+  sentinel.
+- Mechanism tests pin eager explicitly (9 test files + the fstools
+  gate + test_mount_sem's write-time case); classic torture rows
+  stay deliberately unpinned and thereby validate default
+  inheritance (engage=config(aged) auto-resolution).
+
+### What We'd Do Differently
+
+- Keep the explicit-pin convention for MECHANISM tests: the flip's
+  blast radius was the TEST SUITE (23 mount option strings had
+  encoded the default), not the kernel -- when a default lives
+  implicitly in many call sites, pinning it explicitly is what
+  keeps it flippable later.
+- Verify binary provenance (grep the new string in the built
+  kernel) BEFORE every long boot, never after a failure: the
+  parallel-edit trap fired a third time and the pre-boot strings
+  check caught it in seconds.
 
 ### Test Results (all under the new default)
 

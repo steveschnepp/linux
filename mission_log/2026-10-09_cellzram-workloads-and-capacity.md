@@ -17,7 +17,6 @@ exposing the hardcoded 256-cell directory cap, and the capacity fix
 (capacity-derived nr_cells + headroom, u32 cellid widening) that closed the
 bug with all gates green.
 
-- Previous: `2026-10-07_deferred-compression-policy.md`
 
 ## Session 21: cellzram for block devices -- fs workloads, zram head-to-head, and the zero-page finding (2026-10-09)
 

@@ -19,7 +19,6 @@ phantom put plus the {32-bit ID, 23-bit generation} ABA encoding -- with the
 panic-on-corruption assert layer (session 10).
 
 - Previous: `2026-10-07_torture-sweep-farm-benchmarks.md`
-- Next in series: `2026-10-07_test-rig-maturation.md`
 
 ## Session 8: option surface v2 and the compression policy model (2026-10-07)
 

@@ -18,7 +18,6 @@ gotcha that made alarm() silently dead), and restructuring the rig repo into
 tracked guest/ vs disposable build/.
 
 - Previous: `2026-10-07_compression-policy-option-surface.md`
-- Next in series: `2026-10-07_deferred-compression-policy.md`
 
 ## Session 11: Apple's fstools in the guest -- fsx + fstorture on compressed tmpfs (2026-10-07)
 
@@ -126,6 +125,15 @@ mount lines resolved correctly (cell-backed, lz4, watermark=0:0).
   into a no-op that still exits 0.
 - **Mount-then-mkdir rule:** paths that live inside a new mount are
   created after the mount, never before it.
+
+### What We'd Do Differently
+
+- Grep a Darwin port for hardcoded namespaces/paths up front;
+  fsx's xattr namespace was hardwired to macOS and surfaced only
+  when its 500 xattr ops ran.
+- Record every shim/patch in the log at the moment it is written;
+  the four shims and the fsx default patch lived only in the build
+  script until session close.
 
 ### Files Changed
 
@@ -254,6 +262,20 @@ unblocks it before execl).
   "Test exit code: N" in the serial log; watchdog kill = 125; QEMU
   `-no-reboot` exit = pass-through.
 
+### What We Decided
+
+- The shell /init is replaced by a static C PID 1 supervisor: it
+  reaps children, reports per-test results, and enforces the exit
+  code the shell pipeline could not.
+- Guest exit-code contract: last "Test exit code: N" wins; watchdog
+  kill = 125; QEMU -no-reboot exit = pass-through.
+
+### What We'd Do Differently
+
+- Check .config for a silently-dead primitive before debugging
+  logic: alarm() was a no-op without CONFIG_POSIX_TIMERS, and its
+  failure mode is silence, not an error.
+
 ### Files Changed
 
 | File | Purpose |
@@ -343,6 +365,24 @@ The tracked `initrd/init` binary is gone -- it is derived from
 - Old root-level `rootfs.cpio.gz` became visible only after the
   gitignore rewrite dropped its entry -- rewrites of ignore files
   should be diffed against `git status` of the OLD tree first.
+
+### What We Decided
+
+- The repo splits into tracked guest/ (ships verbatim) and
+  disposable build/ (staging, binaries, packed cpio, kernel);
+  build_rootfs.sh rebuilds staging from scratch every pack.
+- Derived artifacts (the init binary, rootfs.cpio.gz) stop being
+  tracked; a stale binary cannot ship.
+
+### What We'd Do Differently
+
+- Design the build graph (which outputs are derived, who wipes
+  them) before wiring scripts: the first cut wrote binaries into
+  the staging tree the packer wipes, and they vanished between
+  steps.
+- Diff .gitignore rewrites against `git status` of the OLD tree;
+  the stale rootfs.cpio.gz stayed invisible until the rewrite
+  dropped its entry.
 
 ### Files Changed (high level)
 

@@ -16,7 +16,6 @@ Covers sessions 1-3 (2026-10-05 - 2026-10-06): the first prototype on
 zsmalloc, the RAM-accounting and merge sweeps, the review-driven correctness
 sweep (C6-C9), and the cell allocator with its GC.
 
-- Next in series: `2026-10-07_tmpfs-upstream-carve.md`
 
 ## Session 1: the zsmalloc prototype and the first bug hunts (2026-10-05)
 

@@ -18,7 +18,6 @@ mis-comparison, and the steady-state analysis that concluded lz4 +
 merge_pages=1 is the Pareto default for small-file farms.
 
 - Previous: `2026-10-07_cellzram-block-device.md`
-- Next in series: `2026-10-07_compression-policy-option-surface.md`
 
 ## Session 6: the torture sweep -- munin untar farm, 1..64 threads (2026-10-07)
 
@@ -135,6 +134,17 @@ like a compilation farm. The workload pivoted twice during design
   SReclaimable/Cached); Shmem assert stays tight (baseline + 4 MB).
 - No drop_caches, no taskset, no engineered storm: the test stays
   plausible for a farm because farms do not do those things either.
+
+### What We'd Do Differently
+
+- Verify column picks against the raw output before narrating
+  numbers; two awk column picks read the wrong fields in one
+  session.
+- Check the guest kernel config (ACPI) before blaming QEMU or the
+  workload for CPU anomalies; the missing CONFIG_ACPI made every
+  -smp VM single-core and aimed the investigation at the host.
+- Sample host-side metrics alongside guest BENCH lines from the
+  start; the "why 400%?" question this triggered cost a detour.
 
 ### Test Results
 
@@ -302,6 +312,25 @@ scales past it. Profiling this is the next perf task; if the
 per-page overhead is the issue, a merge=2 or per-CPU batched entry
 allocation may recover much of merge=8's throughput without its
 small-file ratio loss.
+
+### What We Decided
+
+- Session 6's headline claims are corrected in-place: cell256k was
+  silently uncompressed (cell= without compress= follows the global
+  default-off), lz4_m1 is cell-backed (parity with zsmalloc, killing
+  the "zsmalloc costs 45%" claim), and the CPU sampler's tick math
+  was fixed (/proc/stat ticks are USER_HZ).
+- Every future sweep carries a `comp_pages > 0` engagement guard so
+  a config can never again silently benchmark as plain tmpfs.
+
+### What We'd Do Differently
+
+- Assert per-config that the mount options took effect BEFORE
+  publishing numbers; three of session 6's conclusions were
+  measurement artifacts of configs not doing what their names
+  claimed.
+- Read counter semantics before writing the sampler; the 100x
+  USER_HZ tick math made every CPU% fictional.
 
 ### Files Changed
 
