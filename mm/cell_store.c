@@ -72,7 +72,9 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	cp->cell_order = order;
 	cp->use_thp = use_thp;
 	cp->max_cells = nr_cells;
-	cp->cells = kvcalloc(cp->max_cells, sizeof(struct cell),
+	/* +1 slot: compaction-only bootstrap, see invariant #6 */
+	cp->nslots = cp->max_cells + 1;
+	cp->cells = kvcalloc(cp->nslots, sizeof(struct cell),
 			      GFP_KERNEL);
 	if (!cp->cells) {
 		kfree(cp);
@@ -86,7 +88,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	 * state if a stale reader still holds it from the previous
 	 * incarnation.
 	 */
-	for (i = 0; i < cp->max_cells; i++)
+	for (i = 0; i < cp->nslots; i++)
 		init_rwsem(&cp->cells[i].lock);
 
 	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d, "
@@ -144,9 +146,19 @@ void cell_pool_destroy(struct cell_pool *cp)
  * cell_make_active - ensure cp->active has room for @len bytes
  * @cp: pool
  * @len: block size that must fit
+ * @for_gc: caller is evacuating a sparse cell, not satisfying a store
  *
  * Returns with cp->lock HELD and cp->active non-NULL with at least
  * @len bytes free, or NULL with the lock released (-ENOMEM).
+ *
+ * COMPACTION SLOT: a store may fill every advertised cell, but a GC
+ * caller may take the one extra slot allocated beyond them
+ * (cp->nslots).  A drain relocates a sparse cell's blocks into a
+ * fresh cell, and only the emptied victim frees a slot -- so on a
+ * completely full directory there is no destination unless one slot
+ * is held back, and evacuating it becomes a fixed point that moves
+ * nothing and frees nothing.  The extra slot bootstraps the first
+ * drain; the victims it empties fund the rest.
  *
  * The page allocation happens OUTSIDE the spinlock — GFP_KERNEL may
  * sleep, which is illegal under spin_lock().  After reacquiring the
@@ -155,7 +167,8 @@ void cell_pool_destroy(struct cell_pool *cp)
  * is freed and theirs is used.  This makes concurrent store paths
  * safe without ever allocating in atomic context.
  */
-static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len)
+static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len,
+				     bool for_gc)
 {
 	u32 cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
 	struct cell *c;
@@ -184,12 +197,17 @@ static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len)
 		return NULL;
 	}
 
-	/* Find a free directory slot (GC returns cells for reuse) */
+	/* Find a free directory slot (GC returns cells for reuse).  A
+	 * store is capped at cp->max_cells so the compaction-only slot
+	 * beyond it stays free for a GC caller; see the note above.
+	 * Index-based rather than free-count-based so the rule is obvious
+	 * at the loop bound and cannot drift from a counter. */
 	c = NULL;
 	{
 		u32 slot;
+		u32 limit = for_gc ? cp->nslots : cp->max_cells;
 
-		for (slot = 0; slot < cp->max_cells; slot++) {
+		for (slot = 0; slot < limit; slot++) {
 			if (!cp->cells[slot].pages[0]) {
 				c = &cp->cells[slot];
 				break;
@@ -278,7 +296,7 @@ int cell_store(struct cell_pool *cp, const void *data,
 	c = cp->active;
 	if (!c || c->next_free + len > cell_size) {
 		spin_unlock(&cp->lock);
-		c = cell_make_active(cp, len);
+		c = cell_make_active(cp, len, false);
 		if (!c)
 			return -ENOMEM;
 		/* cell_make_active returns with cp->lock held */
@@ -318,7 +336,7 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 
 	spin_lock(&cp->lock);
 
-	if (cellid >= cp->max_cells) {
+	if (cellid >= cp->nslots) {
 		spin_unlock(&cp->lock);
 		return;
 	}
@@ -384,7 +402,7 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	struct cell *c;
 	u32 cell_size;
 
-	if (cellid >= cp->max_cells)
+	if (cellid >= cp->nslots)
 		return -EINVAL;
 
 	c = &cp->cells[cellid];
@@ -487,7 +505,9 @@ int cell_relocate_one(struct cell_pool *cp, struct cell *victim,
 	a = cp->active;
 	if (!a || a->next_free + len > cell_size) {
 		spin_unlock(&cp->lock);
-		a = cell_make_active(cp, len);
+		/* for_gc=true: the evacuation target may take the compaction
+		 * slot -- this is the one caller that must be able to. */
+		a = cell_make_active(cp, len, true);
 		if (!a)
 			return -ENOMEM;
 		/* cell_make_active returns with cp->lock held */

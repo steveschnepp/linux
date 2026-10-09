@@ -40,6 +40,15 @@
  *      allocation target's identity is cp->active.  Both used to be
  *      cached per-cell as well; a shadow copy can drift from the
  *      authoritative pool field, and every reader already holds cp.
+ *
+ *   6. One slot beyond the advertised capacity belongs to compaction,
+ *      not to a store.  cell_make_active() only lets a GC caller take
+ *      it.  A drain relocates a sparse cell's blocks into a fresh
+ *      cell, so on a completely full directory it has no destination
+ *      unless one slot is held back -- without it, evacuating a full
+ *      directory is a fixed point that moves nothing and frees
+ *      nothing.  The slot is allocated ON TOP of max_cells
+ *      (cp->nslots), so the advertised capacity is unchanged.
  */
 #ifndef _LINUX_CELL_STORE_H
 #define _LINUX_CELL_STORE_H
@@ -83,8 +92,15 @@
 #define CELL_IS_SPARSE(live_bytes, cell_size) \
 	((live_bytes) * 2 <= (cell_size))
 
-/* Victims batched per GC pass: one entry-table scan reclaims all. */
-#define GC_BATCH	8
+/*
+ * Upper bound on victims drained by one compaction pass.  A pass
+ * drains SEQUENTIALLY -- each emptied victim funds the directory slot
+ * the next drain needs -- so this bounds the pass rather than
+ * batching it.  64 is generous for the workloads seen so far (the
+ * churn gate converges in a handful of drains) and keeps a single
+ * shrinker invocation from scanning the entry table indefinitely.
+ */
+#define GC_MAX_VICTIMS	64
 
 struct cell {
 	/*
@@ -129,7 +145,17 @@ struct cell_pool {
 	struct cell	*active;	/* current allocation target, or NULL */
 	struct cell	*cells;		/* directory array, indexed by cellid */
 	u32		nr_cells;	/* high-water mark of directory use */
-	u32		max_cells;	/* directory capacity */
+	u32		max_cells;	/* advertised directory capacity */
+	/*
+	 * Allocated directory slots = max_cells + 1.  The extra slot is
+	 * COMPACTION-ONLY: a normal store may never take it.  A drain
+	 * needs a destination before its victim can be emptied, and the
+	 * emptied victim is what frees the slot -- so without a slot held
+	 * back the pass has no bootstrap and stalls exactly when the
+	 * directory is full.  Unlike a "stop one short" reservation, this
+	 * costs the caller nothing: stores can still fill all max_cells.
+	 */
+	u32		nslots;
 	u8		cell_order;	/* alloc_pages order, same for all cells */
 	bool		use_thp;	/* request THP-backed pages */
 	struct list_head sparse;	/* cells below SPARSE_THRESHOLD objects */

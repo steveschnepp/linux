@@ -201,6 +201,7 @@ static DEFINE_MUTEX(shmem_comp_mounts_lock);
 static void shmem_comp_pressure_pass(struct work_struct *work);
 static DECLARE_WORK(shmem_comp_pressure_work, shmem_comp_pressure_pass);
 
+
 /* Global tallies for the aging policy (comp_stats output) */
 static atomic_long_t shmem_comp_aged_pages;
 static atomic_long_t shmem_comp_skipped_dead;
@@ -710,6 +711,10 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
  *
  * Uses GFP_NOWAIT to avoid blocking in atomic contexts. If allocation
  * fails, returns 0 and caller should handle as compression failure.
+ *
+ * The CELL path is different: it may run one GC pass on directory
+ * exhaustion, so it requires a sleepable caller.  Every cell-path
+ * caller meets that today; see the use_cells branch below.
  */
 unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 			       const void *data, unsigned int len)
@@ -731,6 +736,34 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	if (pool->use_cells) {
 		u32 cellid;
 		u32 offset;
+
+		if (!cell_store(pool->cells, data, len, &cellid, &offset))
+			return shmem_comp_pack_loc(cellid, offset);
+
+		/*
+		 * Directory exhaustion.  Overwrite churn piles up
+		 * partially-filled cells -- a cell only returns to the buddy
+		 * when it empties completely -- so a pool can run out of
+		 * slots while most of its cells are still half empty.
+		 * Evacuating those is what makes room, and only this layer
+		 * can do it: the victim scan needs the entry table.  One
+		 * pass, then one retry, then fail.  An unbounded retry would
+		 * turn memory pressure into a livelock on the write path,
+		 * and when nothing sparse is left to drain the second store
+		 * fails the same way -- the honest answer for a genuinely
+		 * full device, matching zram.
+		 *
+		 * Sleepable context by contract: every cell-path caller runs
+		 * in process or kworker context (cellzram kmallocs its
+		 * bounce buffer with GFP_NOIO in this very path; tmpfs
+		 * compresses from write_end or the aging work).  gc_lock is
+		 * a mutex for the same reason.  GC itself cannot recurse
+		 * back here -- it relocates through cell_relocate_one(),
+		 * which never re-enters this function.
+		 */
+		mutex_lock(&pool->cells->gc_lock);
+		shmem_comp_cell_gc(pool);
+		mutex_unlock(&pool->cells->gc_lock);
 
 		if (cell_store(pool->cells, data, len, &cellid, &offset))
 			return 0;
@@ -1185,53 +1218,50 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
  * @pool: cell-backed compression pool
  *
  * The async half of the cell allocator.  cell_free() only links
- * sparse cells; this pass does the actual relocation.  Batching is
- * the point: up to GC_BATCH victims are harvested first, then ONE
- * entry-table scan relocates every live block that resides in any
- * of them, then all emptied cells return to the buddy.  Per-free
- * synchronous evacuation could never amortise the scan this way.
- * Runs from the shrinker (memory pressure) or the gc_now debug
- * hook — never from the free path.
+ * sparse cells; this pass does the actual relocation.  It runs from
+ * the shrinker (memory pressure), from the gc_now debug hook, and
+ * from the store path when a cell-backed pool runs out of directory
+ * slots -- never from the free path itself.
  *
- * Protocol:
+ * Protocol, per victim:
  *   pick_victim()    harvests a sparse cell and takes down_write on
  *                    it; no reader can be inside cell_load() for it,
  *                    and cell_free()'s empty-return path blocks on
- *                    the same lock.  Repeated up to GC_BATCH times.
- *   scan             pins each entry residing in any victim
- *                    (inc_not_zero — dying entries are skipped, their
+ *                    the same lock.
+ *   scan             pins each entry residing in that victim
+ *                    (inc_not_zero -- dying entries are skipped, their
  *                    own free path handles the accounting), copies
  *                    the block, relocates it, updates the entry
  *                    handle with a WRITE_ONCE.
- *   release_victim() per victim: rechecks under cp->lock — empty →
- *                    buddy, still sparse → re-link for a later pass.
+ *   release_victim() rechecks under cp->lock -- empty -> buddy, still
+ *                    sparse -> re-link for a later pass.
+ *
+ * Draining is SEQUENTIAL and goes to completion per victim; see the
+ * rationale below for why a batched scan cannot work here.
  *
  * Lock order: victim rwsem → cp->lock, matching cell_free()
  * (down_read → cp->lock).  The reader's retry loop in
  * shmem_comp_load_entry() closes the window where a stale handle
  * outlives the relocation.
  */
-static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
+/*
+ * shmem_comp_drain_victim - relocate every block out of one victim
+ * @pool: cell-backed compression pool
+ * @vic: victim cell, held for write by the caller
+ *
+ * One entry-table scan.  Returns the number of blocks relocated; zero
+ * means nothing could move (all pinned, or too large for a cell), which
+ * callers use as a stop signal so a re-linked victim is not re-harvested
+ * forever.
+ */
+static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
+					    struct cell *vic)
 {
 	struct cell_pool *cp = pool->cells;
-	struct cell *victims[GC_BATCH];
-	unsigned int nv = 0, v;
+	unsigned int moved = 0;
 	unsigned long id;
 	struct shmem_comp_entry *ent;
-	unsigned int moved = 0;
 
-	/* Harvest phase: batch victims under their write locks */
-	while (nv < GC_BATCH) {
-		struct cell *c = cell_pool_pick_victim(cp);
-
-		if (!c)
-			break;
-		victims[nv++] = c;
-	}
-	if (!nv)
-		return;
-
-	/* One scan relocates blocks from every victim */
 	xa_for_each(&shmem_comp_entries, id, ent) {
 		unsigned long h;
 		u32 cellid;
@@ -1239,7 +1269,6 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 		unsigned int len;
 		u32 nc;
 		u32 no;
-		struct cell *vic = NULL;
 		int ret;
 
 		if (ent->pool != pool)
@@ -1250,13 +1279,7 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 			continue;	/* merged zsmalloc entry */
 		shmem_comp_unpack_loc(h, &cellid, &offset);
 
-		for (v = 0; v < nv; v++) {
-			if (victims[v]->cellid == cellid) {
-				vic = victims[v];
-				break;
-			}
-		}
-		if (!vic)
+		if (cellid != vic->cellid)
 			continue;
 
 		/* Pin: skip entries whose last reference is dropping */
@@ -1269,23 +1292,91 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 			continue;
 		}
 
-		ret = cell_relocate_one(cp, vic,
-					 vic->base + offset, len,
-					 &nc, &no);
+		ret = cell_relocate_one(cp, vic, vic->base + offset, len,
+					&nc, &no);
 		if (ret == 0) {
-			WRITE_ONCE(ent->handle,
-				   shmem_comp_pack_loc(nc, no));
+			WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
 			moved++;
 		}
 		shmem_comp_entry_put(id);
 	}
+	return moved;
+}
 
-	/* Release phase: emptied cells go back to the buddy */
-	for (v = 0; v < nv; v++)
-		cell_pool_release_victim(cp, victims[v]);
+static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
+{
+	struct cell_pool *cp = pool->cells;
+	unsigned int drained = 0, moved_total = 0;
+	unsigned int i;
 
-	cell_dbg("gc pass: moved %u objects, released %u victim cells",
-		 moved, nv);
+	/*
+	 * Drain victims ONE AT A TIME, each all the way to empty.
+	 *
+	 * The earlier shape harvested up to GC_BATCH victims first and
+	 * then did a single entry-table scan for all of them.  That
+	 * cannot make progress once the directory is full: a victim
+	 * holds at most one cell of live data, so the ONE new cell the
+	 * compaction slot funds gets split across the whole batch, no
+	 * victim reaches zero live_bytes, and only an EMPTY victim
+	 * returns a slot to the buddy.  Measured on the churn gate: the
+	 * batched pass moved exactly one cell's worth of blocks (64
+	 * objects) and freed nothing, on every pass -- a fixed point.
+	 *
+	 * Draining a single victim completely is what frees the slot
+	 * that funds the next drain, so the pass converges instead of
+	 * stalling.  The cost is one table scan per victim rather than
+	 * one per batch, bounded by GC_MAX_VICTIMS and only paid when
+	 * compaction is actually needed (memory pressure, or a store
+	 * that ran out of directory slots).
+	 */
+	for (i = 0; i < GC_MAX_VICTIMS; i++) {
+		struct cell *vic;
+		unsigned int moved;
+
+		vic = cell_pool_pick_victim(cp);
+		if (!vic)
+			break;
+
+		moved = shmem_comp_drain_victim(pool, vic);
+
+		/* Emptied victim goes back to the buddy, freeing the
+		 * directory slot the next drain needs. */
+		cell_pool_release_victim(cp, vic);
+		drained++;
+		moved_total += moved;
+
+		/*
+		 * Nothing left this victim: its remaining objects are
+		 * pinned or too large to relocate.  Stop, or the next
+		 * pick returns the same re-linked cell and we spin.
+		 * The shrinker re-invokes if more sparse cells remain.
+		 */
+		if (!moved)
+			break;
+	}
+
+	/*
+	 * LEAVE THE COMPACTION SLOT FREE.  The pass bootstrapped from
+	 * the extra slot beyond max_cells, so it may still hold the last
+	 * victim's data.  If that is left in place the slot is occupied
+	 * next time, and a later pass that meets a full directory with a
+	 * full active cell has no destination at all -- it relocates
+	 * nothing and frees nothing, which is exactly the stall this
+	 * mechanism exists to prevent (measured: the second pass moved 0
+	 * objects on every subsequent store).  The slots this pass just
+	 * freed are the destination for that last drain.
+	 */
+	if (cp->cells[cp->max_cells].pages[0]) {
+		struct cell *scratch = &cp->cells[cp->max_cells];
+
+		down_write(&scratch->lock);
+		moved_total += shmem_comp_drain_victim(pool, scratch);
+		cell_pool_release_victim(cp, scratch);
+	}
+
+	cell_dbg("gc pass: %u victims drained, %u objects moved",
+		 drained, moved_total);
+
 }
 
 /*
