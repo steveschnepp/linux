@@ -2,6 +2,7 @@
 name: deferred-compression-policy
 description: death-before-pop deferred compression -- the Stage 2 machinery, the watermark/size/merge policy matrices, and the default flip to 50:70 (roadmap addendum + sessions 14-20)
 project: linux
+previous: 2026-10-07_test-rig-maturation.md
 ---
 
 # Mission Log: Deferred Compression -- Stage 2, the Policy Matrices, and the Default Flip
@@ -23,8 +24,6 @@ default flip 0:0 -> 50:70 that completed the plan's landing sequence.
 > pi session transcripts and the sessions' own text, when the linter
 > started enforcing the template.  Content is grounded; in-the-moment
 > hindsight is by definition missing.
-
-- Previous: `2026-10-07_test-rig-maturation.md`
 
 ## Roadmap addendum: the open-work expansion -- Stage 2 machinery and cellzram hardening (recorded 2026-10-07, between sessions 11 and 12)
 

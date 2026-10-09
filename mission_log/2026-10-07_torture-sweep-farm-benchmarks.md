@@ -2,6 +2,7 @@
 name: torture-sweep-farm-benchmarks
 description: the munin untar-farm torture sweep at 1..64 threads, and the ratio/speed/RAM analysis behind the configuration guidance (sessions 6-7)
 project: linux
+previous: 2026-10-07_cellzram-block-device.md
 ---
 
 # Mission Log: the Torture Sweep and the Ratio/Speed/RAM Analysis
@@ -23,8 +24,6 @@ merge_pages=1 is the Pareto default for small-file farms.
 > 2026-10-09 from the pi session transcripts and the sessions' own
 > text, when the linter started enforcing the template.  Content is
 > grounded; in-the-moment hindsight is by definition missing.
-
-- Previous: `2026-10-07_cellzram-block-device.md`
 
 ## Session 6: the torture sweep -- munin untar farm, 1..64 threads (2026-10-07)
 

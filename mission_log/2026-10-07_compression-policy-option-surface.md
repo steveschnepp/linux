@@ -2,6 +2,7 @@
 name: compression-policy-option-surface
 description: option surface v2 and the compression policy model -- the compress_watermark design, Stage 1 landing, and the refs-underflow/ABA fix (sessions 8-10)
 project: linux
+previous: 2026-10-07_torture-sweep-farm-benchmarks.md
 ---
 
 # Mission Log: Option Surface v2, Stage 1, and the Underflow Fix
@@ -17,8 +18,6 @@ landing of the option surface with the 100:100 never-sentinel and
 show_options visibility (session 9), and the refs-underflow fix -- the
 phantom put plus the {32-bit ID, 23-bit generation} ABA encoding -- with the
 panic-on-corruption assert layer (session 10).
-
-- Previous: `2026-10-07_torture-sweep-farm-benchmarks.md`
 
 ## Session 8: option surface v2 and the compression policy model (2026-10-07)
 

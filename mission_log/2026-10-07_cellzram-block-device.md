@@ -2,6 +2,7 @@
 name: cellzram-block-device
 description: cellzram -- the compressed-RAM block device on the cell allocator, and its unit-bug parade (session 5)
 project: linux
+previous: 2026-10-07_tmpfs-upstream-carve.md
 ---
 
 # Mission Log: cellzram -- the Block Device, and a Parade of Unit Bugs
@@ -15,8 +16,6 @@ Covers session 5 (2026-10-07): implementing mm/cellzram.c (~740 lines) on top
 of shmem_comp -- bio paths, block table, sysfs, swap trial -- and the nine
 bugs the rig found, which landed the mandatory unit-suffix naming rule and
 the O_DIRECT-for-block-devices rule.
-
-- Previous: `2026-10-07_tmpfs-upstream-carve.md`
 
 ## Session 5: cellzram -- the block device, and a parade of unit bugs (2026-10-07)
 

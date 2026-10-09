@@ -2,6 +2,7 @@
 name: test-rig-maturation
 description: the QEMU rig grows up -- Apple fstools as an external oracle, the C PID 1 supervisor and the POSIX_TIMERS gotcha, and the guest/ vs build/ repo split (sessions 11-13)
 project: linux
+previous: 2026-10-07_compression-policy-option-surface.md
 ---
 
 # Mission Log: Test-Rig Maturation -- fstools, PID 1, and the Repo Split
@@ -23,8 +24,6 @@ tracked guest/ vs disposable build/.
 > on 2026-10-09 from the pi session transcripts and the sessions' own
 > text, when the linter started enforcing the template.  Content is
 > grounded; in-the-moment hindsight is by definition missing.
-
-- Previous: `2026-10-07_compression-policy-option-surface.md`
 
 ## Session 11: Apple's fstools in the guest -- fsx + fstorture on compressed tmpfs (2026-10-07)
 
