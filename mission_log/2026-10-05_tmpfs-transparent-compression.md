@@ -4187,3 +4187,127 @@ gate.
 4. Optional: delete `pages[]` entirely (recover via `virt_to_page(c->base)`);
    deferred until understood cold.
 5. randio joins the per-commit rotation once green.
+
+---
+
+## Session 24: the capacity fix lands, and the repack that fell out of it (2026-10-09)
+
+Executed session 23's implementation plan (all 5 steps), then kept
+going on the u32 question the bootstrap had deferred. Three kernel
+commits, all gates green including the one that had been red since
+session 22.
+
+### What We Did
+
+1. **`e30aceffc459` -- the capacity fix (plan step 1).**
+   `cell_pool_create(order, use_thp, nr_cells)` ->
+   `shmem_comp_pool_create(algo, cell_order, nr_cells)`.
+   cellzram derives `nr_cells = DIV_ROUND_UP(disksize, cell_size) +
+   headroom`, headroom a module param `cell_headroom_pct`, default
+   **30** (user choice), validated 0..100 at init.  tmpfs passes 0 ->
+   CELL_DEFAULT_MAX_CELLS (256), its memory cost unchanged.  The
+   plan's decision #2 resolved as recommended: clamp, do not reject.
+   (The clamp moved later -- see commit 3.)
+
+2. **Design Q&A that reshaped the follow-up** (the session's real
+   content -- five questions, each changing the answer):
+   - *"u32 cellid cost?"* -- the wall was never the type; it was the
+     handle encoding (`cellid + 1 << 32`, room for 16 bits).  Type
+     widening is ~15 signatures + locals.
+   - *"move cellid and liveobjects to fill a 64b?"* -- yes: evicting
+     two redundant fields made the u32 pair size-neutral (below).
+   - *"bool active could be live_obj != 0?"* -- NO, and the
+     distinction matters: active-with-zero-objects (just allocated)
+     and inactive-with-objects (previous cells, the common write-
+     burst state) are different states; `live_objects != 0` conflates
+     exactly the two the GC wants told apart.  The correct
+     derivation is `c == cp->active`, already used by
+     `cell_pool_pick_victim()`.
+   - *"all bools -> one u32 index at the top?"* -- the slot already
+     exists (`cp->active`, a pointer).  Index vs pointer: moot,
+     the directory is kvcalloc'd once and never reallocates, so
+     pointers cannot dangle; pointer wins on NULL-is-zero-init.
+   - *"at end to avoid misalignment / header more common?"* --
+     header is right for pool-wide state (that IS the evictions),
+     but appends cost stride: the in-place repack fills bytes that
+     already existed, so no array element moves.
+
+3. **`362abeaae38a` -- drop the shadows.** `struct cell` cached
+   `u8 order` (= cp->cell_order, same for every cell) and `bool
+   active` (mirror of cp->active).  Both are pool-wide facts
+   duplicated per-cell: drift bugs waiting for a third update site
+   (cell_make_active and cell_pool_return each maintained the pair).
+   13 read sites now use `cp->cell_order`; the one reader of
+   `active` (cell_stats debug print) compares `c == cp->active`.
+
+4. **`3d7c4b4799a7` -- u32 widening + re-pack.** `live_objects`
+   u16->u32 (fixes the overflow: ~26 B lz4 blocks in an order-9/10
+   cell = ~160k objects > 65535); `cellid` u16->u32 (removes the
+   65535-cell directory ceiling); `max_cells`/`nr_cells` u32; loop
+   counters and locals follow.  The u32 pair lands in the 8 bytes
+   the old `u16+u16+u8+bool+pad` occupied -- struct cell measured
+   **80 B before and after** (compile-probe:
+   `char (*)[sizeof(struct cell)] = 1` reads the size from the error).
+   Handle re-pack at `<< CELL_LOC_OFFSET_BITS` (22): offset 22 bits
+   (max cell 4 MiB), cellid+1 33 bits, 9 spare in the 64-bit
+   entry.handle; +1 bias preserved (handle 0 = storage-failed
+   sentinel, the session-3 rule).  Comment now says: re-price the
+   ENCODING, not the declaration.
+
+### What We Learned
+
+- **Config-dependent sizeof: the log's "112 B" was the rig's KASAN/
+  lockdep config** (lockdep inflates rw_semaphore); the plain build
+  reads 80.  Quote deltas, not absolutes, across configs.
+- **The clamp's location matters for -Wtype-limits:** clamping an
+   `unsigned int` parameter to UINT_MAX is always-false and warns.
+  The guard belongs at the cellzram boundary (u64 disksize
+  arithmetic) where the wide type actually is.
+- **`page_same_filled`-class lesson, new flavor: read the field
+  budget, not the field.**  The u16 cellid looked like a type wall
+  for two sessions; it was a shift-amount wall in one inline
+  function.  Session 23 predicted this; confirming it in 20 minutes
+  validated the "price the encoding" rule.
+- **A design Q&A beats a design doc.**  The five-question chain
+  (this entry's step 2) eliminated fields the plan had not
+  questioned; each answer was derived from a state analysis
+  (four-state table for active), not a style preference.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/cell_store.c` | nr_cells param + default; u32 ids/loops; order/active reads -> cp |
+| `include/linux/cell_store.h` | struct cell repack (80 B, no order/active); u32 fields; CELL_DEFAULT_MAX_CELLS; invariant #5 |
+| `mm/shmem_compress.c` | pool_create nr_cells pass-through; 3 sites -> cp->cell_order / c == cp->active; u32 locals |
+| `include/linux/shmem_compress.h` | pack/unpack u32 at <<22; CELL_LOC_OFFSET_BITS/MAX |
+| `mm/cellzram.c` | cell_headroom_pct param (default 30); disksize-derived nr_cells + u64 truncation guard |
+
+### Test Results
+
+| gate | result |
+|------|--------|
+| randio (THE acceptance) | **4 passed, 0 failed**, exit 0 -- fs phase 28414 blocks verified, 0 bad (was ~2500 bad / 64 IOERR); zram unchanged |
+| cellzram suite | 77/0 |
+| fsdev + distinct-data | 19/0; distinct phase now stores all 16384 blocks: 64 MiB phys + 1179648 B entries = **101.8% of zram, CONFIRMED** (session 21's number was measured AT the old cap but the ratio held) |
+| full suite (QEMU_CPUS=4, KASAN) | exit 0, no Oops/KASAN |
+| entryrace | 0 underflows, quiescent verify PASS x4, stale_value_retries 0 |
+| config-off build (worktree, CONFIG_TMPFS_COMPRESSION=n) | mm/shmem.o + mm/cell_store.o clean, 0 warnings |
+
+Kernel commits: `e30aceffc459`, `362abeaae38a`, `3d7c4b4799a7`
+(each build-clean on its own; bzImage #83/#84/#85/#86).
+
+### Next Steps
+
+1. randio joins the per-commit rotation (plan step 5; it is green).
+2. Optional: GC-on-exhaustion (plan decision #3b) -- still open, and
+   now the only remaining way writes can fail IOERR (the directory
+   no longer caps practical workloads; churn does, at 30% headroom).
+3. Watch `cell_headroom_pct` in the field: 30 is unmeasured
+   headroom, chosen for safety.  A churn-specific sweep could
+   right-size it.
+4. Re-check session 23's remaining optionals: delete `pages[]`
+   entirely (`virt_to_page(c->base)`), >15 GB devices at order-6
+   now possible -- the u32 widening removed the ceiling, so the
+   "IF a big device appears" condition can now be tested by simply
+   setting disksize.
