@@ -58,6 +58,14 @@
 #define CELL_ORDER_DEF	4		/* 64 KiB  */
 
 /*
+ * Directory capacity for pools whose caller has no capacity bound.
+ * A block device derives its cell count from disksize instead; this
+ * default only bounds tmpfs page-cache pools, which are compressible
+ * and size=-accounted.
+ */
+#define CELL_DEFAULT_MAX_CELLS	256
+
+/*
  * A cell is a GC candidate when more than half its capacity is
  * waste: live_bytes * 2 <= cell_size.  Utilization, not object
  * count — twelve 2 KB blocks in a 64 KiB cell is 75% waste whether
@@ -135,8 +143,15 @@ struct cell_pool {
  * cell_store() call allocates the active cell on demand.  This
  * matters because a tmpfs mount may enable cell storage but never
  * actually compress anything (e.g. all data is incompressible).
+ *
+ * @nr_cells is the directory capacity: the pool can never hold more
+ * than nr_cells x cell_size of stored blocks, so a caller that knows
+ * its worst case (incompressible data up to a device's disksize)
+ * must size it accordingly, with headroom for COW churn.  Zero uses
+ * CELL_DEFAULT_MAX_CELLS.  Counts above U16_MAX are clamped.
  */
-struct cell_pool *cell_pool_create(unsigned int order, bool use_thp);
+struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
+				   unsigned int nr_cells);
 void cell_pool_destroy(struct cell_pool *cp);
 
 /*

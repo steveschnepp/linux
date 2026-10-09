@@ -112,6 +112,19 @@ module_param(cell_order, int, 0444);
 MODULE_PARM_DESC(cell_order,
 		 "alloc_pages order for device cell pools (2..10)");
 
+/*
+ * Directory headroom over the incompressible worst case.  disksize /
+ * cell_size cells store disksize of incompressible data exactly, but
+ * the store path COW-allocates before the old block is freed and an
+ * emptied cell (not a partially freed one) is what returns to the
+ * buddy, so overwrite churn transiently needs more cells than the
+ * live set.  This percentage is that buffer.
+ */
+static int cell_headroom_pct = 30;
+module_param(cell_headroom_pct, int, 0444);
+MODULE_PARM_DESC(cell_headroom_pct,
+		 "Cell directory headroom over disksize (percent)");
+
 static int cellzram_major;
 
 static struct cellzram **cellzram_devs;
@@ -494,6 +507,8 @@ static ssize_t disksize_store(struct device *dev,
 	struct cellzram *cz = disk->private_data;
 	struct shmem_comp_pool *pool;
 	u64 size_bytes;
+	u64 cell_bytes;
+	u64 nr_cells;
 	char *algo;
 
 	size_bytes = memparse(buf, NULL);
@@ -514,7 +529,24 @@ static ssize_t disksize_store(struct device *dev,
 	 * contexts idle; noted inefficiency, see plan Open Questions).
 	 */
 	algo = cz->algo[0] ? cz->algo : "lz4";
-	pool = shmem_comp_pool_create(algo, cell_order);
+
+	/*
+	 * Size the cell directory for the advertised capacity: a block
+	 * device must be able to store its whole disksize even when not
+	 * one byte compresses (incompressible blocks are stored raw at
+	 * PAGE_SIZE each, one cell region apiece).  Headroom covers the
+	 * COW-before-free churn described at cell_headroom_pct.  The
+	 * hint is clamped to U16_MAX inside cell_pool_create, which
+	 * caps incompressible storage at U16_MAX x cell_size beyond
+	 * that -- warned there, at the only place the cap is known.
+	 */
+	cell_bytes = (u64)PAGE_SIZE << cell_order;
+	nr_cells = DIV_ROUND_UP(size_bytes, cell_bytes);
+	nr_cells += DIV_ROUND_UP(nr_cells * cell_headroom_pct, 100);
+	if (nr_cells > UINT_MAX)
+		nr_cells = UINT_MAX;	/* cell_pool_create clamps to U16_MAX */
+
+	pool = shmem_comp_pool_create(algo, cell_order, nr_cells);
 	if (IS_ERR(pool)) {
 		mutex_unlock(&cz->io_lock);
 		return PTR_ERR(pool);
@@ -798,6 +830,10 @@ static int __init cellzram_init(void)
 	if (cell_order < CELL_ORDER_MIN || cell_order > CELL_ORDER_MAX) {
 		pr_err(CELLZRAM_NAME ": cell_order must be %d..%d\n",
 		       CELL_ORDER_MIN, CELL_ORDER_MAX);
+		return -EINVAL;
+	}
+	if (cell_headroom_pct < 0 || cell_headroom_pct > 100) {
+		pr_err(CELLZRAM_NAME ": cell_headroom_pct must be 0..100\n");
 		return -EINVAL;
 	}
 

@@ -476,16 +476,23 @@ void shmem_comp_sysfs_unregister(void);
 /**
  * shmem_comp_pool_create - Create a compression pool
  * @algo: Compression algorithm name ("lz4", "lzo", or "lzo-rle")
+ * @cell_order: Cell size as alloc_pages order, or 0 for zsmalloc
+ * @nr_cells: Cell directory capacity hint, or 0 for the default
  *
  * Return: Pointer to pool on success, ERR_PTR on failure
  *
  * Creates a new compression pool with the specified algorithm.
  * Allocates zsmalloc pool and per-CPU compression contexts.
  *
+ * @nr_cells bounds the physical storage of a cell pool; a caller
+ * that knows its worst case passes it (plus headroom), a caller
+ * that does not passes 0.  See cell_pool_create().
+ *
  * The caller must hold no locks that could conflict with allocation.
  */
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
-						unsigned int cell_order);
+						unsigned int cell_order,
+						unsigned int nr_cells);
 
 /**
  * shmem_comp_pool_destroy - Destroy a compression pool

@@ -33,13 +33,41 @@ static gfp_t cell_gfp(struct cell_pool *cp)
 	return GFP_KERNEL | __GFP_NOWARN;
 }
 
-struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
+struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
+				   unsigned int nr_cells)
 {
 	struct cell_pool *cp;
 	u16 i;
 
 	if (order < CELL_ORDER_MIN || order > CELL_ORDER_MAX)
 		return NULL;
+
+	/*
+	 * Directory capacity bounds the pool's PHYSICAL storage: at most
+	 * max_cells x cell_size can ever be stored, regardless of what the
+	 * caller promised its users.  A caller that knows its capacity
+	 * (a block device with a disksize) must pass it, plus headroom:
+	 * the store path COW-allocates the new block before the free path
+	 * drops the old one, and a freed block only returns its cell to
+	 * the buddy when the whole cell empties, so overwrite churn
+	 * accumulates partially-filled cells past live_data / cell_size.
+	 *
+	 * Zero means "caller has no capacity bound" (tmpfs: the page cache
+	 * is compressible and bounded by size= accounting, so the legacy
+	 * default suffices).  The count is clamped to the u16 directory
+	 * index: beyond 65535 cells the incompressible-data cap at this
+	 * order is the ceiling, not memory.
+	 */
+	if (!nr_cells)
+		nr_cells = CELL_DEFAULT_MAX_CELLS;
+	if (nr_cells > U16_MAX) {
+		pr_warn("cell_store: %u cells requested, capping at %u; "
+			"incompressible storage on this pool is limited to "
+			"%u x %lu KiB\n",
+			nr_cells, U16_MAX, U16_MAX,
+			(PAGE_SIZE << order) / 1024);
+		nr_cells = U16_MAX;
+	}
 
 	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
 	if (!cp)
@@ -50,7 +78,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 	INIT_LIST_HEAD(&cp->sparse);
 	cp->cell_order = order;
 	cp->use_thp = use_thp;
-	cp->max_cells = 256;
+	cp->max_cells = nr_cells;
 	cp->cells = kvcalloc(cp->max_cells, sizeof(struct cell),
 			      GFP_KERNEL);
 	if (!cp->cells) {
@@ -68,8 +96,12 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp)
 	for (i = 0; i < cp->max_cells; i++)
 		init_rwsem(&cp->cells[i].lock);
 
-	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d",
-		 order, (PAGE_SIZE << order) / 1024, use_thp);
+	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d, "
+		 "max_cells=%u (%llu MiB incompressible cap)",
+		 order, (PAGE_SIZE << order) / 1024, use_thp,
+		 cp->max_cells,
+		 ((unsigned long long)cp->max_cells << order) >>
+			(20 - PAGE_SHIFT));
 
 	return cp;
 }

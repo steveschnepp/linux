@@ -309,6 +309,8 @@ static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
 /**
  * shmem_comp_pool_create - Create a compression pool
  * @algo: Compression algorithm name ("lz4", "lzo", or "lzo-rle")
+ * @cell_order: Cell size as alloc_pages order, or 0 for zsmalloc
+ * @nr_cells: Cell directory capacity hint, or 0 for the default
  *
  * Return: Pointer to pool on success, ERR_PTR on failure
  *
@@ -317,11 +319,17 @@ static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
  * - zsmalloc pool for compressed data storage
  * - Per-CPU compression contexts
  *
+ * @nr_cells bounds physical storage for cell pools (nr_cells x
+ * cell_size); see cell_pool_create().  A caller that knows its
+ * capacity -- a block device with a disksize -- passes it; a caller
+ * that does not (tmpfs) passes 0.
+ *
  * The pool is added to the global list for tracking.
  * Callers must call shmem_comp_pool_put() when done.
  */
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
-						unsigned int cell_order)
+						unsigned int cell_order,
+						unsigned int nr_cells)
 {
 	struct shmem_comp_pool *pool;
 	int cpu;
@@ -347,7 +355,8 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 
 	/* Cell storage: no zsmalloc pool needed */
 	if (cell_order > 0) {
-		pool->cells = cell_pool_create(cell_order, cell_order >= 4);
+		pool->cells = cell_pool_create(cell_order, cell_order >= 4,
+					       nr_cells);
 		if (!pool->cells) {
 			pr_warn("shmem_comp: failed to create cell pool\n");
 			kfree(pool);
@@ -1873,6 +1882,11 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	 * cell storage entirely (zsmalloc backend) -- the
 	 * cell_seen flag distinguishes that from "not given",
 	 * which triggers the size-based derivation below.
+	 *
+	 * The pool's directory stays at the default capacity:
+	 * tmpfs page cache is compressible and bounded by
+	 * size= accounting, so it cannot walk into the
+	 * incompressible-storage wall a block device hits.
 	 */
 	if (cell_order == 0 && !opts->cell_seen) {
 		unsigned int merge_pages = opts->merge_pages ?: 1;
@@ -1888,7 +1902,7 @@ int shmem_comp_fill_sb(struct super_block *sb,
 			cell_order++;
 	}
 
-	comp->pool = shmem_comp_pool_create(algo, cell_order);
+	comp->pool = shmem_comp_pool_create(algo, cell_order, 0);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");
