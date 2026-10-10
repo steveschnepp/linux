@@ -561,6 +561,19 @@ void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
 unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool);
 
 /*
+ * Validity-bitmap accessors for split pools (unit_ratio > 1).  The
+ * bitmap lives in the entry, outside the compressed blob, so discard
+ * clears a bit without recompressing.  At unit_ratio == 1 no words are
+ * allocated and these report on the entry's presence instead, keeping
+ * the disabled-split path identical.
+ */
+bool shmem_comp_entry_sector_valid(unsigned int id, unsigned int idx);
+bool shmem_comp_entry_any_valid(unsigned int id);
+bool shmem_comp_entry_sector_clear(unsigned int id, unsigned int idx);
+void shmem_comp_entry_sector_set(unsigned int id, unsigned int idx);
+void shmem_comp_entry_valid_copy(unsigned int dst_id, unsigned int src_id);
+
+/*
  * Pinned, relocation-safe block load for cell storage.  Retries if
  * GC moves the block mid-read; see implementation for the protocol.
  */

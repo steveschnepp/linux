@@ -550,18 +550,6 @@ void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
 		pool->unit_ratio = ratio ? ratio : 1;
 }
 
-/*
- * shmem_comp_pool_unit_ratio - logical sectors per unit
- * Returns 1 for NULL pools and for every pool with the split disabled,
- * so callers can divide by it unconditionally.
- */
-unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool)
-{
-	if (!pool || !pool->unit_ratio)
-		return 1;
-	return pool->unit_ratio;
-}
-
 /**
  * shmem_comp_pool_put - Release reference to a pool
  * @pool: Pool to release
@@ -1013,6 +1001,154 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 
 /* XA_FLAGS_ALLOC reserves index 0: the page cache uses 0 for "empty" */
 static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
+
+/*
+ * shmem_comp_pool_unit_ratio - logical sectors per unit
+ * Returns 1 for NULL pools and for every pool with the split disabled,
+ * so callers can divide by it unconditionally.
+ */
+unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool)
+{
+	if (!pool || !pool->unit_ratio)
+		return 1;
+	return pool->unit_ratio;
+}
+
+/*
+ * Validity-bitmap accessors for split pools (unit_ratio > 1).
+ *
+ * The bitmap is per-entry, uncompressed, and lives outside the
+ * compressed blob so discard can clear a bit without recompressing
+ * (see shmem_comp_entry.valid).  These are the ONLY way the block
+ * device touches it: the entry lives in this file's private xarray,
+ * so cellzram cannot reach valid[] directly.
+ *
+ * At unit_ratio == 1 no bitmap words are allocated and existence of
+ * the entry IS the bitmap -- every accessor reports the entry present,
+ * which keeps the disabled-split path byte-identical.
+ */
+
+/* is logical sector @idx live in unit @id?  false for a dead or
+ * absent entry, so a caller can use it directly as a read mask. */
+bool shmem_comp_entry_sector_valid(unsigned int id, unsigned int idx)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int ratio;
+	bool live = false;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent)
+		goto out;
+	ratio = shmem_comp_pool_unit_ratio(ent->pool);
+	if (ratio == 1) {
+		live = true;	/* presence is the bitmap */
+	} else if (idx < ratio &&
+		   atomic_inc_not_zero(&ent->refs)) {
+		live = test_bit(idx, ent->valid);
+		shmem_comp_entry_put(id);
+	}
+out:
+	rcu_read_unlock();
+	return live;
+}
+
+/* is ANY logical sector in unit @id still live?  A unit whose mask
+ * reaches zero is garbage: free it rather than hold an empty blob. */
+bool shmem_comp_entry_any_valid(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int ratio;
+	bool live = false;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent)
+		goto out;
+	ratio = shmem_comp_pool_unit_ratio(ent->pool);
+	if (ratio == 1) {
+		live = true;
+	} else if (atomic_inc_not_zero(&ent->refs)) {
+		live = !bitmap_empty(ent->valid, ratio);
+		shmem_comp_entry_put(id);
+	}
+out:
+	rcu_read_unlock();
+	return live;
+}
+
+/* mark logical sector @idx dead in unit @id.  A bit-flip, no I/O and
+ * no recompress: the stale bytes stay in the blob until the unit is
+ * rewritten or freed.  Returns true if the unit is now entirely dead,
+ * so the caller can drop it. */
+bool shmem_comp_entry_sector_clear(unsigned int id, unsigned int idx)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int ratio;
+	bool now_dead = false;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent)
+		goto out;
+	ratio = shmem_comp_pool_unit_ratio(ent->pool);
+	if (ratio > 1 && idx < ratio &&
+	    atomic_inc_not_zero(&ent->refs)) {
+		clear_bit(idx, ent->valid);
+		now_dead = bitmap_empty(ent->valid, ratio);
+		shmem_comp_entry_put(id);
+	}
+out:
+	rcu_read_unlock();
+	return now_dead;
+}
+
+/* copy the validity mask from unit @src_id to @dst_id.  A split write
+ * replaces the entry (COW) but must preserve which sibling sectors are
+ * still live, so the new entry inherits the old mask before the written
+ * sector is set. */
+void shmem_comp_entry_valid_copy(unsigned int dst_id, unsigned int src_id)
+{
+	struct shmem_comp_entry *dst, *src;
+	unsigned int ratio;
+
+	rcu_read_lock();
+	src = xa_load(&shmem_comp_entries, src_id);
+	dst = xa_load(&shmem_comp_entries, dst_id);
+	if (!src || !dst)
+		goto out;
+	ratio = shmem_comp_pool_unit_ratio(src->pool);
+	if (ratio > 1 && ratio == shmem_comp_pool_unit_ratio(dst->pool) &&
+	    atomic_inc_not_zero(&src->refs) &&
+	    atomic_inc_not_zero(&dst->refs)) {
+		bitmap_copy(dst->valid, src->valid, ratio);
+		shmem_comp_entry_put(src_id);
+		shmem_comp_entry_put(dst_id);
+	}
+out:
+	rcu_read_unlock();
+}
+
+/* mark logical sector @idx live in unit @id.  Inverse of sector_clear;
+ * used after a split write installs the new entry. */
+void shmem_comp_entry_sector_set(unsigned int id, unsigned int idx)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int ratio;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent)
+		goto out;
+	ratio = shmem_comp_pool_unit_ratio(ent->pool);
+	if (ratio > 1 && idx < ratio && atomic_inc_not_zero(&ent->refs)) {
+		set_bit(idx, ent->valid);
+		shmem_comp_entry_put(id);
+	}
+out:
+	rcu_read_unlock();
+}
+
 
 /*
  * Generation counter for entry incarnations (swapops.h packs 23 bits
