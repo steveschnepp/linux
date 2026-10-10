@@ -427,10 +427,16 @@ static int cellzram_write_unit(struct cellzram *dev, unsigned long unit_nr,
 
 	/* closed or unwritten: stage a fresh buffer seeded from old_id */
 	new_id = shmem_comp_stage_open(dev->pool, old_id);
+	if (!new_id) {
+		/* pool full: drain staged units (compress them) to free a
+		 * slot, then retry once -- "compress when no open slots". */
+		shmem_comp_drain_staged_now(dev->pool);
+		new_id = shmem_comp_stage_open(dev->pool, old_id);
+	}
 	if (old_id)
 		shmem_comp_entry_put(old_id);
 	if (!new_id)
-		return -ENOMEM;	/* pool full: no slot (drain is a later step) */
+		return -ENOMEM;	/* genuinely full (every slot pinned) */
 
 	ret = shmem_comp_stage_write(new_id, blk, src, PAGE_SIZE);
 	if (ret) {

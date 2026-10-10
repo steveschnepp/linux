@@ -1697,6 +1697,23 @@ static void shmem_comp_drain_staged(struct shmem_comp_pool *pool)
 	}
 }
 
+/*
+ * shmem_comp_drain_staged_now - synchronously drain a pool's staged units
+ * @pool: cell-backed pool with staging
+ *
+ * The write path calls this when it needs an open-buffer slot and none is
+ * free ("compress when no open slots").  Serialised against the GC's
+ * drain by gc_lock.  No-op for pools without staging.
+ */
+void shmem_comp_drain_staged_now(struct shmem_comp_pool *pool)
+{
+	if (!pool || !pool->use_cells || !pool->cells || !pool->opens)
+		return;
+	mutex_lock(&pool->cells->gc_lock);
+	shmem_comp_drain_staged(pool);
+	mutex_unlock(&pool->cells->gc_lock);
+}
+
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 {
 	struct cell_pool *cp = pool->cells;

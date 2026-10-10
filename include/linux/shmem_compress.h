@@ -627,6 +627,11 @@ unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
 				   unsigned int seed_id);
 int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
 			 unsigned int len);
+int shmem_comp_stage_write(unsigned int id, unsigned int blk,
+			   const void *src, unsigned int len);
+unsigned int shmem_comp_entry_valid_count(unsigned int id);
+unsigned long shmem_comp_pool_staged_bytes(struct shmem_comp_pool *pool);
+void shmem_comp_drain_staged_now(struct shmem_comp_pool *pool);
 
 /*
  * Validity-bitmap accessors for split pools (unit_ratio > 1).  The
