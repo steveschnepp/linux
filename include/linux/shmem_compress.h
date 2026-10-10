@@ -154,6 +154,27 @@ struct shmem_comp_entry {
 	 */
 	struct shmem_comp_pool *pool;
 	struct rcu_head rcu;
+	/*
+	 * Per-unit validity bitmap: which logical sectors inside this
+	 * compression unit still hold live data.  Only meaningful when
+	 * pool->unit_ratio > 1 (the logical/physical split, cellzram).
+	 *
+	 * Lives HERE, uncompressed, and never inside the compressed blob:
+	 * a blob-internal bitmap would need a full decompress-recompress
+	 * to flip one bit on discard, rebuilding the RMW the split exists
+	 * to avoid, and it would make the validity mask depend on the
+	 * blob's own integrity.  Post-decompress, the mask is independent
+	 * authoritative state -- discard is a bit-flip with no recompress.
+	 *
+	 * A flexible array sized at alloc: BITS_TO_LONGS(ratio) words
+	 * when the split is on, ZERO words when it is off.  At ratio 1
+	 * the entry's existence is already the bitmap, so the default
+	 * allocation stays byte-identical to before this field existed.
+	 * That is non-negotiable: an entry-table shrink must not begin by
+	 * growing the entry.  Any access must therefore be ratio-guarded
+	 * -- at ratio 1 no words are allocated and valid[0] is OOB.
+	 */
+	unsigned long valid[];
 };
 
 /*
@@ -535,6 +556,9 @@ bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
 struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
 unsigned long shmem_comp_pool_gc_recoveries(struct shmem_comp_pool *pool);
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
+void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
+				    unsigned int ratio);
+unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool);
 
 /*
  * Pinned, relocation-safe block load for cell storage.  Retries if

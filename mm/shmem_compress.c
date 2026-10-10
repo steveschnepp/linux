@@ -68,6 +68,8 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/overflow.h>
+#include <linux/bitmap.h>
 #include <linux/mutex.h>
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
@@ -181,6 +183,14 @@ struct shmem_comp_pool {
 	 * mm_stat so the field order of existing parsers stays stable.
 	 */
 	atomic64_t gc_recoveries;
+	/*
+	 * Logical sectors per compression unit (the logical/physical
+	 * split).  1 = split disabled, which is every pool except a
+	 * cellzram device configured with physical > logical.  Drives
+	 * the size of shmem_comp_entry.valid and which code paths may
+	 * touch it.
+	 */
+	unsigned int unit_ratio;
 	struct list_head list;			/* global pools list */
 };
 
@@ -521,6 +531,35 @@ unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool)
 	if (!pool || !pool->use_cells || !pool->cells)
 		return 0;
 	return 1U << pool->cells->cell_order;
+}
+
+/*
+ * shmem_comp_pool_set_unit_ratio - set logical sectors per unit
+ * @pool: target pool
+ * @ratio: logical blocks per compression unit; 1 = split disabled
+ *
+ * Must be called before the first entry is allocated on @pool: the
+ * ratio sizes every entry's validity bitmap at alloc time and is not
+ * retroactive.  A ratio-1 pool allocates zero bitmap words, which is
+ * why the default path is byte-identical to a pool without the field.
+ */
+void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
+				    unsigned int ratio)
+{
+	if (pool)
+		pool->unit_ratio = ratio ? ratio : 1;
+}
+
+/*
+ * shmem_comp_pool_unit_ratio - logical sectors per unit
+ * Returns 1 for NULL pools and for every pool with the split disabled,
+ * so callers can divide by it unconditionally.
+ */
+unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool)
+{
+	if (!pool || !pool->unit_ratio)
+		return 1;
+	return pool->unit_ratio;
 }
 
 /**
@@ -1186,11 +1225,23 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 	struct shmem_comp_entry *ent;
 	unsigned int id;
 	unsigned int g;
+	unsigned int ratio = pool->unit_ratio ? pool->unit_ratio : 1;
+	unsigned int vbm_words;
 	int ret;
 
-	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
+	/*
+	 * valid[] gets BITS_TO_LONGS(ratio) words when the split is on
+	 * and ZERO when it is off, so a ratio-1 entry is the same size
+	 * it was before the field existed.  A fresh unit is entirely
+	 * live, so all bits start set -- the write path clears bits on
+	 * discard from there.
+	 */
+	vbm_words = ratio > 1 ? BITS_TO_LONGS(ratio) : 0;
+	ent = kmalloc(struct_size(ent, valid, vbm_words), GFP_KERNEL);
 	if (!ent)
 		return 0;
+	if (vbm_words)
+		bitmap_fill(ent->valid, ratio);
 
 	ent->handle = handle;
 	ent->length = length;

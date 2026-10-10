@@ -662,6 +662,13 @@ static ssize_t disksize_store(struct device *dev,
 		mutex_unlock(&cz->io_lock);
 		return PTR_ERR(pool);
 	}
+	/*
+	 * Must precede the first entry alloc: the ratio sizes every
+	 * entry's validity bitmap and is not retroactive.  At ratio 1
+	 * this costs zero bitmap words, so the default path allocates
+	 * byte-identical entries to a pool without the field.
+	 */
+	shmem_comp_pool_set_unit_ratio(pool, cellzram_unit_ratio);
 
 	cz->pool = pool;
 	cz->logical_bytes = size_bytes;
