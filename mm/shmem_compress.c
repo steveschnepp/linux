@@ -1669,8 +1669,25 @@ static void shmem_comp_drain_staged(struct shmem_comp_pool *pool)
 					  &comp_len);
 		if (ret)
 			comp_len = unit_bytes;	/* incompressible: store raw */
-		new_handle = shmem_comp_store(pool, ret ? dbuf : cbuf,
-					      comp_len);
+		/*
+		 * Store via cell_store() DIRECTLY, not shmem_comp_store():
+		 * this drain runs under gc_lock, and shmem_comp_store()'s
+		 * directory-exhaustion path re-takes gc_lock (a non-recursive
+		 * mutex) to run the cell GC -- same task, same mutex: a
+		 * self-deadlock, which the churn bench's drain-on-full hits.
+		 * A drain must not recursively GC; if the cell directory is
+		 * full, leave the unit staged and let a later pass (or the
+		 * write path's own exhaustion GC) make room.
+		 */
+		{
+			u32 cellid, offset;
+
+			if (cell_store(pool->cells, ret ? dbuf : cbuf,
+				       comp_len, &cellid, &offset))
+				new_handle = 0;
+			else
+				new_handle = shmem_comp_pack_loc(cellid, offset);
+		}
 		kfree(cbuf);
 		if (!new_handle) {
 			up_write(&op->lock);
@@ -1698,19 +1715,26 @@ static void shmem_comp_drain_staged(struct shmem_comp_pool *pool)
 }
 
 /*
- * shmem_comp_drain_staged_now - synchronously drain a pool's staged units
+ * shmem_comp_gc_now - run one full cell GC on a pool (drain staged +
+ * compact cells)
  * @pool: cell-backed pool with staging
  *
- * The write path calls this when it needs an open-buffer slot and none is
- * free ("compress when no open slots").  Serialised against the GC's
- * drain by gc_lock.  No-op for pools without staging.
+ * The ratio>1 write path calls this when it needs an open-buffer slot and
+ * none is free ("compress when no open slots").  It runs the SAME pass the
+ * shrinker / gc_now run -- shmem_comp_cell_gc(), which drains staged open
+ * buffers AND compacts sparse cells -- because when the cell directory is
+ * full, draining staged units alone cannot store them; the directory needs
+ * compacting first (this is what the ratio-1 store-exhaustion path does).
+ * Serialised by gc_lock, which this path does not otherwise hold, and which
+ * nothing underneath re-takes (drain_staged stores via cell_store directly,
+ * not shmem_comp_store, whose exhaustion path would re-enter gc_lock).
  */
-void shmem_comp_drain_staged_now(struct shmem_comp_pool *pool)
+void shmem_comp_gc_now(struct shmem_comp_pool *pool)
 {
 	if (!pool || !pool->use_cells || !pool->cells || !pool->opens)
 		return;
 	mutex_lock(&pool->cells->gc_lock);
-	shmem_comp_drain_staged(pool);
+	shmem_comp_cell_gc(pool);
 	mutex_unlock(&pool->cells->gc_lock);
 }
 
@@ -1719,10 +1743,6 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 	struct cell_pool *cp = pool->cells;
 	unsigned int drained = 0, moved_total = 0;
 	unsigned int i;
-
-	/* Compress staged open buffers into cell regions first (the async
-	 * close of the open-cell buffer), then drain sparse cells. */
-	shmem_comp_drain_staged(pool);
 
 	/*
 	 * Drain victims ONE AT A TIME, each all the way to empty.
@@ -1788,6 +1808,17 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 		moved_total += shmem_comp_drain_victim(pool, scratch);
 		cell_pool_release_victim(cp, scratch);
 	}
+
+	/*
+	 * Drain STAGED buffers LAST, after compaction.  Compaction above has
+	 * freed directory slots, so a compressed staged unit can now be stored
+	 * into a cell.  Doing this first (before compaction) left units staged
+	 * whenever the directory was full -- the store failed and the
+	 * compaction that would have made room ran too late, so one pass never
+	 * converged and the ratio>1 write path starved for open slots under
+	 * random-overwrite churn.
+	 */
+	shmem_comp_drain_staged(pool);
 
 	cell_dbg("gc pass: %u victims drained, %u objects moved",
 		 drained, moved_total);
@@ -2044,11 +2075,21 @@ unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
 			kfree(cbuf);
 			goto fail;
 		}
-		ret = shmem_comp_decompress(pool, cbuf, comp_len,
-					    page_address(page), &out);
+		if (comp_len == (unsigned int)ratio * PAGE_SIZE) {
+			/* raw seed (incompressible unit, stored raw by the
+			 * drain): the blob IS the uncompressed unit -- copy it,
+			 * do NOT decompress (inflating raw bytes yields garbage
+			 * and silently corrupts the re-staged unit). */
+			memcpy(page_address(page), cbuf, comp_len);
+		} else {
+			ret = shmem_comp_decompress(pool, cbuf, comp_len,
+						    page_address(page), &out);
+			if (ret) {
+				kfree(cbuf);
+				goto fail;
+			}
+		}
 		kfree(cbuf);
-		if (ret)
-			goto fail;
 	}
 
 	/* create the staged entry: slot handle, length 0, one table ref */

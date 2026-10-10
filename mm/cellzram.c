@@ -428,9 +428,10 @@ static int cellzram_write_unit(struct cellzram *dev, unsigned long unit_nr,
 	/* closed or unwritten: stage a fresh buffer seeded from old_id */
 	new_id = shmem_comp_stage_open(dev->pool, old_id);
 	if (!new_id) {
-		/* pool full: drain staged units (compress them) to free a
-		 * slot, then retry once -- "compress when no open slots". */
-		shmem_comp_drain_staged_now(dev->pool);
+		/* pool full: run one full cell GC (drain staged + compact
+		 * cells) to free a slot, then retry once -- "compress when no
+		 * open slots", and compact the directory if it is full too. */
+		shmem_comp_gc_now(dev->pool);
 		new_id = shmem_comp_stage_open(dev->pool, old_id);
 	}
 	if (old_id)
