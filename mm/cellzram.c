@@ -252,9 +252,10 @@ static void cellzram_put_slot(void *old)
  * Read one logical block. @dst has room for @len_bytes bytes (<= PAGE_SIZE).
  * Unwritten blocks read as zeros (brd semantics).
  */
-static int cellzram_read_block(struct cellzram *dev, unsigned long unit_nr,
+static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
 			       void *dst, unsigned int len_bytes)
 {
+	unsigned long unit_nr = cellzram_unit_of(block_nr);
 	unsigned int id, dlen_bytes;
 	void *src;
 	int ret;
@@ -284,6 +285,29 @@ static int cellzram_read_block(struct cellzram *dev, unsigned long unit_nr,
 			break;
 	}
 	rcu_read_unlock();
+
+	if (cellzram_unit_sectors() > 1) {
+		/* ratio>1: the whole-unit read lives in shmem_compress
+		 * (validity mask, staged memcpy, closed decompress). */
+		unsigned int blk = block_nr % cellzram_unit_sectors();
+
+		if (len_bytes == PAGE_SIZE) {
+			ret = shmem_comp_unit_load(id, blk, dst, len_bytes);
+		} else {
+			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
+
+			if (!tmp) {
+				shmem_comp_entry_put(id);
+				return -ENOMEM;
+			}
+			ret = shmem_comp_unit_load(id, blk, tmp, PAGE_SIZE);
+			if (!ret)
+				memcpy(dst, tmp, len_bytes);
+			kfree(tmp);
+		}
+		shmem_comp_entry_put(id);
+		return ret;
+	}
 
 	if (dlen_bytes == PAGE_SIZE && len_bytes == PAGE_SIZE) {
 		/* raw block: load straight into the destination */
@@ -353,15 +377,93 @@ static bool cellzram_page_all_zero(const void *src)
 }
 
 /*
+ * ratio>1 write: stage the unit (an uncompressed gather buffer) and write
+ * one logical block into it.  A normal write only stages -- it compresses
+ * nothing.  When the pool has no free open slot this returns -ENOMEM
+ * (-> BLK_STS_RESOURCE): the async drain / eviction that frees a slot is
+ * a later step, so for now a full pool rejects the write rather than
+ * silently losing data.  See mission_log/2026-10-10_ftl-open-cell-buffer.md.
+ */
+static int cellzram_write_unit(struct cellzram *dev, unsigned long unit_nr,
+			       unsigned long block_nr, const void *src)
+{
+	unsigned int ratio = cellzram_unit_sectors();
+	unsigned int blk = block_nr % ratio;
+	unsigned int old_id = 0, new_id;
+	unsigned long handle = 0;
+	void *old;
+	int ret;
+
+	rcu_read_lock();
+	{
+		void *e = xa_load(&dev->table, unit_nr);
+
+		if (e)
+			old_id = xa_to_value(e);
+	}
+	rcu_read_unlock();
+
+	/* all-zero block: clear the unit's valid bit, store no data; the
+	 * block then reads as zeros via the validity mask. */
+	if (cellzram_page_all_zero(src)) {
+		if (old_id) {
+			shmem_comp_entry_get(old_id, NULL, NULL, NULL, NULL, NULL);
+			shmem_comp_entry_sector_clear(old_id, blk);
+			shmem_comp_entry_put(old_id);
+		}
+		return 0;
+	}
+
+	/* pin the old entry (if any) so it stays alive across the stage */
+	if (old_id)
+		shmem_comp_entry_get(old_id, &handle, NULL, NULL, NULL, NULL);
+
+	if (old_id && shmem_comp_is_staged(handle)) {
+		shmem_comp_entry_put(old_id);
+		/* -EAGAIN means it was drained mid-write; step 2 has no
+		 * drain, so it cannot fire here -- surface it if it does. */
+		return shmem_comp_stage_write(old_id, blk, src, PAGE_SIZE);
+	}
+
+	/* closed or unwritten: stage a fresh buffer seeded from old_id */
+	new_id = shmem_comp_stage_open(dev->pool, old_id);
+	if (old_id)
+		shmem_comp_entry_put(old_id);
+	if (!new_id)
+		return -ENOMEM;	/* pool full: no slot (drain is a later step) */
+
+	ret = shmem_comp_stage_write(new_id, blk, src, PAGE_SIZE);
+	if (ret) {
+		shmem_comp_entry_put(new_id);
+		return ret;
+	}
+
+	/* publish: swap the staged entry into the table, drop the old */
+	old = xa_store(&dev->table, unit_nr, xa_mk_value(new_id), GFP_NOIO);
+	if (IS_ERR(old)) {
+		shmem_comp_entry_put(new_id);
+		return PTR_ERR(old);
+	}
+	if (old)
+		cellzram_put_slot(old);
+	return 0;
+}
+
+/*
  * Write one full logical block. Stores raw in phase-1 mode
  * (compressed == false); phase 2 wires compression in with the entry
  * length as the discriminator. Replaces any previous block (COW): the
  * old entry is put after the exchange, so a reader pinned on it keeps
  * its data alive until it is done.
  */
-static int cellzram_write_block(struct cellzram *dev, unsigned long unit_nr,
+static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 				const void *src)
 {
+	unsigned long unit_nr = cellzram_unit_of(block_nr);
+
+	if (cellzram_unit_sectors() > 1)
+		return cellzram_write_unit(dev, unit_nr, block_nr, src);
+
 	/*
 	 * all-zero page: store a sentinel slot (xa_mk_value(0); entry ids
 	 * are never 0), no entry/cell -- a zero block reads back as zeros
@@ -459,12 +561,11 @@ static void cellzram_bio_read(struct cellzram *dev, struct bio *bio)
 
 	bio_for_each_segment(bv, bio, iter) {
 		void *mem = kmap_local_page(bv.bv_page) + bv.bv_offset;
-		unsigned long unit_nr =
-			cellzram_unit_of(sector >> SECTOR_SHIFT_BITS);
+		unsigned long block_nr = sector >> SECTOR_SHIFT_BITS;
 		int ret;
 
 		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
-			ret = cellzram_read_block(dev, unit_nr, mem, bv.bv_len);
+			ret = cellzram_read_block(dev, block_nr, mem, bv.bv_len);
 		else {
 			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
 
@@ -473,7 +574,7 @@ static void cellzram_bio_read(struct cellzram *dev, struct bio *bio)
 				kunmap_local(mem);
 				return;
 			}
-			ret = cellzram_read_block(dev, unit_nr, tmp, PAGE_SIZE);
+			ret = cellzram_read_block(dev, block_nr, tmp, PAGE_SIZE);
 			if (!ret)
 				memcpy(mem, tmp, bv.bv_len);
 			kfree(tmp);
@@ -496,12 +597,11 @@ static void cellzram_bio_write(struct cellzram *dev, struct bio *bio)
 
 	bio_for_each_segment(bv, bio, iter) {
 		void *mem = kmap_local_page(bv.bv_page) + bv.bv_offset;
-		unsigned long unit_nr =
-			cellzram_unit_of(sector >> SECTOR_SHIFT_BITS);
+		unsigned long block_nr = sector >> SECTOR_SHIFT_BITS;
 		int ret;
 
 		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
-			ret = cellzram_write_block(dev, unit_nr, mem);
+			ret = cellzram_write_block(dev, block_nr, mem);
 		else {
 			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
 
@@ -514,7 +614,7 @@ static void cellzram_bio_write(struct cellzram *dev, struct bio *bio)
 			if (bv.bv_len < PAGE_SIZE)
 				memset(tmp + bv.bv_len, 0,
 				       PAGE_SIZE - bv.bv_len);
-			ret = cellzram_write_block(dev, unit_nr, tmp);
+			ret = cellzram_write_block(dev, block_nr, tmp);
 			kfree(tmp);
 		}
 		kunmap_local(mem);
@@ -525,6 +625,47 @@ static void cellzram_bio_write(struct cellzram *dev, struct bio *bio)
 		}
 		atomic64_inc(&dev->io_writes);
 		sector += bv.bv_len >> SECTOR_SHIFT;
+	}
+}
+
+/*
+ * Drop one logical block.  At ratio 1 the unit IS the block, so erase the
+ * slot.  At ratio>1 clear the block's validity bit and erase the unit only
+ * when no bit remains.  Counts one discarded block per call that found
+ * data.  Used by both discard and swap-slot-free.
+ */
+static void cellzram_drop_block(struct cellzram *dev, unsigned long block_nr)
+{
+	unsigned long unit_nr = cellzram_unit_of(block_nr);
+	void *old;
+
+	if (cellzram_unit_sectors() > 1) {
+		unsigned int id, blk = block_nr % cellzram_unit_sectors();
+
+		rcu_read_lock();
+		{
+			void *e = xa_load(&dev->table, unit_nr);
+
+			id = e ? xa_to_value(e) : 0;
+		}
+		rcu_read_unlock();
+		if (!id)
+			return;
+		shmem_comp_entry_get(id, NULL, NULL, NULL, NULL, NULL);
+		shmem_comp_entry_sector_clear(id, blk);
+		atomic64_inc(&dev->discarded_blocks);
+		if (!shmem_comp_entry_any_valid(id)) {
+			old = xa_erase(&dev->table, unit_nr);
+			if (old)
+				cellzram_put_slot(old);
+		}
+		shmem_comp_entry_put(id);
+		return;
+	}
+	old = xa_erase(&dev->table, unit_nr);
+	if (old) {
+		cellzram_put_slot(old);
+		atomic64_inc(&dev->discarded_blocks);
 	}
 }
 
@@ -554,15 +695,8 @@ static void cellzram_bio_discard(struct cellzram *dev, struct bio *bio)
 	 * partial-unit case (punch-hole -> WRITE_ZEROES) is step 4's: it
 	 * clears one bitmap bit instead of dropping the unit.
 	 */
-	for (block_nr = start_block; block_nr < end_block; block_nr++) {
-		void *old = xa_erase(&dev->table,
-				     cellzram_unit_of(block_nr));
-
-		if (old) {
-			cellzram_put_slot(old);
-			atomic64_inc(&dev->discarded_blocks);
-		}
-	}
+	for (block_nr = start_block; block_nr < end_block; block_nr++)
+		cellzram_drop_block(dev, block_nr);
 }
 
 static void cellzram_submit_bio(struct bio *bio)
@@ -599,13 +733,8 @@ static void cellzram_slot_free_notify(struct block_device *bdev,
 				      unsigned long block_nr)
 {
 	struct cellzram *dev = bdev->bd_disk->private_data;
-	void *old = xa_erase(&dev->table,
-			     cellzram_unit_of(block_nr));
 
-	if (old) {
-		cellzram_put_slot(old);
-		atomic64_inc(&dev->discarded_blocks);
-	}
+	cellzram_drop_block(dev, block_nr);
 }
 
 static const struct block_device_operations cellzram_devops = {
@@ -761,6 +890,7 @@ static ssize_t mm_stat_show(struct device *dev,
 	struct cellzram *cz = disk->private_data;
 	unsigned long long orig_bytes, compr_bytes = 0, phys_bytes = 0;
 	unsigned long long objects = 0, entry_bytes, zero_blocks = 0;
+	unsigned long long unit_live = 0;
 	unsigned long long gc_recoveries;
 	unsigned long idx;
 	void *entry;
@@ -794,7 +924,9 @@ static ssize_t mm_stat_show(struct device *dev,
 		}
 		if (shmem_comp_entry_get(id, NULL, &len, NULL, NULL, NULL)) {
 			objects++;
-			compr_bytes += len;
+			compr_bytes += len;	/* staged entries report 0 */
+			if (cellzram_unit_sectors() > 1)
+				unit_live += shmem_comp_entry_valid_count(id);
 			shmem_comp_entry_put(id);
 		}
 	}
@@ -808,7 +940,14 @@ static ssize_t mm_stat_show(struct device *dev,
 			<< PAGE_SHIFT;
 	mutex_unlock(&cz->io_lock);
 
-	orig_bytes = (objects + zero_blocks) << PAGE_SHIFT;
+	/* staged (uncompressed) buffers are RAM the vs-zram comparison must
+	 * see; neither cell storage nor compressed data. */
+	phys_bytes += shmem_comp_pool_staged_bytes(cz->pool);
+
+	if (cellzram_unit_sectors() > 1)
+		orig_bytes = unit_live << PAGE_SHIFT;
+	else
+		orig_bytes = (objects + zero_blocks) << PAGE_SHIFT;
 	/*
 	 * entry_bytes is reported separately from phys_used: phys_used
 	 * is cell storage only, so the vs-zram comparison stays
@@ -1065,15 +1204,15 @@ static int __init cellzram_init(void)
 	 * in unit N/ratio and clobber its siblings.  Reject until then so
 	 * every commit in the series is correct on its own.
 	 */
-	if (cellzram_unit_ratio != 1) {
+	if (cellzram_unit_sectors() > 1 && open_units <= 0) {
 		pr_err(CELLZRAM_NAME
-		       ": physical_block_size > logical_block_size is not yet supported (step 4)\n");
+		       ": physical > logical requires open_units > 0 (the open-cell buffer)\n");
 		return -EINVAL;
 	}
 	pr_info(CELLZRAM_NAME
-		": logical=%d physical=%d unit_ratio=%u%s\n",
+		": logical=%d physical=%d unit_ratio=%u open_units=%d%s\n",
 		logical_block_size, physical_block_size,
-		cellzram_unit_ratio,
+		cellzram_unit_ratio, open_units,
 		cellzram_unit_ratio == 1 ? " (split disabled)" : "");
 
 	cellzram_major = register_blkdev(0, CELLZRAM_NAME);
