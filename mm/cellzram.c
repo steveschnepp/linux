@@ -166,6 +166,42 @@ module_param(cell_headroom_pct, int, 0444);
 MODULE_PARM_DESC(cell_headroom_pct,
 		 "Cell directory headroom over disksize (percent)");
 
+/*
+ * FTL-style logical/physical split.  logical is the granularity the
+ * block layer addresses (and the only size it enforces on writes);
+ * physical is the compression unit -- one blob per physical block,
+ * with a per-unit validity bitmap so a discarded logical sector reads
+ * as zeros without recompressing the unit.
+ *
+ * Set at device creation, both powers of two.  logical is capped by
+ * BLK_MAX_BLOCK_SIZE (PAGE_SIZE without THP).  physical has no block-
+ * layer bound but MUST fit in one cell, since a unit is stored as a
+ * single cell region -- that is the limit that matters, and it also
+ * bounds the unit bitmap at cell_size / logical bits.
+ *
+ * Defaults are both PAGE_SIZE: ratio 1, one blob per 4 KiB block,
+ * bitmaps degenerate to a single set bit.  That is byte-for-byte the
+ * pre-split behaviour, so this is a no-op until a larger physical is
+ * requested.
+ */
+static int logical_block_size = PAGE_SIZE;
+module_param(logical_block_size, int, 0444);
+MODULE_PARM_DESC(logical_block_size,
+		 "Logical block size in bytes (power of 2, default PAGE_SIZE)");
+
+static int physical_block_size = PAGE_SIZE;
+module_param(physical_block_size, int, 0444);
+MODULE_PARM_DESC(physical_block_size,
+		 "Physical block size in bytes (power of 2, >= logical, <= cell size)");
+
+/* logical sectors per compression unit; 1 when the split is disabled */
+static unsigned int cellzram_unit_ratio;
+
+static __maybe_unused unsigned int cellzram_unit_sectors(void)
+{
+	return cellzram_unit_ratio ? cellzram_unit_ratio : 1;
+}
+
 static int cellzram_major;
 
 static struct cellzram **cellzram_devs;
@@ -812,12 +848,20 @@ ATTRIBUTE_GROUPS(cellzram);
 static int cellzram_add(int id)
 {
 	struct queue_limits lim = {
-		.logical_block_size	= PAGE_SIZE,
-		.physical_block_size	= PAGE_SIZE,
-		.io_min			= PAGE_SIZE,
-		.io_opt			= PAGE_SIZE,
+		.logical_block_size	= logical_block_size,
+		.physical_block_size	= physical_block_size,
+		.io_min			= physical_block_size,
+		.io_opt			= physical_block_size,
 		.max_hw_discard_sectors	= UINT_MAX,
-		.discard_granularity	= PAGE_SIZE,
+		/*
+	 * discard_granularity is raised to physical_block_size by
+	 * blk_validate_limits(), so discards arrive whole-unit
+	 * aligned.  Punch-hole reaches us as WRITE_ZEROES, which
+	 * the block layer does NOT align to physical -- that path
+	 * needs the per-unit bitmap to clear a single logical
+	 * sector without recompressing.
+	 */
+		.discard_granularity	= physical_block_size,
 		/*
 		 * Punch-hole (fallocate) reaches the device as
 		 * REQ_OP_WRITE_ZEROES through the BLKDEV_ZERO_NOFALLBACK
@@ -919,6 +963,38 @@ static int __init cellzram_init(void)
 		pr_err(CELLZRAM_NAME ": cell_headroom_pct must be 0..100\n");
 		return -EINVAL;
 	}
+	if (!is_power_of_2(logical_block_size) ||
+	    blk_validate_block_size(logical_block_size)) {
+		pr_err(CELLZRAM_NAME
+		       ": logical_block_size must be a power of 2 in 512..%lu\n",
+		       (unsigned long)BLK_MAX_BLOCK_SIZE);
+		return -EINVAL;
+	}
+	if (!is_power_of_2(physical_block_size) ||
+	    physical_block_size < logical_block_size) {
+		pr_err(CELLZRAM_NAME
+		       ": physical_block_size must be a power of 2 >= logical_block_size\n");
+		return -EINVAL;
+	}
+	/*
+	 * The unit is stored as one cell region, so it must fit in a
+	 * cell.  This is the real ceiling on physical -- the block
+	 * layer sets none -- and it bounds the unit bitmap at
+	 * physical/logical bits.
+	 */
+	if (physical_block_size > (PAGE_SIZE << cell_order)) {
+		pr_err(CELLZRAM_NAME
+		       ": physical_block_size %d exceeds cell size %lu\n",
+		       physical_block_size,
+		       (unsigned long)PAGE_SIZE << cell_order);
+		return -EINVAL;
+	}
+	cellzram_unit_ratio = physical_block_size / logical_block_size;
+	pr_info(CELLZRAM_NAME
+		": logical=%d physical=%d unit_ratio=%u%s\n",
+		logical_block_size, physical_block_size,
+		cellzram_unit_ratio,
+		cellzram_unit_ratio == 1 ? " (split disabled)" : "");
 
 	cellzram_major = register_blkdev(0, CELLZRAM_NAME);
 	if (cellzram_major < 0)
