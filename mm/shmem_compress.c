@@ -68,8 +68,6 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
-#include <linux/overflow.h>
-#include <linux/bitmap.h>
 #include <linux/mutex.h>
 #include <linux/percpu.h>
 #include <linux/spinlock.h>
@@ -97,8 +95,6 @@
 
 /* GC implementation lives after the entry table (needs the xarray) */
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool);
-static void shmem_comp_open_free_slot(struct shmem_comp_pool *pool,
-				      unsigned int idx);
 static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
 					   struct shrink_control *sc);
 static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
@@ -169,25 +165,6 @@ struct shmem_comp_sb {
 	atomic_long_t skipped_dead;	/* chilled pages freed without compression */
 };
 
-/*
- * One staged (uncompressed) compression unit: a buffer of `unit_ratio *
- * PAGE_SIZE` bytes holding a not-yet-compressed cellzram unit.  Lives in
- * the pool's bounded opens[] array and is reached from an entry handle
- * whose bit 63 is set (index in the low bits).  The rwsem mirrors a
- * cell's: a staged reader holds it down_read across its memcpy; GC's
- * staged drain (a later step) takes down_write to exclude readers while
- * it flips the handle and frees the buffer -- the same contract
- * shmem_comp_load_entry() relies on for cells.
- */
-struct shmem_comp_open {
-	struct page		*page;	/* compound page, the unit buffer */
-	unsigned int		order;	/* alloc order of @page */
-	struct rw_semaphore	lock;	/* staged readers vs drain */
-	refcount_t		refs;	/* pinned staged readers */
-	bool			in_use;
-	struct list_head	lru;	/* pool->open_lru when in_use */
-};
-
 struct shmem_comp_pool {
 	/*
 	 * Storage backing.  Exactly one of zs_pool / cells is non-NULL;	 * use_cells selects which.  The choice is made at pool creation
@@ -202,41 +179,9 @@ struct shmem_comp_pool {
 	 * Writes that ran out of directory slots and were saved by the
 	 * exhaustion GC pass.  A counter, not a gauge: it answers "how
 	 * often would this write have failed before session 25", which
-	 * is the number a headroom sweep needs.  Appended to cellzram's
-	 * mm_stat so the field order of existing parsers stays stable.
+	 * is the number a headroom sweep needs.
 	 */
 	atomic64_t gc_recoveries;
-	/*
-	 * Logical sectors per compression unit (the logical/physical
-	 * split).  1 = split disabled, which is every pool except a
-	 * cellzram device configured with physical > logical.  Drives
-	 * the size of shmem_comp_entry.valid and which code paths may
-	 * touch it.
-	 */
-	unsigned int unit_ratio;
-	/*
-	 * Staged-write buffer bound (the FTL open-cell model): the max
-	 * number of uncompressed unit buffers a cellzram device may hold
-	 * open at once.  0 = staging disabled, which is every pool except
-	 * a cellzram device configured with open_units > 0; tmpfs pools
-	 * never stage.  Set once at setup (disksize_store) before io, like
-	 * unit_ratio.  The opens[] array is allocated here, once, in the
-	 * single-threaded setup path (disksize_store) -- a pool that never
-	 * stages (open_max == 0) allocates nothing beyond this scalar,
-	 * which kzalloc already zeroed.
-	 */
-	unsigned int open_max;
-	/*
-	 * Staged open-buffer slots (open-cell buffer).  opens[] has
-	 * open_max entries, allocated in set_open_max() when open_max > 0.
-	 * open_lock protects in_use/page/refs/lru/open_count and the LRU
-	 * order; it is a leaf with respect to a slot's own rwsem and to
-	 * cp->lock.
-	 */
-	struct shmem_comp_open	*opens;
-	unsigned int		open_count;
-	spinlock_t		open_lock;
-	struct list_head	open_lru;	/* MRU head -> victim tail */
 	struct list_head list;			/* global pools list */
 };
 
@@ -579,67 +524,6 @@ unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool)
 	return 1U << pool->cells->cell_order;
 }
 
-/*
- * shmem_comp_pool_set_unit_ratio - set logical sectors per unit
- * @pool: target pool
- * @ratio: logical blocks per compression unit; 1 = split disabled
- *
- * Must be called before the first entry is allocated on @pool: the
- * ratio sizes every entry's validity bitmap at alloc time and is not
- * retroactive.  A ratio-1 pool allocates zero bitmap words, which is
- * why the default path is byte-identical to a pool without the field.
- */
-void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
-				    unsigned int ratio)
-{
-	if (pool)
-		pool->unit_ratio = ratio ? ratio : 1;
-}
-
-/*
- * shmem_comp_pool_set_open_max - set the staged-write buffer bound
- * @pool: target pool
- * @open_max: max simultaneous uncompressed staging buffers; 0 = off
- *
- * Must be called before the first stage on @pool (it bounds the opens[]
- * array).  A 0 value keeps staging disabled and is byte-for-byte the
- * pre-open-cell behaviour, which is what makes this a no-op until a
- * device asks for buffers.
- */
-void shmem_comp_pool_set_open_max(struct shmem_comp_pool *pool,
-				  unsigned int open_max)
-{
-	unsigned int i;
-
-	if (!pool)
-		return;
-	pool->open_max = open_max;
-	if (!open_max)
-		return;	/* staging disabled */
-
-	/*
-	 * Allocate the bounded open-buffer array once, here in the
-	 * single-threaded setup path, so the write path never races the
-	 * lazy init.  On failure degrade to staging off (open_max = 0):
-	 * cellzram then reads 0 and stores units compressed, which is
-	 * correct, just without the write-gathering benefit.
-	 */
-	pool->opens = kcalloc(open_max, sizeof(*pool->opens), GFP_KERNEL);
-	if (!pool->opens) {
-		pool->open_max = 0;
-		return;
-	}
-	INIT_LIST_HEAD(&pool->open_lru);
-	spin_lock_init(&pool->open_lock);
-	for (i = 0; i < open_max; i++)
-		init_rwsem(&pool->opens[i].lock);
-}
-
-unsigned int shmem_comp_pool_open_max(struct shmem_comp_pool *pool)
-{
-	return pool ? pool->open_max : 0;
-}
-
 /**
  * shmem_comp_pool_put - Release reference to a pool
  * @pool: Pool to release
@@ -890,12 +774,11 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 		 * full device, matching zram.
 		 *
 		 * Sleepable context by contract: every cell-path caller runs
-		 * in process or kworker context (cellzram kmallocs its
-		 * bounce buffer with GFP_NOIO in this very path; tmpfs
-		 * compresses from write_end or the aging work).  gc_lock is
-		 * a mutex for the same reason.  GC itself cannot recurse
-		 * back here -- it relocates through cell_relocate_one(),
-		 * which never re-enters this function.
+		 * in process or kworker context (tmpfs compresses from
+		 * write_end or the aging work).  gc_lock is a mutex for the
+		 * same reason.  GC itself cannot recurse back here -- it
+		 * relocates through cell_relocate_one(), which never
+		 * re-enters this function.
 		 */
 		mutex_lock(&pool->cells->gc_lock);
 		shmem_comp_cell_gc(pool);
@@ -1093,154 +976,6 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
 static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 
 /*
- * shmem_comp_pool_unit_ratio - logical sectors per unit
- * Returns 1 for NULL pools and for every pool with the split disabled,
- * so callers can divide by it unconditionally.
- */
-unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool)
-{
-	if (!pool || !pool->unit_ratio)
-		return 1;
-	return pool->unit_ratio;
-}
-
-/*
- * Validity-bitmap accessors for split pools (unit_ratio > 1).
- *
- * The bitmap is per-entry, uncompressed, and lives outside the
- * compressed blob so discard can clear a bit without recompressing
- * (see shmem_comp_entry.valid).  These are the ONLY way the block
- * device touches it: the entry lives in this file's private xarray,
- * so cellzram cannot reach valid[] directly.
- *
- * At unit_ratio == 1 no bitmap words are allocated and existence of
- * the entry IS the bitmap -- every accessor reports the entry present,
- * which keeps the disabled-split path byte-identical.
- */
-
-/* is logical sector @idx live in unit @id?  false for a dead or
- * absent entry, so a caller can use it directly as a read mask. */
-bool shmem_comp_entry_sector_valid(unsigned int id, unsigned int idx)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int ratio;
-	bool live = false;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent)
-		goto out;
-	ratio = shmem_comp_pool_unit_ratio(ent->pool);
-	if (ratio == 1) {
-		live = true;	/* presence is the bitmap */
-	} else if (idx < ratio &&
-		   atomic_inc_not_zero(&ent->refs)) {
-		live = test_bit(idx, ent->valid);
-		shmem_comp_entry_put(id);
-	}
-out:
-	rcu_read_unlock();
-	return live;
-}
-
-/* is ANY logical sector in unit @id still live?  A unit whose mask
- * reaches zero is garbage: free it rather than hold an empty blob. */
-bool shmem_comp_entry_any_valid(unsigned int id)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int ratio;
-	bool live = false;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent)
-		goto out;
-	ratio = shmem_comp_pool_unit_ratio(ent->pool);
-	if (ratio == 1) {
-		live = true;
-	} else if (atomic_inc_not_zero(&ent->refs)) {
-		live = !bitmap_empty(ent->valid, ratio);
-		shmem_comp_entry_put(id);
-	}
-out:
-	rcu_read_unlock();
-	return live;
-}
-
-/* mark logical sector @idx dead in unit @id.  A bit-flip, no I/O and
- * no recompress: the stale bytes stay in the blob until the unit is
- * rewritten or freed.  Returns true if the unit is now entirely dead,
- * so the caller can drop it. */
-bool shmem_comp_entry_sector_clear(unsigned int id, unsigned int idx)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int ratio;
-	bool now_dead = false;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent)
-		goto out;
-	ratio = shmem_comp_pool_unit_ratio(ent->pool);
-	if (ratio > 1 && idx < ratio &&
-	    atomic_inc_not_zero(&ent->refs)) {
-		clear_bit(idx, ent->valid);
-		now_dead = bitmap_empty(ent->valid, ratio);
-		shmem_comp_entry_put(id);
-	}
-out:
-	rcu_read_unlock();
-	return now_dead;
-}
-
-/* copy the validity mask from unit @src_id to @dst_id.  A split write
- * replaces the entry (COW) but must preserve which sibling sectors are
- * still live, so the new entry inherits the old mask before the written
- * sector is set. */
-void shmem_comp_entry_valid_copy(unsigned int dst_id, unsigned int src_id)
-{
-	struct shmem_comp_entry *dst, *src;
-	unsigned int ratio;
-
-	rcu_read_lock();
-	src = xa_load(&shmem_comp_entries, src_id);
-	dst = xa_load(&shmem_comp_entries, dst_id);
-	if (!src || !dst)
-		goto out;
-	ratio = shmem_comp_pool_unit_ratio(src->pool);
-	if (ratio > 1 && ratio == shmem_comp_pool_unit_ratio(dst->pool) &&
-	    atomic_inc_not_zero(&src->refs) &&
-	    atomic_inc_not_zero(&dst->refs)) {
-		bitmap_copy(dst->valid, src->valid, ratio);
-		shmem_comp_entry_put(src_id);
-		shmem_comp_entry_put(dst_id);
-	}
-out:
-	rcu_read_unlock();
-}
-
-/* mark logical sector @idx live in unit @id.  Inverse of sector_clear;
- * used after a split write installs the new entry. */
-void shmem_comp_entry_sector_set(unsigned int id, unsigned int idx)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int ratio;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent)
-		goto out;
-	ratio = shmem_comp_pool_unit_ratio(ent->pool);
-	if (ratio > 1 && idx < ratio && atomic_inc_not_zero(&ent->refs)) {
-		set_bit(idx, ent->valid);
-		shmem_comp_entry_put(id);
-	}
-out:
-	rcu_read_unlock();
-}
-
-
-/*
  * Generation counter for entry incarnations (swapops.h packs 23 bits
  * of it into every page cache xarray value, next to the ID) and the
  * count of stale xarray values those generations rejected. A stale
@@ -1298,11 +1033,7 @@ static void shmem_comp_entry_free(unsigned int id)
 	 * length to decrement live_bytes, which is why cell_free() is
 	 * called directly here rather than through shmem_comp_free().	 * The zsmalloc free path does not need the length — zs_free()	 * recovers it from the size class encoded in the handle.	 */
 	if (ent->handle) {
-		if (shmem_comp_is_staged(ent->handle)) {
-			/* staged buffer, not a cell region: free the slot */
-			shmem_comp_open_free_slot(ent->pool,
-						   shmem_comp_open_idx(ent->handle));
-		} else if (ent->pool->use_cells) {
+		if (ent->pool->use_cells) {
 			u32 cellid;
 			u32 offset;
 
@@ -1362,9 +1093,8 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 			  unsigned long **handles,
 			  unsigned short *nchunks)
 {
-	/* Bare-ID pin: table-internal users only (cellzram, whose
-	 * entries are pinned by their own table references). Anything
-	 * that reached the ID through a page cache xarray value must
+	/* Bare-ID pin: table-internal users only.  Anything that
+	 * reached the ID through a page cache xarray value must
 	 * use shmem_comp_entry_get_gen(). */
 	return shmem_comp_entry_get_common(id, false, 0, handle, length,
 					   nr_pages, handles, nchunks);
@@ -1455,23 +1185,11 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 	struct shmem_comp_entry *ent;
 	unsigned int id;
 	unsigned int g;
-	unsigned int ratio = pool->unit_ratio ? pool->unit_ratio : 1;
-	unsigned int vbm_words;
 	int ret;
 
-	/*
-	 * valid[] gets BITS_TO_LONGS(ratio) words when the split is on
-	 * and ZERO when it is off, so a ratio-1 entry is the same size
-	 * it was before the field existed.  A fresh unit is entirely
-	 * live, so all bits start set -- the write path clears bits on
-	 * discard from there.
-	 */
-	vbm_words = ratio > 1 ? BITS_TO_LONGS(ratio) : 0;
-	ent = kmalloc(struct_size(ent, valid, vbm_words), GFP_KERNEL);
+	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
 	if (!ent)
 		return 0;
-	if (vbm_words)
-		bitmap_fill(ent->valid, ratio);
 
 	ent->handle = handle;
 	ent->length = length;
@@ -1604,140 +1322,6 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 	return moved;
 }
 
-/*
- * shmem_comp_drain_staged - compress staged open buffers into cell regions
- * @pool: cell-backed pool with staging enabled
- *
- * The async half of the open-cell buffer: a staged unit holds its
- * uncompressed bytes in an open-buffer slot; this compresses it into a
- * cell region and flips the entry handle from staged (bit 63 set) to a
- * cell location.  A reader that raced the flip sees the changed handle
- * under the slot's down_read and retries into the closed path -- the same
- * contract shmem_comp_load_entry() relies on for cells.  Runs from the
- * cell GC (shrinker, gc_now, store-exhaustion), all of which hold
- * gc_lock, so two drains cannot overlap.  An incompressible unit is stored
- * raw at unit_bytes; unit_load() detects that (length == unit_bytes) and
- * extracts the block without decompressing.
- */
-static void shmem_comp_drain_staged(struct shmem_comp_pool *pool)
-{
-	unsigned long id;
-	struct shmem_comp_entry *ent;
-
-	if (!pool->opens)
-		return;
-
-	xa_for_each(&shmem_comp_entries, id, ent) {
-		unsigned long h, new_handle;
-		unsigned int ratio, comp_len, idx, unit_bytes;
-		struct shmem_comp_open *op;
-		void *dbuf, *cbuf;
-		int ret;
-
-		if (ent->pool != pool)
-			continue;
-		h = READ_ONCE(ent->handle);
-		if (!h || !shmem_comp_is_staged(h))
-			continue;
-		if (!atomic_inc_not_zero(&ent->refs))
-			continue;	/* dying; its own free path handles it */
-		if (READ_ONCE(ent->handle) != h) {
-			shmem_comp_entry_put(id);
-			continue;	/* changed under the pin */
-		}
-
-		ratio = pool->unit_ratio;
-		unit_bytes = (unsigned int)ratio * PAGE_SIZE;
-		idx = shmem_comp_open_idx(h);
-		op = &pool->opens[idx];
-
-		down_write(&op->lock);
-		if (READ_ONCE(ent->handle) != h || !op->in_use || !op->page) {
-			up_write(&op->lock);
-			shmem_comp_entry_put(id);
-			continue;	/* already drained / reused */
-		}
-		dbuf = page_address(op->page);
-		cbuf = kmalloc(unit_bytes, GFP_KERNEL);
-		if (!cbuf) {
-			up_write(&op->lock);
-			shmem_comp_entry_put(id);
-			continue;	/* stay staged; try a later pass */
-		}
-		comp_len = unit_bytes;
-		ret = shmem_comp_compress(pool, dbuf, unit_bytes, cbuf,
-					  &comp_len);
-		if (ret)
-			comp_len = unit_bytes;	/* incompressible: store raw */
-		/*
-		 * Store via cell_store() DIRECTLY, not shmem_comp_store():
-		 * this drain runs under gc_lock, and shmem_comp_store()'s
-		 * directory-exhaustion path re-takes gc_lock (a non-recursive
-		 * mutex) to run the cell GC -- same task, same mutex: a
-		 * self-deadlock, which the churn bench's drain-on-full hits.
-		 * A drain must not recursively GC; if the cell directory is
-		 * full, leave the unit staged and let a later pass (or the
-		 * write path's own exhaustion GC) make room.
-		 */
-		{
-			u32 cellid, offset;
-
-			if (cell_store(pool->cells, ret ? dbuf : cbuf,
-				       comp_len, &cellid, &offset))
-				new_handle = 0;
-			else
-				new_handle = shmem_comp_pack_loc(cellid, offset);
-		}
-		kfree(cbuf);
-		if (!new_handle) {
-			up_write(&op->lock);
-			shmem_comp_entry_put(id);
-			continue;	/* no cell space; stay staged */
-		}
-		/* flip under the same down_write the readers exclude on */
-		WRITE_ONCE(ent->length, comp_len);
-		WRITE_ONCE(ent->handle, new_handle);
-		if (op->page) {
-			__free_pages(op->page, op->order);
-			op->page = NULL;
-		}
-		up_write(&op->lock);
-
-		spin_lock(&pool->open_lock);
-		if (op->in_use) {
-			op->in_use = false;
-			list_del(&op->lru);
-			pool->open_count--;
-		}
-		spin_unlock(&pool->open_lock);
-		shmem_comp_entry_put(id);
-	}
-}
-
-/*
- * shmem_comp_gc_now - run one full cell GC on a pool (drain staged +
- * compact cells)
- * @pool: cell-backed pool with staging
- *
- * The ratio>1 write path calls this when it needs an open-buffer slot and
- * none is free ("compress when no open slots").  It runs the SAME pass the
- * shrinker / gc_now run -- shmem_comp_cell_gc(), which drains staged open
- * buffers AND compacts sparse cells -- because when the cell directory is
- * full, draining staged units alone cannot store them; the directory needs
- * compacting first (this is what the ratio-1 store-exhaustion path does).
- * Serialised by gc_lock, which this path does not otherwise hold, and which
- * nothing underneath re-takes (drain_staged stores via cell_store directly,
- * not shmem_comp_store, whose exhaustion path would re-enter gc_lock).
- */
-void shmem_comp_gc_now(struct shmem_comp_pool *pool)
-{
-	if (!pool || !pool->use_cells || !pool->cells || !pool->opens)
-		return;
-	mutex_lock(&pool->cells->gc_lock);
-	shmem_comp_cell_gc(pool);
-	mutex_unlock(&pool->cells->gc_lock);
-}
-
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 {
 	struct cell_pool *cp = pool->cells;
@@ -1808,17 +1392,6 @@ static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 		moved_total += shmem_comp_drain_victim(pool, scratch);
 		cell_pool_release_victim(cp, scratch);
 	}
-
-	/*
-	 * Drain STAGED buffers LAST, after compaction.  Compaction above has
-	 * freed directory slots, so a compressed staged unit can now be stored
-	 * into a cell.  Doing this first (before compaction) left units staged
-	 * whenever the directory was full -- the store failed and the
-	 * compaction that would have made room ran too late, so one pass never
-	 * converged and the ratio>1 write path starved for open slots under
-	 * random-overwrite churn.
-	 */
-	shmem_comp_drain_staged(pool);
 
 	cell_dbg("gc pass: %u victims drained, %u objects moved",
 		 drained, moved_total);
@@ -1957,395 +1530,6 @@ out:
 }
 
 /* Debug hook: run one GC pass on every cell-backed pool. */
-/*
- * shmem_comp_open_free_slot - release one staged open-buffer slot
- * @pool: pool owning the slot
- * @idx: slot index (from a staged handle's low bits)
- *
- * Frees the buffer page and returns the slot to the free pool.  The
- * down_write mirrors a cell's: it excludes a staged reader mid-memcpy.
- * Called from entry teardown (refs == 0, so no reader is pinned) today;
- * the staged drain of a later step reuses it under the same rwsem
- * contract while the entry lives.
- */
-static void shmem_comp_open_free_slot(struct shmem_comp_pool *pool,
-				      unsigned int idx)
-{
-	struct shmem_comp_open *op;
-
-	if (!pool->opens || idx >= pool->open_max)
-		return;
-	op = &pool->opens[idx];
-
-	down_write(&op->lock);
-	if (op->page) {
-		__free_pages(op->page, op->order);
-		op->page = NULL;
-	}
-	up_write(&op->lock);
-
-	spin_lock(&pool->open_lock);
-	if (op->in_use) {
-		op->in_use = false;
-		list_del(&op->lru);
-		pool->open_count--;
-	}
-	spin_unlock(&pool->open_lock);
-}
-
-/*
- * shmem_comp_stage_open - create a staged (uncompressed) unit entry
- * @pool: cell-backed pool with staging enabled (open_max > 0, ratio > 1)
- * @seed_id: existing closed entry to seed from, or 0 for a fresh unit
- *
- * Return: the new entry id, or 0 when no slot is free (the caller stores
- * the unit compressed instead) or on allocation failure.
- *
- * The returned entry carries a staged handle (bit 63 set, low bits the
- * slot index), length 0 (not yet compressed), and one table reference
- * (nr_pages = 1: cellzram's block table holds a single slot per unit,
- * regardless of how many logical blocks the unit spans).  Its validity
- * bitmap is @seed_id's, or empty for a fresh unit -- the caller sets the
- * written block's bit.  The buffer is the ONLY copy of staged data until
- * it is compressed, so the entry's lifetime owns the slot (freed in
- * shmem_comp_entry_free).
- */
-unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
-				   unsigned int seed_id)
-{
-	unsigned int ratio = pool->unit_ratio;
-	unsigned int order, idx, id, i;
-	struct shmem_comp_open *op;
-	struct shmem_comp_entry *ent;
-	struct page *page;
-	unsigned long h;
-
-	if (!pool->opens || ratio < 2)
-		return 0;
-
-	order = get_order((size_t)ratio * PAGE_SIZE);
-	page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-	if (!page)
-		return 0;
-
-	/* claim a free slot (open_max is small; a linear scan is fine) */
-	spin_lock(&pool->open_lock);
-	idx = pool->open_max;
-	if (pool->open_count < pool->open_max) {
-		for (i = 0; i < pool->open_max; i++)
-			if (!pool->opens[i].in_use) {
-				idx = i;
-				break;
-			}
-	}
-	if (idx == pool->open_max) {
-		spin_unlock(&pool->open_lock);
-		__free_pages(page, order);
-		return 0;	/* pool full: caller stores compressed */
-	}
-	op = &pool->opens[idx];
-	op->in_use = true;
-	op->page = page;
-	op->order = order;
-	list_add(&op->lru, &pool->open_lru);	/* MRU at head */
-	pool->open_count++;
-	spin_unlock(&pool->open_lock);
-
-	/* seed: decompress the seed blob into the buffer (else stays zero).
-	 * load_entry copies *len bytes -- the STORED length, not a capacity --
-	 * so fetch the seed's length first; passing unit_bytes here would copy
-	 * adjacent cell garbage past the compressed blob and fail to inflate. */
-	if (seed_id) {
-		unsigned int comp_len = 0;
-		unsigned int out = (unsigned int)ratio * PAGE_SIZE;
-		void *cbuf;
-		int ret;
-
-		if (!shmem_comp_entry_get(seed_id, NULL, &comp_len, NULL,
-					   NULL, NULL))
-			goto fail;	/* seed vanished */
-		cbuf = kmalloc(comp_len, GFP_KERNEL);
-		if (!cbuf) {
-			shmem_comp_entry_put(seed_id);
-			goto fail;
-		}
-		ret = shmem_comp_load_entry(seed_id, cbuf, &comp_len);
-		shmem_comp_entry_put(seed_id);
-		if (ret) {
-			kfree(cbuf);
-			goto fail;
-		}
-		if (comp_len == (unsigned int)ratio * PAGE_SIZE) {
-			/* raw seed (incompressible unit, stored raw by the
-			 * drain): the blob IS the uncompressed unit -- copy it,
-			 * do NOT decompress (inflating raw bytes yields garbage
-			 * and silently corrupts the re-staged unit). */
-			memcpy(page_address(page), cbuf, comp_len);
-		} else {
-			ret = shmem_comp_decompress(pool, cbuf, comp_len,
-						    page_address(page), &out);
-			if (ret) {
-				kfree(cbuf);
-				goto fail;
-			}
-		}
-		kfree(cbuf);
-	}
-
-	/* create the staged entry: slot handle, length 0, one table ref */
-	h = shmem_comp_pack_open(idx);
-	id = shmem_comp_entry_alloc(pool, h, 0, 1, NULL, 0, NULL);
-	if (!id)
-		goto fail;
-
-	/* set the validity bitmap: copy the seed's, else empty */
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (ent) {
-		if (seed_id) {
-			struct shmem_comp_entry *src =
-				xa_load(&shmem_comp_entries, seed_id);
-
-			if (src)
-				bitmap_copy(ent->valid, src->valid, ratio);
-			else
-				bitmap_zero(ent->valid, ratio);
-		} else {
-			bitmap_zero(ent->valid, ratio);
-		}
-	}
-	rcu_read_unlock();
-	if (!ent) {
-		/* unreachable (we hold the only reference); be safe */
-		shmem_comp_entry_put(id);
-		goto fail;
-	}
-	return id;
-
-fail:
-	shmem_comp_open_free_slot(pool, idx);
-	return 0;
-}
-
-/*
- * shmem_comp_unit_load - copy logical block @blk of a unit into @dst
- * @id: entry id (cellzram block table); the caller need not pin it
- * @blk: in-unit logical block index (0..ratio-1)
- * @dst: destination, @len bytes
- * @len: bytes to copy (<= PAGE_SIZE)
- *
- * Return: 0 on success, -ENOENT if the entry vanished, -EIO on a
- * corrupt/short decompress.
- *
- * The whole ratio>1 read, staged or closed, kept here so the staged-
- * vs-drain protocol lives next to the entry and slot it guards.  A block
- * whose validity bit is clear (discarded, or never written) reads as
- * zeros.  A staged block is memcpy'd under the slot's down_read, with the
- * handle re-checked under the lock (retry if a drain moved it); a closed
- * block is decompressed from its cell region, exactly as load_entry does.
- */
-int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
-			 unsigned int len)
-{
-	struct shmem_comp_entry *ent;
-	struct shmem_comp_pool *pool;
-	unsigned int ratio;
-	unsigned int budget = 8;
-	int ret = -EIO;
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent || !atomic_inc_not_zero(&ent->refs)) {
-		rcu_read_unlock();
-		return -ENOENT;
-	}
-	rcu_read_unlock();
-
-	pool = ent->pool;
-	ratio = pool->unit_ratio ? pool->unit_ratio : 1;
-	if (blk >= ratio) {
-		shmem_comp_entry_put(id);
-		return -EINVAL;
-	}
-
-	/* validity: a discarded / never-written block reads zeros */
-	if (!shmem_comp_entry_sector_valid(id, blk)) {
-		memset(dst, 0, len);
-		shmem_comp_entry_put(id);
-		return 0;
-	}
-
-	while (budget--) {
-		unsigned long h = READ_ONCE(ent->handle);
-
-		if (!h) {
-			ret = -EIO;
-			break;
-		}
-		if (shmem_comp_is_staged(h)) {
-			unsigned int idx = shmem_comp_open_idx(h);
-			struct shmem_comp_open *op = &pool->opens[idx];
-
-			down_read(&op->lock);
-			if (READ_ONCE(ent->handle) != h ||
-			    !op->in_use || !op->page) {
-				up_read(&op->lock);
-				continue;	/* drained; retry */
-			}
-			memcpy(dst, page_address(op->page) +
-			       (size_t)blk * PAGE_SIZE, len);
-			up_read(&op->lock);
-			shmem_comp_entry_put(id);
-			return 0;
-		} else {
-			unsigned int comp_len = ent->length;
-			unsigned int out = (unsigned int)ratio * PAGE_SIZE;
-			void *cbuf, *dbuf;
-			int r;
-
-			cbuf = kmalloc(comp_len, GFP_KERNEL);
-			if (!cbuf) {
-				ret = -ENOMEM;
-				break;
-			}
-			r = shmem_comp_load_entry(id, cbuf, &comp_len);
-			if (r) {
-				kfree(cbuf);
-				ret = r;
-				break;
-			}
-			if (comp_len == (unsigned int)ratio * PAGE_SIZE) {
-				/* raw unit (incompressible): the blob IS the
-				 * uncompressed unit; extract the block directly */
-				memcpy(dst, cbuf + (size_t)blk * PAGE_SIZE, len);
-				kfree(cbuf);
-				shmem_comp_entry_put(id);
-				return 0;
-			}
-			dbuf = kmalloc((size_t)ratio * PAGE_SIZE, GFP_KERNEL);
-			if (!dbuf) {
-				kfree(cbuf);
-				ret = -ENOMEM;
-				break;
-			}
-			r = shmem_comp_decompress(pool, cbuf, comp_len,
-						  dbuf, &out);
-			kfree(cbuf);
-			if (r || out != (unsigned int)ratio * PAGE_SIZE) {
-				kfree(dbuf);
-				ret = r ? r : -EIO;
-				break;
-			}
-			memcpy(dst, dbuf + (size_t)blk * PAGE_SIZE, len);
-			kfree(dbuf);
-			shmem_comp_entry_put(id);
-			return 0;
-		}
-	}
-	shmem_comp_entry_put(id);
-	return ret;
-}
-
-/*
- * shmem_comp_stage_write - write @len bytes into a staged unit's block
- * @id: staged entry id (cellzram block table); caller need not pin
- * @blk: in-unit logical block index (0..ratio-1)
- * @src / @len: the logical block data (<= PAGE_SIZE)
- *
- * Return: 0 on success, -ENOENT if the entry vanished, -EAGAIN if the
- * unit is no longer staged (a drain compressed it; the caller re-stages).
- *
- * Writes into the buffer under the slot's down_read -- safe alongside a
- * reader of a DIFFERENT block (disjoint bytes) and a writer of another
- * block; same-block ordering is the filesystem's job.  Marks the block
- * valid and moves the slot to the LRU head.  The down_write that would
- * exclude this is only ever taken by the drain, which first flips the
- * handle so a racing writer retries.
- */
-int shmem_comp_stage_write(unsigned int id, unsigned int blk,
-			   const void *src, unsigned int len)
-{
-	struct shmem_comp_entry *ent;
-	struct shmem_comp_pool *pool;
-	unsigned int ratio, idx, budget = 8;
-	int ret = -EAGAIN;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (!ent || !atomic_inc_not_zero(&ent->refs)) {
-		rcu_read_unlock();
-		return -ENOENT;
-	}
-	rcu_read_unlock();
-
-	pool = ent->pool;
-	ratio = pool->unit_ratio;
-	if (blk >= ratio) {
-		shmem_comp_entry_put(id);
-		return -EINVAL;
-	}
-
-	while (budget--) {
-		unsigned long h = READ_ONCE(ent->handle);
-		struct shmem_comp_open *op;
-
-		if (!h || !shmem_comp_is_staged(h)) {
-			ret = -EAGAIN;	/* not staged; caller re-stages */
-			break;
-		}
-		idx = shmem_comp_open_idx(h);
-		op = &pool->opens[idx];
-		down_read(&op->lock);
-		if (READ_ONCE(ent->handle) != h ||
-		    !op->in_use || !op->page) {
-			up_read(&op->lock);
-			continue;	/* drained; retry */
-		}
-		memcpy(page_address(op->page) + (size_t)blk * PAGE_SIZE,
-		       src, len);
-		shmem_comp_entry_sector_set(id, blk);
-		spin_lock(&pool->open_lock);
-		list_move(&op->lru, &pool->open_lru);	/* MRU head */
-		spin_unlock(&pool->open_lock);
-		up_read(&op->lock);
-		shmem_comp_entry_put(id);
-		return 0;
-	}
-	shmem_comp_entry_put(id);
-	return ret;
-}
-
-/* Number of live logical blocks in a unit (set validity bits). */
-unsigned int shmem_comp_entry_valid_count(unsigned int id)
-{
-	struct shmem_comp_entry *ent;
-	unsigned int ratio, n = 0;
-
-	rcu_read_lock();
-	ent = xa_load(&shmem_comp_entries, id);
-	if (ent) {
-		ratio = ent->pool->unit_ratio;
-		if (ratio > 1)
-			n = bitmap_weight(ent->valid, ratio);
-		else
-			n = 1;
-	}
-	rcu_read_unlock();
-	return n;
-}
-
-/* Uncompressed staging bytes currently held by a pool's open buffers. */
-unsigned long shmem_comp_pool_staged_bytes(struct shmem_comp_pool *pool)
-{
-	unsigned long n;
-
-	if (!pool || !pool->opens)
-		return 0;
-	spin_lock(&pool->open_lock);
-	n = (unsigned long)pool->open_count * pool->unit_ratio * PAGE_SIZE;
-	spin_unlock(&pool->open_lock);
-	return n;
-}
-
 void shmem_comp_cell_gc_all(void)
 {
 	struct shmem_comp_pool *pool;

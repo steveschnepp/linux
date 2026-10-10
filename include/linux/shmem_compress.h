@@ -154,27 +154,6 @@ struct shmem_comp_entry {
 	 */
 	struct shmem_comp_pool *pool;
 	struct rcu_head rcu;
-	/*
-	 * Per-unit validity bitmap: which logical sectors inside this
-	 * compression unit still hold live data.  Only meaningful when
-	 * pool->unit_ratio > 1 (the logical/physical split, cellzram).
-	 *
-	 * Lives HERE, uncompressed, and never inside the compressed blob:
-	 * a blob-internal bitmap would need a full decompress-recompress
-	 * to flip one bit on discard, rebuilding the RMW the split exists
-	 * to avoid, and it would make the validity mask depend on the
-	 * blob's own integrity.  Post-decompress, the mask is independent
-	 * authoritative state -- discard is a bit-flip with no recompress.
-	 *
-	 * A flexible array sized at alloc: BITS_TO_LONGS(ratio) words
-	 * when the split is on, ZERO words when it is off.  At ratio 1
-	 * the entry's existence is already the bitmap, so the default
-	 * allocation stays byte-identical to before this field existed.
-	 * That is non-negotiable: an entry-table shrink must not begin by
-	 * growing the entry.  Any access must therefore be ratio-guarded
-	 * -- at ratio 1 no words are allocated and valid[0] is OOB.
-	 */
-	unsigned long valid[];
 };
 
 /*
@@ -220,41 +199,6 @@ static inline void shmem_comp_unpack_loc(unsigned long handle,
 {
 	*cellid = (handle >> CELL_LOC_OFFSET_BITS) - 1;
 	*offset = handle & (CELL_LOC_OFFSET_MAX - 1);
-}
-
-/*
- * Staged (uncompressed) handle -- the FTL open-cell model.
- *
- * Bit 63 marks the handle as an OPEN-BUFFER SLOT INDEX rather than a
- * cell region; the low bits carry the index into the pool's bounded
- * opens[] array.  Bit 63 is free: shmem_comp_pack_loc() uses bits
- * 54..0 (offset 22 + cellid+1 33), leaving 63..55 spare (see the
- * encoding note above).  A staged unit and a closed unit are the SAME
- * entry -- only the handle flips -- so shmem_comp_unpack_loc() is
- * called only on cell-region handles (bit 63 clear); dispatch is one
- * shmem_comp_is_staged() test.  Bit 63 set also guarantees a staged
- * handle is never 0, so it cannot collide with the "storage failed"
- * sentinel any more than a cell region can.
- *
- * Step 1 of the open-cell buffer: the encoding and the open_max knob
- * only, dormant (no opens[] array is allocated and no path stages).
- * See mission_log/2026-10-10_ftl-open-cell-buffer.md.
- */
-#define CELL_STAGED_BIT		(1UL << 63)
-
-static inline unsigned long shmem_comp_pack_open(unsigned int idx)
-{
-	return CELL_STAGED_BIT | idx;
-}
-
-static inline bool shmem_comp_is_staged(unsigned long handle)
-{
-	return handle & CELL_STAGED_BIT;
-}
-
-static inline unsigned int shmem_comp_open_idx(unsigned long handle)
-{
-	return (unsigned int)(handle & ~CELL_STAGED_BIT);
 }
 
 /**
@@ -591,60 +535,6 @@ bool shmem_comp_pool_uses_cells(struct shmem_comp_pool *pool);
 struct cell_pool *shmem_comp_pool_cells(struct shmem_comp_pool *pool);
 unsigned long shmem_comp_pool_gc_recoveries(struct shmem_comp_pool *pool);
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
-void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
-				    unsigned int ratio);
-unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool);
-
-/*
- * Staged-write bound (open-cell buffer).  Set once at setup before io,
- * like unit_ratio.  0 = staging disabled (every pool but a cellzram
- * device configured with open_units > 0); the opens[] array itself is
- * allocated lazily on the first stage, so a pool that never stages
- * holds no extra state.  The getter lands with the code that reads it
- * (step 2).
- */
-void shmem_comp_pool_set_open_max(struct shmem_comp_pool *pool,
-				  unsigned int open_max);
-unsigned int shmem_comp_pool_open_max(struct shmem_comp_pool *pool);
-
-/*
- * Staged-write buffers (the FTL open-cell buffer; cellzram at ratio>1).
- * A unit is staged: its uncompressed bytes live in a pool open-buffer
- * slot (handle bit 63 set, low bits the slot index) until GC or a full
- * pool compresses it into a cell region.  See
- * mission_log/2026-10-10_ftl-open-cell-buffer.md.
- *
- * stage_open: create a staged entry, seeded from @seed_id's blob (or a
- * fresh zeroed unit when @seed_id is 0).  Returns the entry id, or 0 when
- * no slot is free (the caller stores the unit compressed instead).
- *
- * unit_load: copy logical block @blk of a unit (staged OR closed) into
- * @dst, honouring the validity bitmap (a discarded block reads zeros).
- * This is the whole ratio>1 read, so the staged-vs-drain protocol stays
- * inside shmem_compress where the entry and slot live.
- */
-unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
-				   unsigned int seed_id);
-int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
-			 unsigned int len);
-int shmem_comp_stage_write(unsigned int id, unsigned int blk,
-			   const void *src, unsigned int len);
-unsigned int shmem_comp_entry_valid_count(unsigned int id);
-unsigned long shmem_comp_pool_staged_bytes(struct shmem_comp_pool *pool);
-void shmem_comp_gc_now(struct shmem_comp_pool *pool);
-
-/*
- * Validity-bitmap accessors for split pools (unit_ratio > 1).  The
- * bitmap lives in the entry, outside the compressed blob, so discard
- * clears a bit without recompressing.  At unit_ratio == 1 no words are
- * allocated and these report on the entry's presence instead, keeping
- * the disabled-split path identical.
- */
-bool shmem_comp_entry_sector_valid(unsigned int id, unsigned int idx);
-bool shmem_comp_entry_any_valid(unsigned int id);
-bool shmem_comp_entry_sector_clear(unsigned int id, unsigned int idx);
-void shmem_comp_entry_sector_set(unsigned int id, unsigned int idx);
-void shmem_comp_entry_valid_copy(unsigned int dst_id, unsigned int src_id);
 
 /*
  * Pinned, relocation-safe block load for cell storage.  Retries if
@@ -853,8 +743,8 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
  * in stale_value_retries; the caller treats failure as "entry
  * vanished" and retries its slot lookup. Use this (never the bare
  * get) for anything that reached the ID through a page cache xarray
- * value; bare get() stays for table-internal users (cellzram) whose
- * entries are pinned by their own table references.
+ * value; bare get() stays for table-internal users whose entries are
+ * pinned by their own table references.
  */
 bool shmem_comp_entry_get_gen(unsigned int id, unsigned int gen,
 			      unsigned long *handle,
