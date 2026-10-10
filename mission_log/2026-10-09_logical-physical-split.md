@@ -190,19 +190,78 @@ cellzram: logical=4096 physical=4096 unit_ratio=1 (split disabled)
   than trusting the edit.  The compiler cannot know a return was meant
   to be there.
 
+## Step 2: the unit rekey (commit 081be4e7df8f)
+
+### What We Did
+
+1. **Rekeyed the block table by unit index.**
+   `cellzram_unit_of(block_nr) = block_nr / unit_ratio`.  At ratio 1
+   that is the identity -- `block_nr / 1 == block_nr` -- so this is
+   byte-identical at default, which is what makes it bisectable.
+2. **Applied it at all four boundaries** where a block number enters:
+   `bio_read`, `bio_write`, `bio_discard`, `slot_free_notify`.  The
+   read/write helpers now take and store a `unit_nr`, named as such,
+   so the rekey is honest at every level rather than a block number
+   that quietly means a unit.
+3. **Rejected ratio > 1 until step 4.**  Once the key is a unit index,
+   a write to logical block N lands in unit N/ratio and clobbers its
+   siblings, because the RMW that makes a partial write safe does not
+   exist yet.  Rejecting keeps every commit correct on its own rather
+   than correct-only-at-default.
+
+### What We Learned
+
+#### Technical
+
+- **The discard loop rewrite underflowed, and the gates would not have
+  caught it.**  My first version used a unit-range loop
+  (`unit <= unit_of(end_block - 1)`).  Correct for aligned discards,
+  but on a zero-length bio at sector 0, `end_block - 1` wraps to
+  `ULONG_MAX` and the loop sweeps the entire table.  No test in the
+  suite issues a zero-length discard, so all three gates would have
+  gone green over it.  The original `< end_block` guard was naturally
+  safe against empty; the rewrite lost that property.  Fixed by
+  mapping each block to its unit inside the original loop -- identity
+  at ratio 1, safe against empty, idempotent at ratio > 1.
+
+- **A rekey that is the identity at default still needs the ratio>1
+  path rejected.**  "It behaves the same at default" is not the same
+  as "it is correct."  The rekey made ratio>1 actively dangerous in a
+  way it had not been after step 1 (where the table was still keyed by
+  block number and ratio>1 merely advertised a size it did not use).
+  Each step changes which configurations are safe, and that has to be
+  re-derived, not assumed.
+
+#### Process
+
+- **Read the loop bound, not just the loop body.**  The bug was in the
+  termination condition, introduced by rewriting a correct loop into a
+  cleverer one.  The cleverer version was shorter and wrong.
+
+### Test Results
+
+Three gates re-run at default, all green, identical to step 1:
+
+| gate | result | step 1 |
+|------|--------|--------|
+| cellzram | 106/0 | 106/0 |
+| fsdev (blkdev ext4) | 19/0 | 19/0 |
+| churn | 2/0 | 2/0 |
+
+churn avg 124.3 MB/s vs step 1's 124.3 -- unchanged, as required for
+a rekey that is the identity at ratio 1.
+
 ### Files Changed
 
 | File | Purpose |
 |------|---------|
 | `mm/cellzram.c` | `logical_block_size` / `physical_block_size` params, power-of-2 + cell-size validation, `cellzram_unit_ratio`, queue_limits derived from params (step 1) |
+| `mm/cellzram.c` | `cellzram_unit_of()`, block table rekeyed by unit index at all four bio boundaries, read/write helpers take `unit_nr`, ratio>1 rejected until step 4 (step 2) |
 
 ### Next Steps
 
-Within this session (steps 2-5 of the design above):
+Within this session (steps 3-5 of the design above):
 
-2. **Unit abstraction** -- index the block table by `unit_nr`, derive
-   the offset within the unit.  At ratio 1 this is the identity
-   function, so it must be byte-identical.
 3. **Per-entry valid bitmap** -- `DECLARE_BITMAP`, sized
    `physical/logical`.  At ratio 1 it is one bit, always set.
 4. **Enable ratio > 1** -- the correctness core: write-RMW
