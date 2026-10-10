@@ -594,3 +594,58 @@ the `drain_victim` pin + `WRITE_ONCE` handle-flip, pointed at an open
 buffer instead of a victim cell.  This is the concurrency-critical step:
 the staged reader's `down_read` + handle-recheck already in `unit_load`
 is what makes it safe, and it is what a concurrent-io test must exercise.
+
+### Steps 3 + 4: the async drain, then drain-on-full (landed)
+
+- **Step 3** (`0a63915d8608`, rig `7f38dfb`): `shmem_comp_cell_gc` now
+  compresses staged open buffers into cell regions before draining sparse
+  cells -- the `drain_victim` pin + `WRITE_ONCE` handle-flip contract,
+  pointed at an open buffer.  Serialised by `gc_lock` (every `cell_gc`
+  caller holds it).  Incompressible units store raw; `unit_load` detects
+  `length == unit_bytes` and extracts without decompressing.
+- **Step 4** (`cf18eaaa5342`, rig `9c90e04`): drain-on-full on the write
+  path.  On pool-full, `cellzram_write_unit` calls
+  `shmem_comp_drain_staged_now()` to free a slot and retries once -- the
+  "compress when no open slots" direct-reclaim analog.  Only if every
+  slot is genuinely pinned does it return `-ENOMEM`.
+
+**A bug found and fixed in step 3.**  `shmem_comp_load_entry()` copies
+`*len` bytes -- the STORED length, not a capacity.  `stage_open`'s seeding
+was passing `unit_bytes` as `*len`, so it copied the compressed blob *plus
+adjacent cell garbage* and the inflate failed (write-after-drain returned
+EIO).  The read path was immune because `unit_load` passes `ent->length`.
+Caught by the split test's write-after-drain check, not by inspection --
+exactly the kind of latent `*len`-vs-capacity confusion the ratio-1 path
+had already learned to avoid by fetching the length from `entry_get`.
+
+**Verified.**  Ratio-1 cellzram gate **106/0** (staging/drain/drain-on-full
+are all inert at `open_units==0`).  Ratio>1 split test (ratio 16,
+open_units 8) now **24/0**: staged round-trip, overwrite, zero/punch
+clear, `gc_now` drain (compr 0 -> 12433, phys 524288 -> 262144), closed
+reads surviving the handle flip, write-after-drain re-stage, and
+drain-on-full (writing 2x open_units with no explicit gc_now).
+
+### Step 5 (measure): the feature is built; the evidence is the next
+session
+
+Steps 1-4 are the complete open-cell buffer: staged writes, GC
+drain-on-full, all green.  What remains is the measurement the design
+gated the whole feature on, and it is a distinct effort:
+
+- **The entry-table win is already visible** in the split test: 128
+  logical blocks across 8 units -> `objects=8` (one entry per 16 blocks),
+  versus 128 entries at ratio 1.  That is the 16x entry-table reduction
+  the split existed for, confirmed at ratio 16.
+- **The compression-ratio and throughput-vs-zram evidence is not**, and
+  cannot be, gathered here: it needs the **compressible-non-zero
+  workload** (series open-question #1 -- a real text/binary/log dataset),
+  run through the M-boot aggregator against zram.  Every prior "cellzram
+  wins" claim rests on zero-heavy or incompressible synthetics; this
+  feature's payoff (better cross-block ratio + smaller entry table) must
+  be proven on real data before any `open_units`/`physical` default
+  moves.  That workload + the sweep is the next session's brief, not a
+  continuation of this build.
+
+So: the code is done and green; the *decision it informs* (does staging
+pay on a realistic compressible workload, and what default) awaits the
+measurement session.
