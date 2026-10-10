@@ -27,10 +27,6 @@ a bump allocator built for this work. The cell backend trades
 size-class flexibility for O(1) allocation, zero per-object metadata,
 and a synchronous return of freed RAM to the page allocator.
 
-The same compression machinery is reused by **cellzram**, a compressed
-RAM block device offering zram's contract (runtime-configurable
-capacity, allocation on demand) on top of the cell backend.
-
 Layer stack
 ===========
 
@@ -38,26 +34,22 @@ Layer stack
 
     +------------------------------------------------------------+
     |                     applications                           |
-    +---------------------------+--------------------------------+
+    +------------------------------------------------------------+
                                 |
-        +-----------------------+-----------------------+
-        |                                               |
-        v                                               v
-   +----------+                                  +--------------+
-   |  tmpfs   |                                  | block device |
-   |compress= |                                  |  (cellzram)  |
-   |merge_pages                                    +--------------+
-   +----------+                                         |
-        |                                               |
-        v                                               |
+                                v
+   +----------+
+   |  tmpfs   |
+   |compress= |
+   |merge_pages
+   +----------+
+        |
+        v
    +----------------------------------------------------+
    |        policy: hot/chill watermarks, aging,         |
    |                 merge groups                        |
    +----------------------------------------------------+
-        |                                               |
-        +-----------------------+-----------------------+
-                                |
-                                v
+        |
+        v
    +----------------------------------------------------+
    |            compression core (shmem_compress)        |
    |      per-CPU acomp contexts, entry table (xarray)   |
@@ -74,8 +66,7 @@ Layer stack
 The compression core does not know which backend is active. Both
 implement the same three-verb contract -- ``store`` returns an opaque
 handle, ``load`` copies data out, ``free`` releases storage -- and
-callers dispatch on a single ``use_cells`` flag. This is what allows
-cellzram to reuse every hot path unchanged.
+callers dispatch on a single ``use_cells`` flag.
 
 The cell allocator
 ==================
@@ -141,8 +132,8 @@ reclaimed by evacuating the entire cell rather than by reusing gaps::
 
 Three triggers: the **shrinker** under memory pressure, the ``gc_now``
 sysfs hook for manual maintenance, and the **store path** when a
-cell-backed pool runs out of directory slots. The last is how cellzram
-avoids write failures it previously hit.
+cell-backed pool runs out of directory slots. The last keeps a full
+directory from failing writes.
 
 Compaction takes the per-cell rwsem exclusively; readers hold it shared
 and additionally pin the entry, so a victim cannot be freed while a
@@ -152,11 +143,10 @@ The entry table
 ===============
 
 Every stored block is referenced by an ID rather than a raw pointer.
-The ID is what appears in a page-cache xarray slot or in a block
-device's table::
+The ID is what appears in a page-cache xarray slot::
 
     page cache slot -----> entry ID -----> shmem_comp_entry
-    or block slot          (+ generation)      |
+                           (+ generation)      |
                                                +-- handle --> backend
                                                |              storage
                                                +-- length
@@ -196,59 +186,23 @@ means eager. Pages whose data does not shrink are simply kept
 uncompressed -- the entry length field is the raw/compressed
 discriminator, so no separate metadata is needed to track it.
 
-cellzram
-========
-
-cellzram applies zram's contract -- capacity set at runtime via
-``disksize``, physical allocation on demand -- on top of the cell
-backend::
-
-    bio -----> block table (xarray) ----+----> cell region
-               block_nr -> entry ID     |      (+ entry)
-                                        |
-                                        +----> zero-block sentinel
-                                               (no cell, no entry)
-
-    discard / punch-hole -----> synchronous free -----> buddy allocator
-
-Two design points are not obvious:
-
-* **Zero blocks are free.** An all-zero write stores a sentinel in the
-  table instead of compressing. Filesystem metadata is zero-heavy, so
-  this turns ext4's own zero writes into essentially free storage.
-
-* **Discard frees synchronously.** When the last reference to a cell
-  region drops, the pages return to the buddy inline. An ext4 delete
-  returns RAM before the syscall returns -- a property zram's
-  architecture cannot offer.
-
-``mm_stat`` is derived by walking the block table on read rather than
-from incremental counters. An earlier counter-based implementation
-drifted on the zero-block path: a repeated zero write double-counted
-``orig_bytes``. The walk is exact by construction.
-
 Measurement
 ===========
 
-A QEMU guest boots a static initrd and runs self-verifying tests. Five
-are pass/fail gates; the remainder are unit or exploratory tests::
+A QEMU guest boots a static initrd and runs self-verifying test
+binaries: pool and entry-table unit tests, mount-semantics gates, cell
+allocator and GC tests, and torture/scale runs::
 
     host scripts --cmdline knobs--> QEMU guest
                                         |
                                         v
                                     /init -> init.sh
                                         |
-        +-----------+-----------+-----------+-----------+
-        |           |           |           |           |
-     cellzram    randio     fsdev/untar  torture     churn
-        |           |           |           |           |
-        +-----------+-----------+-----------+-----------+
+                                        v
+                            self-verifying test binaries
                                         |
                                         v
-                              BENCH lines + raw mm_stat
-                                        |
-                                        v
-                                 host aggregator
+                            per-test pass/fail summaries
 
 Two methodology rules were learned the hard way and are now enforced:
 
@@ -257,62 +211,27 @@ Two methodology rules were learned the hard way and are now enforced:
   in-boot samples and reports high/low/avg/median, then runs M full
   boots and reports median plus IQR across them.
 
-* **Use the control that runs in every boot.** zram runs alongside
-  cellzram in the same boot, so the ratio between them cancels that
-  boot's drift. zram also serves as a canary: a boot whose zram row
-  moved is an off boot and is rejected.
-
-Measured results
-================
-
-Current state of the ``cell_order`` axis (allocation size, 2..10,
-default 6 meaning 256 KiB).
-
-**untar workload** (compressible, append-heavy) -- smaller cells win:
-
-========  ========  ===========  ============  ==========
-order     cell      RAM held     verify MB/s   rm MB/s
-========  ========  ===========  ============  ==========
-2         16 KiB    **16 KiB**   79.5          60.8
-6         256 KiB   256 KiB      76.1          55.5
-zram      --        *80 KiB*     *75.5*        *64.4*
-========  ========  ===========  ============  ==========
-
-**churn workload** (random overwrite) -- a real tradeoff:
-
-========  ===========  ==============  ============
-order     avg MB/s     GC recoveries   RAM held
-========  ===========  ==============  ============
-2         **133.6**    **0**           16.6 MiB
-6         125.3        58              **10.25 MiB**
-zram      *136.3*      --              *8.0 MiB*
-========  ===========  ==============  ============
-
-At order 2 a cell holds only four blocks, so it empties naturally under
-random overwrite and returns inline. The compaction pass never fires,
-and cellzram comes within 2% of zram on throughput. But with no GC
-there is no compaction either, so fragmentation accumulates and more RAM
-is held. Order 6 pays roughly 9% throughput for GC but keeps RAM closer
-to the live set. Neither order dominates.
+* **Use a control that runs in every boot.** A benchmark compares
+  against a reference running in the same boot, so the ratio between
+  them cancels that boot's drift. The reference also serves as a
+  canary: a boot whose reference row moved is an off boot and is
+  rejected.
 
 Status
 ======
 
-A logical/physical block split was under development -- compressing 16
-consecutive 4 KiB blocks as one unit, the same storage layout that
-tmpfs ``merge_pages`` already produces. It is parked. The landed steps
-are dormant, byte-identical scaffolding (parameters, unit rekey,
-validity bitmap, accessors); the read-modify-write core was not built.
-The reason: the split's only measured payoff was a 936-byte entry table
-on the untar workload, against roughly 200 lines of correctness-critical
-read-modify-write. The real untar gap was cell granularity, which
-``cell_order`` fixes directly.
+An FTL-style logical/physical block split and its follow-up, an
+open-cell write-gathering buffer, were built on this machinery for a
+compressed RAM block device (cellzram) and then removed. The device
+lost to zram on random-overwrite throughput for a negligible RAM win,
+so the pivot is to the tmpfs path alone. The design, builds and
+verdict live in the project's session logs and in git history; the tree
+carries only what this document describes.
 
 **The largest open question.** No workload in the test rig measures
 compression ratio on genuinely compressible, non-zero data. The
 ``distinct`` workload is incompressible; untar is approximately 2048
-zero blocks out of 2061. Every claim about where cellzram wins rests on
-zero-heavy or incompressible synthetic data. Until a real dataset --
-text, binaries, logs -- is measured against zram, the compression-ratio
-question is open, and the parked split should be decided on that
-evidence rather than by momentum.
+zero blocks out of 2061. Any compression-ratio claim that rests on
+zero-heavy or incompressible synthetic data does not generalize. Until
+a real dataset -- text, binaries, logs -- is measured against
+uncompressed tmpfs, the compression-ratio question is open.

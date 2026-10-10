@@ -55,9 +55,8 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	 * Zero means "caller has no capacity bound" (tmpfs: the page cache
 	 * is compressible and bounded by size= accounting, so the legacy
 	 * default suffices).  @nr_cells is already unsigned int, so no
-	 * clamp is needed here: the caller owns any wider arithmetic
-	 * (cellzram sizes from a u64 disksize and truncates before the
-	 * call).
+	 * clamp is needed here: the caller owns any wider arithmetic and
+	 * truncates before the call.
 	 */
 	if (!nr_cells)
 		nr_cells = CELL_DEFAULT_MAX_CELLS;
