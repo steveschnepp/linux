@@ -1604,11 +1604,108 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 	return moved;
 }
 
+/*
+ * shmem_comp_drain_staged - compress staged open buffers into cell regions
+ * @pool: cell-backed pool with staging enabled
+ *
+ * The async half of the open-cell buffer: a staged unit holds its
+ * uncompressed bytes in an open-buffer slot; this compresses it into a
+ * cell region and flips the entry handle from staged (bit 63 set) to a
+ * cell location.  A reader that raced the flip sees the changed handle
+ * under the slot's down_read and retries into the closed path -- the same
+ * contract shmem_comp_load_entry() relies on for cells.  Runs from the
+ * cell GC (shrinker, gc_now, store-exhaustion), all of which hold
+ * gc_lock, so two drains cannot overlap.  An incompressible unit is stored
+ * raw at unit_bytes; unit_load() detects that (length == unit_bytes) and
+ * extracts the block without decompressing.
+ */
+static void shmem_comp_drain_staged(struct shmem_comp_pool *pool)
+{
+	unsigned long id;
+	struct shmem_comp_entry *ent;
+
+	if (!pool->opens)
+		return;
+
+	xa_for_each(&shmem_comp_entries, id, ent) {
+		unsigned long h, new_handle;
+		unsigned int ratio, comp_len, idx, unit_bytes;
+		struct shmem_comp_open *op;
+		void *dbuf, *cbuf;
+		int ret;
+
+		if (ent->pool != pool)
+			continue;
+		h = READ_ONCE(ent->handle);
+		if (!h || !shmem_comp_is_staged(h))
+			continue;
+		if (!atomic_inc_not_zero(&ent->refs))
+			continue;	/* dying; its own free path handles it */
+		if (READ_ONCE(ent->handle) != h) {
+			shmem_comp_entry_put(id);
+			continue;	/* changed under the pin */
+		}
+
+		ratio = pool->unit_ratio;
+		unit_bytes = (unsigned int)ratio * PAGE_SIZE;
+		idx = shmem_comp_open_idx(h);
+		op = &pool->opens[idx];
+
+		down_write(&op->lock);
+		if (READ_ONCE(ent->handle) != h || !op->in_use || !op->page) {
+			up_write(&op->lock);
+			shmem_comp_entry_put(id);
+			continue;	/* already drained / reused */
+		}
+		dbuf = page_address(op->page);
+		cbuf = kmalloc(unit_bytes, GFP_KERNEL);
+		if (!cbuf) {
+			up_write(&op->lock);
+			shmem_comp_entry_put(id);
+			continue;	/* stay staged; try a later pass */
+		}
+		comp_len = unit_bytes;
+		ret = shmem_comp_compress(pool, dbuf, unit_bytes, cbuf,
+					  &comp_len);
+		if (ret)
+			comp_len = unit_bytes;	/* incompressible: store raw */
+		new_handle = shmem_comp_store(pool, ret ? dbuf : cbuf,
+					      comp_len);
+		kfree(cbuf);
+		if (!new_handle) {
+			up_write(&op->lock);
+			shmem_comp_entry_put(id);
+			continue;	/* no cell space; stay staged */
+		}
+		/* flip under the same down_write the readers exclude on */
+		WRITE_ONCE(ent->length, comp_len);
+		WRITE_ONCE(ent->handle, new_handle);
+		if (op->page) {
+			__free_pages(op->page, op->order);
+			op->page = NULL;
+		}
+		up_write(&op->lock);
+
+		spin_lock(&pool->open_lock);
+		if (op->in_use) {
+			op->in_use = false;
+			list_del(&op->lru);
+			pool->open_count--;
+		}
+		spin_unlock(&pool->open_lock);
+		shmem_comp_entry_put(id);
+	}
+}
+
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool)
 {
 	struct cell_pool *cp = pool->cells;
 	unsigned int drained = 0, moved_total = 0;
 	unsigned int i;
+
+	/* Compress staged open buffers into cell regions first (the async
+	 * close of the open-cell buffer), then drain sparse cells. */
+	shmem_comp_drain_staged(pool);
 
 	/*
 	 * Drain victims ONE AT A TIME, each all the way to empty.
@@ -1906,17 +2003,26 @@ unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
 	pool->open_count++;
 	spin_unlock(&pool->open_lock);
 
-	/* seed: decompress the seed blob into the buffer (else stays zero) */
+	/* seed: decompress the seed blob into the buffer (else stays zero).
+	 * load_entry copies *len bytes -- the STORED length, not a capacity --
+	 * so fetch the seed's length first; passing unit_bytes here would copy
+	 * adjacent cell garbage past the compressed blob and fail to inflate. */
 	if (seed_id) {
-		unsigned int comp_len = (unsigned int)ratio * PAGE_SIZE;
+		unsigned int comp_len = 0;
 		unsigned int out = (unsigned int)ratio * PAGE_SIZE;
 		void *cbuf;
 		int ret;
 
+		if (!shmem_comp_entry_get(seed_id, NULL, &comp_len, NULL,
+					   NULL, NULL))
+			goto fail;	/* seed vanished */
 		cbuf = kmalloc(comp_len, GFP_KERNEL);
-		if (!cbuf)
+		if (!cbuf) {
+			shmem_comp_entry_put(seed_id);
 			goto fail;
+		}
 		ret = shmem_comp_load_entry(seed_id, cbuf, &comp_len);
+		shmem_comp_entry_put(seed_id);
 		if (ret) {
 			kfree(cbuf);
 			goto fail;
@@ -1988,7 +2094,6 @@ int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
 	unsigned int ratio;
 	unsigned int budget = 8;
 	int ret = -EIO;
-
 	rcu_read_lock();
 	ent = xa_load(&shmem_comp_entries, id);
 	if (!ent || !atomic_inc_not_zero(&ent->refs)) {
@@ -2050,6 +2155,14 @@ int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
 				ret = r;
 				break;
 			}
+			if (comp_len == (unsigned int)ratio * PAGE_SIZE) {
+				/* raw unit (incompressible): the blob IS the
+				 * uncompressed unit; extract the block directly */
+				memcpy(dst, cbuf + (size_t)blk * PAGE_SIZE, len);
+				kfree(cbuf);
+				shmem_comp_entry_put(id);
+				return 0;
+			}
 			dbuf = kmalloc((size_t)ratio * PAGE_SIZE, GFP_KERNEL);
 			if (!dbuf) {
 				kfree(cbuf);
@@ -2072,6 +2185,107 @@ int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
 	}
 	shmem_comp_entry_put(id);
 	return ret;
+}
+
+/*
+ * shmem_comp_stage_write - write @len bytes into a staged unit's block
+ * @id: staged entry id (cellzram block table); caller need not pin
+ * @blk: in-unit logical block index (0..ratio-1)
+ * @src / @len: the logical block data (<= PAGE_SIZE)
+ *
+ * Return: 0 on success, -ENOENT if the entry vanished, -EAGAIN if the
+ * unit is no longer staged (a drain compressed it; the caller re-stages).
+ *
+ * Writes into the buffer under the slot's down_read -- safe alongside a
+ * reader of a DIFFERENT block (disjoint bytes) and a writer of another
+ * block; same-block ordering is the filesystem's job.  Marks the block
+ * valid and moves the slot to the LRU head.  The down_write that would
+ * exclude this is only ever taken by the drain, which first flips the
+ * handle so a racing writer retries.
+ */
+int shmem_comp_stage_write(unsigned int id, unsigned int blk,
+			   const void *src, unsigned int len)
+{
+	struct shmem_comp_entry *ent;
+	struct shmem_comp_pool *pool;
+	unsigned int ratio, idx, budget = 8;
+	int ret = -EAGAIN;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (!ent || !atomic_inc_not_zero(&ent->refs)) {
+		rcu_read_unlock();
+		return -ENOENT;
+	}
+	rcu_read_unlock();
+
+	pool = ent->pool;
+	ratio = pool->unit_ratio;
+	if (blk >= ratio) {
+		shmem_comp_entry_put(id);
+		return -EINVAL;
+	}
+
+	while (budget--) {
+		unsigned long h = READ_ONCE(ent->handle);
+		struct shmem_comp_open *op;
+
+		if (!h || !shmem_comp_is_staged(h)) {
+			ret = -EAGAIN;	/* not staged; caller re-stages */
+			break;
+		}
+		idx = shmem_comp_open_idx(h);
+		op = &pool->opens[idx];
+		down_read(&op->lock);
+		if (READ_ONCE(ent->handle) != h ||
+		    !op->in_use || !op->page) {
+			up_read(&op->lock);
+			continue;	/* drained; retry */
+		}
+		memcpy(page_address(op->page) + (size_t)blk * PAGE_SIZE,
+		       src, len);
+		shmem_comp_entry_sector_set(id, blk);
+		spin_lock(&pool->open_lock);
+		list_move(&op->lru, &pool->open_lru);	/* MRU head */
+		spin_unlock(&pool->open_lock);
+		up_read(&op->lock);
+		shmem_comp_entry_put(id);
+		return 0;
+	}
+	shmem_comp_entry_put(id);
+	return ret;
+}
+
+/* Number of live logical blocks in a unit (set validity bits). */
+unsigned int shmem_comp_entry_valid_count(unsigned int id)
+{
+	struct shmem_comp_entry *ent;
+	unsigned int ratio, n = 0;
+
+	rcu_read_lock();
+	ent = xa_load(&shmem_comp_entries, id);
+	if (ent) {
+		ratio = ent->pool->unit_ratio;
+		if (ratio > 1)
+			n = bitmap_weight(ent->valid, ratio);
+		else
+			n = 1;
+	}
+	rcu_read_unlock();
+	return n;
+}
+
+/* Uncompressed staging bytes currently held by a pool's open buffers. */
+unsigned long shmem_comp_pool_staged_bytes(struct shmem_comp_pool *pool)
+{
+	unsigned long n;
+
+	if (!pool || !pool->opens)
+		return 0;
+	spin_lock(&pool->open_lock);
+	n = (unsigned long)pool->open_count * pool->unit_ratio * PAGE_SIZE;
+	spin_unlock(&pool->open_lock);
+	return n;
 }
 
 void shmem_comp_cell_gc_all(void)
