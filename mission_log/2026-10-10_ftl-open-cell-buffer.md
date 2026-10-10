@@ -441,3 +441,107 @@ Open questions to resolve during the build:
   once the buffer proves out -- but the cell_order sweep and this knob
   interact (buffer RAM = `open_count * physical`) and must be swept
   together.
+
+---
+
+## The design, refined in-session (appended; supersedes the draft above)
+
+Appended the same day, after the first draft was committed
+(`c335418a6dd4`).  The user kept refining the design and each pass
+simplified it.  **The draft above is left exactly as written** -- it is
+the record of where the design went, and its two superseded ideas (a
+separate `open` xarray, then pointer entries in the table; and sync
+close on the evicting write) are the useful part.  Per the mission-log
+rule that a log is append-only and the journey matters more than the
+destination, nothing above was rewritten.  This section is what gets
+built.
+
+### Refinement A: the staged address is a handle bit, not a table pointer
+
+The committed draft put `xa_mk_pointer(cz_open_unit)` in the block table
+for a staged unit, which mixes pointer and value entries in one xarray
+and moves the dispatch into the table.  Cleaner: keep the table
+value-only (entry ids, as always) and spend an **unused high bit of the
+entry handle**.  `entry->handle` for a cell pool packs `{cellid,
+offset}` via `shmem_comp_pack_loc` and leaves **bits 63..55 free** (the
+header says so).  One bit becomes the staged flag:
+
+- **bit 63 clear** -- a cell region `{cellid, offset}`: closed,
+  compressed.  Today's meaning.
+- **bit 63 set** -- an **open-buffer slot index** (the low bits):
+  staged, uncompressed.
+
+The **entry exists for a unit whether staged or closed** -- it is the
+unit's metadata home throughout (length, `nr_pages`, the parked step-4a
+`valid[]` bitmap).  Only the `handle` flips between the two states.
+`shmem_comp_unpack_loc()` runs only on cell-region handles; dispatch is
+one `is_staged()` test.  The block table, the value-only single lookup,
+and the no-invisible-window invariant all stand unchanged from above --
+only the *encoding* of "staged" moved from a table pointer to a handle
+bit.  The **open buffers are pool-owned** (shmem_compress side, a
+bounded `opens[]` array, lazily allocated like the cell directory),
+because the GC pass lives there and already scans the global entry
+table.
+
+### Refinement B: close is the async GC; the write compresses only when it must
+
+The committed draft closed a unit synchronously on the evicting write.
+The user's model -- exactly tmpfs's -- is **write uncompressed, compress
+on the async GC**:
+
+- **Normal write: stage only, no compression.**  The write copies into
+  the staged buffer and returns.  It never compresses.
+- **The write path compresses ONLY when there is no free open slot.**
+  When `open_count == open_max` and a write needs a new slot, *that*
+  write drains one staged buffer (compresses it) to free a slot -- the
+  direct-reclaim analog.  Normally it does not compress at all; sized
+  right, with the background GC keeping the count low, this is the only
+  compress the write path ever pays.
+- **GC compresses (async).**  On its normal triggers (shrinker,
+  `gc_now`, store-exhaustion), the cell GC gains a **staged drain**:
+  scan the global entry table for staged handles, pin
+  (`atomic_inc_not_zero`), `compress(open buffer)` -> `shmem_comp_store`
+  (one cell region) -> `WRITE_ONCE(ent->handle, pack_loc(...))` (bit 63
+  now clear), free the slot.  This is `shmem_comp_drain_victim`'s exact
+  pin-and-WRITE_ONCE pattern pointed at an open buffer instead of a
+  victim cell -- the mechanism already exists, at
+  `shmem_compress.c:1505`.
+
+This supersedes "sync close for now."  It removes the write-latency
+spike in the common case and makes the compression trigger the memory
+policy that already exists.  The three hazards recorded above (write-vs-
+close, reset-vs-close, close-failure) carry over unchanged; they are
+now attached to the GC staged-drain instead of an inline close.
+
+### Refinement C: there is no read cache
+
+cellzram is **not a second page cache**.  A read is either hot (just
+written, still in a staged buffer -- a memcpy anyway) or cold (closed
+and compressed, unlikely to be re-read soon).  tmpfs decompresses into
+the page cache and *keeps* the folios because a mapped page will be
+re-read; cellzram's blocks are already cached by the filesystem's page
+cache above it (ext4), so caching them again here is redundant.
+
+So a read of a closed unit decompresses into the bio's destination page
+and **retains nothing**.  The only uncompressed residency cellzram ever
+holds is *written* data in a staged buffer, never data that was merely
+read.  A bio spanning several blocks of one unit decompresses it once
+into a scratch buffer and slices the blocks out -- per-bio efficiency,
+retained across nothing.
+
+### Ladder adjustment
+
+Steps 1-2 carry the handle-bit encoding and the pool `opens[]` array
+instead of `cz_open_unit` + a table pointer; step 3's close becomes the
+GC staged-drain; step 4's "eviction" becomes the no-open-slot write
+drain plus the shrinker force-drain.  The bisectable shape is otherwise
+unchanged: every step green at default (ratio 1), dormant until step 3
+flips ratio>1 on.
+
+### Process note
+
+- **A mission log is append-only.**  Superseded designs stay in place;
+  the refinement is appended and says what it supersedes.  Rewriting
+  the file to "clean up" the design would delete the exact dead ends a
+  future reader needs.  This near-miss is the rule restated: correct the
+  record forward, never in place.
