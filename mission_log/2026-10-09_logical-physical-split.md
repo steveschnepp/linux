@@ -513,3 +513,94 @@ the directory before storing a byte.
    compressible workload shows the entry table or the compression-ratio
    gain from 64K context matters, step 4 becomes worth building.  If
    not, revert steps 1-4a and record why.
+
+## The architecture doc (commits c0bab0fd9f21, 1d6ea2e1b5d0)
+
+At the user's request, wrote a high-level explanation of what has been
+built, with diagrams.
+
+### What We Did
+
+1. **Identified the gap first.**  Two documents already existed and
+   neither filled it: `TMPFS_COMPRESSION_PLAN.md` (3371 lines) is
+   day-one forward-looking design rationale, and `mission_log/` is the
+   session-by-session journey.  Neither describes the shape of what is
+   in the tree *now*.  The doc targets that space: what exists, how the
+   pieces fit, what has been measured.
+
+2. **Wrote it as Markdown at the repo root** (`c0bab0fd9f21`), with
+   seven mermaid diagrams -- one per subsystem: layer stack, cell
+   allocator, compaction, entry table, watermarks, cellzram, the rig.
+
+3. **The user corrected the placement and format**: if it is a kernel
+   doc, it belongs in `Documentation/` as reStructuredText.  Checked
+   the tree's convention before converting -- confirmed no mermaid
+   support in the kernel's Sphinx (`Documentation/sphinx/`,
+   `conf.py`), and that `erofs.rst` / `f2fs.rst` / `nilfs2.rst` draw
+   layouts as ASCII art in `::` literal blocks.
+
+4. **Converted and relocated** (`1d6ea2e1b5d0`):
+   `Documentation/filesystems/tmpfs-compression.rst`, registered in
+   the filesystems toctree after `tmpfs`.  All seven mermaid diagrams
+   redrawn as ASCII art; the markdown file was **deleted, not kept in
+   parallel** -- two copies of the same explanation drift and only one
+   of them builds.
+
+### What We Learned
+
+#### Technical
+
+- **Kernel docs are `Documentation/` + rst, built by Sphinx.**  A
+  Markdown file in the repo root is not a kernel doc regardless of its
+  content.  Worth checking `Documentation/*/index.rst` for the toctree
+  a new file must be registered in -- an unregistered file builds
+  nowhere.
+
+- **The kernel's Sphinx has no mermaid extension.**  Every mermaid
+  diagram had to be redrawn.  The house convention is ASCII art in a
+  `::` literal block, which is what the filesystem docs already use for
+  on-disk layouts.  The layer-stack diagram needed the largest rewrite:
+  mermaid's `subgraph` has no rst equivalent, so it became one nested
+  box diagram.
+
+- **rst simple tables are whitespace-sensitive.**  The markdown pipe
+  tables became `===`-delimited simple tables with padded columns, and
+  the column boundary must be respected by every row or the table
+  fails to parse.  All three verified by hand against their separator
+  lines.
+
+- **The one thing that could not be verified is the Sphinx build
+  itself.**  Neither `docutils` nor `sphinx` is installed and the
+  no-install rule forbids adding them.  Checked everything checkable
+  mechanically instead -- ASCII-clean, heading underlines at least as
+  long as their titles, all three tables column-aligned, literal blocks
+  indented, toctree entry present and alphabetically placed -- but
+  "`make htmldocs` builds clean" remains unconfirmed.  Simple-table
+  alignment is exactly the class of error only a real parser catches;
+  this should be built before it ships.
+
+#### Process
+
+- **A format correction is worth acting on immediately, not debating.**
+  The user's point was one sentence -- kernel doc means rst in
+  `Documentation/` -- and the conversion took one pass.  Had I argued
+  for Markdown's convenience I would have been defending a file that
+  does not build.
+
+- **Check the convention before writing, not after.**  Confirmed the
+  diagram style and the toctree requirement from existing docs before
+  converting, which is what made the conversion mechanical rather than
+  a second guess at the house style.
+
+### Files Changed (this section)
+
+| File | Purpose |
+|------|---------|
+| `Documentation/filesystems/tmpfs-compression.rst` | **new** -- the architecture tour: layer stack, the six cell invariants, compaction, the entry table, watermarks, cellzram, the rig and its methodology rules, measured cell_order results, and an honest status section |
+| `Documentation/filesystems/index.rst` | registered `tmpfs-compression` in the filesystems toctree |
+| `TMPFS_COMPRESSION_ARCHITECTURE.md` | **deleted** -- superseded by the rst; two copies would drift |
+
+### Test Results
+
+None -- documentation only.  No kernel code changed, so the gates were
+not re-run.
