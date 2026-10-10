@@ -646,10 +646,16 @@ static ssize_t disksize_store(struct device *dev,
 	 * device must be able to store its whole disksize even when not
 	 * one byte compresses (incompressible blocks are stored raw at
 	 * PAGE_SIZE each, one cell region apiece).  Headroom covers the
-	 * COW-before-free churn described at cell_headroom_pct.  The
-	 * hint is clamped to U16_MAX inside cell_pool_create, which
-	 * caps incompressible storage at U16_MAX x cell_size beyond
-	 * that -- warned there, at the only place the cap is known.
+	 * COW-before-free churn described at cell_headroom_pct.
+	 *
+	 * There is NO clamp on max_cells inside cell_pool_create -- it
+	 * takes the hint as given, and the directory array is
+	 * kvcalloc(nslots, sizeof(struct cell)).  So the real ceiling on
+	 * incompressible capacity is the array allocation itself, and it
+	 * scales with 1/cell_size: order 2 (16 KiB cells) needs 64x more
+	 * slots than order 6 for the same disksize.  A large device at a
+	 * small cell_order can exhaust memory on the directory alone
+	 * before storing a byte.  Size cell_order with the device.
 	 */
 	cell_bytes = (u64)PAGE_SIZE << cell_order;
 	nr_cells = DIV_ROUND_UP(size_bytes, cell_bytes);
