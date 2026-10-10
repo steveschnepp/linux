@@ -77,8 +77,8 @@ struct cellzram {
 	 */
 	struct shmem_comp_pool	*pool;
 	/*
-	 * block_nr -> entry id. Sparse by nature: unwritten blocks
-	 * have no slot and read as zeros. Values only (entry ids via
+	 * block table: unit index -> entry id. Sparse by nature: unwritten
+	 * blocks have no slot and read as zeros. Values only (entry ids via
 	 * xa_mk_value), so no pointer/value mixing.
 	 */
 	struct xarray		table;
@@ -197,9 +197,20 @@ MODULE_PARM_DESC(physical_block_size,
 /* logical sectors per compression unit; 1 when the split is disabled */
 static unsigned int cellzram_unit_ratio;
 
-static __maybe_unused unsigned int cellzram_unit_sectors(void)
+static unsigned int cellzram_unit_sectors(void)
 {
 	return cellzram_unit_ratio ? cellzram_unit_ratio : 1;
+}
+
+/*
+ * Logical block number -> compression unit index, the block table's
+ * key.  At ratio 1 this is the identity, which is what makes step 2 a
+ * no-op at default.  The in-unit logical offset is derived the same
+ * way and is consumed by the RMW paths (steps 4+), not here.
+ */
+static unsigned long cellzram_unit_of(unsigned long block_nr)
+{
+	return block_nr / cellzram_unit_sectors();
 }
 
 static int cellzram_major;
@@ -224,7 +235,7 @@ static void cellzram_put_slot(void *old)
  * Read one logical block. @dst has room for @len_bytes bytes (<= PAGE_SIZE).
  * Unwritten blocks read as zeros (brd semantics).
  */
-static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
+static int cellzram_read_block(struct cellzram *dev, unsigned long unit_nr,
 			       void *dst, unsigned int len_bytes)
 {
 	unsigned int id, dlen_bytes;
@@ -233,7 +244,7 @@ static int cellzram_read_block(struct cellzram *dev, unsigned long block_nr,
 
 	rcu_read_lock();
 	for (;;) {
-		void *entry = xa_load(&dev->table, block_nr);
+		void *entry = xa_load(&dev->table, unit_nr);
 
 		if (!entry) {
 			rcu_read_unlock();
@@ -331,7 +342,7 @@ static bool cellzram_page_all_zero(const void *src)
  * old entry is put after the exchange, so a reader pinned on it keeps
  * its data alive until it is done.
  */
-static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
+static int cellzram_write_block(struct cellzram *dev, unsigned long unit_nr,
 				const void *src)
 {
 	/*
@@ -351,7 +362,7 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 	 * repeated zero write.
 	 */
 	if (cellzram_page_all_zero(src)) {
-		void *old = xa_store(&dev->table, block_nr, xa_mk_value(0),
+		void *old = xa_store(&dev->table, unit_nr, xa_mk_value(0),
 				     GFP_NOIO);
 
 		if (IS_ERR(old))
@@ -413,7 +424,7 @@ static int cellzram_write_block(struct cellzram *dev, unsigned long block_nr,
 	 * releases the cell region) rather than leaking it, and never
 	 * feed an XA_ERROR pointer to xa_to_value().
 	 */
-	old = xa_store(&dev->table, block_nr, xa_mk_value(id), GFP_NOIO);
+	old = xa_store(&dev->table, unit_nr, xa_mk_value(id), GFP_NOIO);
 	if (IS_ERR(old)) {
 		shmem_comp_entry_put(id);
 		return PTR_ERR(old);
@@ -431,11 +442,12 @@ static void cellzram_bio_read(struct cellzram *dev, struct bio *bio)
 
 	bio_for_each_segment(bv, bio, iter) {
 		void *mem = kmap_local_page(bv.bv_page) + bv.bv_offset;
-		unsigned long block_nr = sector >> SECTOR_SHIFT_BITS;
+		unsigned long unit_nr =
+			cellzram_unit_of(sector >> SECTOR_SHIFT_BITS);
 		int ret;
 
 		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
-			ret = cellzram_read_block(dev, block_nr, mem, bv.bv_len);
+			ret = cellzram_read_block(dev, unit_nr, mem, bv.bv_len);
 		else {
 			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
 
@@ -444,7 +456,7 @@ static void cellzram_bio_read(struct cellzram *dev, struct bio *bio)
 				kunmap_local(mem);
 				return;
 			}
-			ret = cellzram_read_block(dev, block_nr, tmp, PAGE_SIZE);
+			ret = cellzram_read_block(dev, unit_nr, tmp, PAGE_SIZE);
 			if (!ret)
 				memcpy(mem, tmp, bv.bv_len);
 			kfree(tmp);
@@ -467,11 +479,12 @@ static void cellzram_bio_write(struct cellzram *dev, struct bio *bio)
 
 	bio_for_each_segment(bv, bio, iter) {
 		void *mem = kmap_local_page(bv.bv_page) + bv.bv_offset;
-		unsigned long block_nr = sector >> SECTOR_SHIFT_BITS;
+		unsigned long unit_nr =
+			cellzram_unit_of(sector >> SECTOR_SHIFT_BITS);
 		int ret;
 
 		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
-			ret = cellzram_write_block(dev, block_nr, mem);
+			ret = cellzram_write_block(dev, unit_nr, mem);
 		else {
 			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
 
@@ -484,7 +497,7 @@ static void cellzram_bio_write(struct cellzram *dev, struct bio *bio)
 			if (bv.bv_len < PAGE_SIZE)
 				memset(tmp + bv.bv_len, 0,
 				       PAGE_SIZE - bv.bv_len);
-			ret = cellzram_write_block(dev, block_nr, tmp);
+			ret = cellzram_write_block(dev, unit_nr, tmp);
 			kfree(tmp);
 		}
 		kunmap_local(mem);
@@ -513,8 +526,20 @@ static void cellzram_bio_discard(struct cellzram *dev, struct bio *bio)
 						SECTOR_SHIFT_BITS;
 	unsigned long block_nr;
 
+	/*
+	 * Discard is whole-unit aligned (discard_granularity == physical),
+	 * so erasing by unit index is correct.  Iterating blocks and
+	 * mapping each to its unit keeps the original `< end_block` guard,
+	 * which is safe against a zero-length bio (`end_block - 1` would
+	 * underflow and sweep the whole table); at ratio 1 unit_nr ==
+	 * block_nr, so this is byte-identical to the old loop.  Repeated
+	 * units erase once and then find nothing -- idempotent.  The
+	 * partial-unit case (punch-hole -> WRITE_ZEROES) is step 4's: it
+	 * clears one bitmap bit instead of dropping the unit.
+	 */
 	for (block_nr = start_block; block_nr < end_block; block_nr++) {
-		void *old = xa_erase(&dev->table, block_nr);
+		void *old = xa_erase(&dev->table,
+				     cellzram_unit_of(block_nr));
 
 		if (old) {
 			cellzram_put_slot(old);
@@ -557,7 +582,8 @@ static void cellzram_slot_free_notify(struct block_device *bdev,
 				      unsigned long block_nr)
 {
 	struct cellzram *dev = bdev->bd_disk->private_data;
-	void *old = xa_erase(&dev->table, block_nr);
+	void *old = xa_erase(&dev->table,
+			     cellzram_unit_of(block_nr));
 
 	if (old) {
 		cellzram_put_slot(old);
@@ -990,6 +1016,18 @@ static int __init cellzram_init(void)
 		return -EINVAL;
 	}
 	cellzram_unit_ratio = physical_block_size / logical_block_size;
+	/*
+	 * Step 2 rekeys the block table by unit index.  At ratio 1 that is
+	 * the identity, but at ratio > 1 the RMW that makes it safe does
+	 * not exist until step 4 -- a write to logical block N would land
+	 * in unit N/ratio and clobber its siblings.  Reject until then so
+	 * every commit in the series is correct on its own.
+	 */
+	if (cellzram_unit_ratio != 1) {
+		pr_err(CELLZRAM_NAME
+		       ": physical_block_size > logical_block_size is not yet supported (step 4)\n");
+		return -EINVAL;
+	}
 	pr_info(CELLZRAM_NAME
 		": logical=%d physical=%d unit_ratio=%u%s\n",
 		logical_block_size, physical_block_size,
