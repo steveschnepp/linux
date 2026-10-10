@@ -194,6 +194,23 @@ module_param(physical_block_size, int, 0444);
 MODULE_PARM_DESC(physical_block_size,
 		 "Physical block size in bytes (power of 2, >= logical, <= cell size)");
 
+/*
+ * Staged-write buffers per device (the FTL open-cell model): the
+ * bounded count of uncompressed unit buffers a write may hold open
+ * before a slot must be reclaimed by compression (GC, or -- only when
+ * the count is exhausted -- the write itself).  Each buffer is one
+ * cell (cell_order), so this bounds uncompressed staging RAM at
+ * open_units * cell_size.  0 = staging disabled, the default: the
+ * device is byte-for-byte today's per-block behaviour.  The real
+ * default is a bench decision (mission_log/2026-10-10_ftl-open-
+ * cell-buffer.md), so this ships off until that data exists.
+ */
+#define OPEN_UNITS_MAX	1024
+static int open_units = 0;
+module_param(open_units, int, 0444);
+MODULE_PARM_DESC(open_units,
+		 "Staged uncompressed write buffers per device (0 = disabled)");
+
 /* logical sectors per compression unit; 1 when the split is disabled */
 static unsigned int cellzram_unit_ratio;
 
@@ -675,6 +692,13 @@ static ssize_t disksize_store(struct device *dev,
 	 * byte-identical entries to a pool without the field.
 	 */
 	shmem_comp_pool_set_unit_ratio(pool, cellzram_unit_ratio);
+	/*
+	 * Staged-write bound.  Dormant at open_units == 0 (the default):
+	 * no opens[] array is allocated and the device behaves
+	 * byte-for-byte as before.  See mission_log/2026-10-10_ftl-
+	 * open-cell-buffer.md.
+	 */
+	shmem_comp_pool_set_open_max(pool, open_units);
 
 	cz->pool = pool;
 	cz->logical_bytes = size_bytes;
@@ -1026,6 +1050,11 @@ static int __init cellzram_init(void)
 		       ": physical_block_size %d exceeds cell size %lu\n",
 		       physical_block_size,
 		       (unsigned long)PAGE_SIZE << cell_order);
+		return -EINVAL;
+	}
+	if (open_units < 0 || open_units > OPEN_UNITS_MAX) {
+		pr_err(CELLZRAM_NAME ": open_units must be 0..%d\n",
+		       OPEN_UNITS_MAX);
 		return -EINVAL;
 	}
 	cellzram_unit_ratio = physical_block_size / logical_block_size;

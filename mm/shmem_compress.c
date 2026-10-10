@@ -191,6 +191,17 @@ struct shmem_comp_pool {
 	 * touch it.
 	 */
 	unsigned int unit_ratio;
+	/*
+	 * Staged-write buffer bound (the FTL open-cell model): the max
+	 * number of uncompressed unit buffers a cellzram device may hold
+	 * open at once.  0 = staging disabled, which is every pool except
+	 * a cellzram device configured with open_units > 0; tmpfs pools
+	 * never stage.  Set once at setup (disksize_store) before io, like
+	 * unit_ratio.  The opens[] array is allocated lazily on the first
+	 * stage (step 2) -- a pool that never stages allocates nothing
+	 * beyond this scalar, which kzalloc already zeroed.
+	 */
+	unsigned int open_max;
 	struct list_head list;			/* global pools list */
 };
 
@@ -548,6 +559,23 @@ void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
 {
 	if (pool)
 		pool->unit_ratio = ratio ? ratio : 1;
+}
+
+/*
+ * shmem_comp_pool_set_open_max - set the staged-write buffer bound
+ * @pool: target pool
+ * @open_max: max simultaneous uncompressed staging buffers; 0 = off
+ *
+ * Must be called before the first stage on @pool (it bounds the opens[]
+ * array).  A 0 value keeps staging disabled and is byte-for-byte the
+ * pre-open-cell behaviour, which is what makes this a no-op until a
+ * device asks for buffers.
+ */
+void shmem_comp_pool_set_open_max(struct shmem_comp_pool *pool,
+				  unsigned int open_max)
+{
+	if (pool)
+		pool->open_max = open_max;
 }
 
 /**

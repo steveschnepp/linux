@@ -222,6 +222,41 @@ static inline void shmem_comp_unpack_loc(unsigned long handle,
 	*offset = handle & (CELL_LOC_OFFSET_MAX - 1);
 }
 
+/*
+ * Staged (uncompressed) handle -- the FTL open-cell model.
+ *
+ * Bit 63 marks the handle as an OPEN-BUFFER SLOT INDEX rather than a
+ * cell region; the low bits carry the index into the pool's bounded
+ * opens[] array.  Bit 63 is free: shmem_comp_pack_loc() uses bits
+ * 54..0 (offset 22 + cellid+1 33), leaving 63..55 spare (see the
+ * encoding note above).  A staged unit and a closed unit are the SAME
+ * entry -- only the handle flips -- so shmem_comp_unpack_loc() is
+ * called only on cell-region handles (bit 63 clear); dispatch is one
+ * shmem_comp_is_staged() test.  Bit 63 set also guarantees a staged
+ * handle is never 0, so it cannot collide with the "storage failed"
+ * sentinel any more than a cell region can.
+ *
+ * Step 1 of the open-cell buffer: the encoding and the open_max knob
+ * only, dormant (no opens[] array is allocated and no path stages).
+ * See mission_log/2026-10-10_ftl-open-cell-buffer.md.
+ */
+#define CELL_STAGED_BIT		(1UL << 63)
+
+static inline unsigned long shmem_comp_pack_open(unsigned int idx)
+{
+	return CELL_STAGED_BIT | idx;
+}
+
+static inline bool shmem_comp_is_staged(unsigned long handle)
+{
+	return handle & CELL_STAGED_BIT;
+}
+
+static inline unsigned int shmem_comp_open_idx(unsigned long handle)
+{
+	return (unsigned int)(handle & ~CELL_STAGED_BIT);
+}
+
 /**
  * struct shmem_comp_stats - Compression statistics
  * @compressed_pages: Number of currently compressed pages
@@ -559,6 +594,17 @@ unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 void shmem_comp_pool_set_unit_ratio(struct shmem_comp_pool *pool,
 				    unsigned int ratio);
 unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool);
+
+/*
+ * Staged-write bound (open-cell buffer).  Set once at setup before io,
+ * like unit_ratio.  0 = staging disabled (every pool but a cellzram
+ * device configured with open_units > 0); the opens[] array itself is
+ * allocated lazily on the first stage, so a pool that never stages
+ * holds no extra state.  The getter lands with the code that reads it
+ * (step 2).
+ */
+void shmem_comp_pool_set_open_max(struct shmem_comp_pool *pool,
+				  unsigned int open_max);
 
 /*
  * Validity-bitmap accessors for split pools (unit_ratio > 1).  The
