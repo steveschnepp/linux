@@ -119,6 +119,7 @@ Documentation for filesystem implementations.
    squashfs
    sysfs
    tmpfs
+   tmpfs-compression
    ubifs
    ubifs-authentication
    udf
