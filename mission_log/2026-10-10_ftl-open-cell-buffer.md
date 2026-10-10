@@ -545,3 +545,52 @@ flips ratio>1 on.
   the file to "clean up" the design would delete the exact dead ends a
   future reader needs.  This near-miss is the rule restated: correct the
   record forward, never in place.
+
+---
+
+## Build progress (appended as steps land)
+
+Implementation follows the bisectable ladder above: every step green at
+default (ratio 1), dormant until ratio>1 is configured.  Steps land one
+commit at a time; this section records them.
+
+### Steps 1 + 2: the parameter knob, then staged ratio>1 (landed)
+
+- **Step 1** (`172e7b6564e9`): staged-handle encoding (bit 63 of the entry
+  handle = open-buffer index), the pool `open_max` knob, and the cellzram
+  `open_units` module param (default 0 = off).  Dormant no-op; cellzram
+  gate 106/0.
+- **Step 2a** (`ef3ee5b1ff4c`): pool-side staging primitives --
+  `struct shmem_comp_open` (buffer + a per-slot rwsem mirroring a cell's),
+  `stage_open` (seed a staged entry from a closed blob or zero),
+  `unit_load` (the whole ratio>1 read: validity mask + staged memcpy /
+  closed decompress), and entry teardown freeing a staged slot instead of
+  a cell region.  No caller yet; inert at default.
+- **Step 2b** (`8fb0ab6c748e`, rig `32c2039`): the device runs at ratio>1.
+  A write stages into an uncompressed gather buffer and compresses
+  nothing; reads dispatch staged vs closed; a zero/discard clears a
+  block's validity bit.  `mm_stat` at ratio>1: orig = live blocks * PAGE,
+  phys includes staged buffers.  `cellzram_init` allows ratio>1 only when
+  `open_units>0`.
+
+**Verified.**  Ratio-1 cellzram gate **106/0** (no regression across all
+of step 2).  New ratio>1 staging test (physical=64K -> ratio 16,
+open_units=8) **15/0**: staged round-trip across units, overwrite,
+zero-overwrite and a punched block reading zeros with neighbours intact,
+`mm_stat orig == live*PAGE` (520192 = 127 x 4096) and `phys` showing the
+staged buffers (524288 = 128 pages = 8 units x 16), reset draining to 0.
+
+**Known gap in step 2 (deliberate, next step).**  A write to a new unit
+when the pool has no free open slot returns `BLK_STS_RESOURCE`; the async
+GC drain that compresses a staged buffer into a cell region (freeing the
+slot) is step 3, and the write-path drain-on-full that the design calls
+for ("compress when no open slots") is step 4.  `compr_bytes` is 0 under
+staging until a drain runs, exactly as the model predicts.
+
+### Next: step 3 (the GC staged-drain)
+
+Wire `shmem_comp_cell_gc` to compress staged buffers into cell regions --
+the `drain_victim` pin + `WRITE_ONCE` handle-flip, pointed at an open
+buffer instead of a victim cell.  This is the concurrency-critical step:
+the staged reader's `down_read` + handle-recheck already in `unit_load`
+is what makes it safe, and it is what a concurrent-io test must exercise.
