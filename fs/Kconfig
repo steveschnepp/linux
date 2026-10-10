@@ -242,25 +242,6 @@ config TMPFS_COMPRESSOR_DEFAULT
 	  This can be changed at runtime via /sys/fs/tmpfs/compressor or
 	  per-mount via the compress= mount option.
 
-config TMPFS_COMP_BLKDEV
-	bool "Cell-backed compressed RAM block device (cellzram)"
-	depends on TMPFS_COMPRESSION
-	default n
-	help
-	  Build /dev/cellzramN: a zram-style compressed RAM block device
-	  that stores 4 KiB blocks in the tmpfs compression cell allocator
-	  instead of zsmalloc. Logical capacity is set at runtime via
-	  /sys/block/cellzramN/disksize; physical allocation is on demand,
-	  discard and swap-slot frees return emptied cells to the buddy
-	  allocator synchronously, and reads copy straight from the cell
-	  direct map with no bounce buffer.
-
-	  Experimental; intended for rigs and swap/scratch workloads that
-	  need a struct block_device. Requires the tmpfs compression
-	  subsystem (the device reuses its pool, entry table and GC).
-
-	  If unsure, say N.
-
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT
