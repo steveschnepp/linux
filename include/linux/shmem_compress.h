@@ -605,6 +605,28 @@ unsigned int shmem_comp_pool_unit_ratio(struct shmem_comp_pool *pool);
  */
 void shmem_comp_pool_set_open_max(struct shmem_comp_pool *pool,
 				  unsigned int open_max);
+unsigned int shmem_comp_pool_open_max(struct shmem_comp_pool *pool);
+
+/*
+ * Staged-write buffers (the FTL open-cell buffer; cellzram at ratio>1).
+ * A unit is staged: its uncompressed bytes live in a pool open-buffer
+ * slot (handle bit 63 set, low bits the slot index) until GC or a full
+ * pool compresses it into a cell region.  See
+ * mission_log/2026-10-10_ftl-open-cell-buffer.md.
+ *
+ * stage_open: create a staged entry, seeded from @seed_id's blob (or a
+ * fresh zeroed unit when @seed_id is 0).  Returns the entry id, or 0 when
+ * no slot is free (the caller stores the unit compressed instead).
+ *
+ * unit_load: copy logical block @blk of a unit (staged OR closed) into
+ * @dst, honouring the validity bitmap (a discarded block reads zeros).
+ * This is the whole ratio>1 read, so the staged-vs-drain protocol stays
+ * inside shmem_compress where the entry and slot live.
+ */
+unsigned int shmem_comp_stage_open(struct shmem_comp_pool *pool,
+				   unsigned int seed_id);
+int shmem_comp_unit_load(unsigned int id, unsigned int blk, void *dst,
+			 unsigned int len);
 
 /*
  * Validity-bitmap accessors for split pools (unit_ratio > 1).  The
