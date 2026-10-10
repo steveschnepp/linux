@@ -335,21 +335,181 @@ required for a step that allocates byte-identical entries.
 
 ### Next Steps
 
-Within this session (steps 4-5 of the design above):
+Superseded -- see "The pivot" below.  Steps 4-5 of the split were
+never completed because the measurement that should have preceded them
+showed the split's payoff does not exist on a realistic workload.  The
+steps are left in this log as written because the reasoning that led
+them astray is the useful part.
 
-4. **Enable ratio > 1** -- the correctness core: write-RMW
-   (decompress whole unit, patch sector, recompress whole unit), read
-   masks by bitmap, discard flips bits and frees the unit when the
-   bitmap reaches 0.  Needs a dedicated correctness test before any
-   performance claim.
-5. **Measure** -- entry table size, RAM held, untar vs churn at
-   physical=64K vs 4K.  The entry table should drop ~16x; that is the
-   number this whole session exists to move.
+## The pivot: are we chasing ghosts? (commit bbea20a5e864)
 
-Open question to settle in step 4: whether the write-triggered
-recompress should zero the discarded sectors' stale bytes (shrinks the
-unit, and is free since we are already paying the full recompress) or
-keep them (lets them contribute cross-sector compression matches, per
-the user's spec).  Implementing as specified -- keep them -- and
-leaving the zeroing variant as a one-line alternative for the
-benchmark to decide.
+Mid-step-4 the user stopped the work and asked two questions that
+reframed the whole session: *what is the goal of the journey, and do
+we go there or chase ghosts?* and *rethink from first principles*
+-- then, crucially, **"tmpfs merge is akin to bigger physical size."**
+
+That last observation is exact, not an analogy.  tmpfs `merge_pages=16`
+and cellzram `physical=64K` produce the **same storage layout**: one
+compressed blob spanning N consecutive 4K pages, one cell region, one
+entry, `nr_pages=N`.  The tmpfs path already prefers cells for it --
+the code comment says cells do it better than zsmalloc because "the
+entire group fits in one cell region and avoids the per-chunk handle
+array."
+
+### Why tmpfs gets merge free and cellzram would not
+
+Tracing `shmem_decompress_group` to its only caller
+(`shmem_decompress_folio`, a READ path) exposed the asymmetry that
+matters: tmpfs decompresses a group **into the page cache** and all
+writes land there, uncompressed.  Compression in tmpfs is a
+*reclaim-time* activity.  cellzram is a block device with no page
+cache, so every 4K write would hit the compressed blob directly --
+decompress 64K, patch, **recompress 64K, synchronously**, ~20x the
+CPU per write versus today.
+
+So the split was porting piece 1 of tmpfs's model (one blob per N
+pages) without piece 2 (a buffer that absorbs writes uncompressed).
+That is what the proposed write-gathering buffer would have supplied,
+and it is the "leverage being RAM-backed" round the user named.
+
+### The measurement that settled it
+
+Before building either, the untar workload -- compressible,
+sequential-append, the shape the cell scheme is *for* -- was read from
+the logs.  It had already run in this session's gates and never been
+examined.  Session 32's verdict rested on two gaps with different
+causes, and I had spent the session fixing the one that only exists in
+a synthetic test:
+
+| workload | gap vs zram | cause | does the split fix it |
+|---|---|---|---|
+| `distinct` (64 MiB incompressible) | 1.125 MiB | entry table (16384 x 72 B) | **yes, entirely** |
+| `untar` (8 MiB compressible) | 176 KiB | **cell granularity floor** | **936 bytes of it** |
+
+untar's mm_stat: `orig=8441856 compr=870 phys=262144 objects=13
+entry_bytes=936`.  The entry table is **936 bytes** -- the whole RAM
+footprint the split was built to shrink.  The real gap is that 870
+bytes of compressed data forces a whole 256 KiB cell, where zsmalloc's
+size classes need only 80 KiB.  Finishing step 4 would have cost ~200
+lines of correctness-critical RMW to save 936 bytes.
+
+The 256 KiB floor is `cell_order`, and it is the axis sessions 26/28/29
+all flagged as unswept.  The direction was also wrong: bigger cells
+worsen both the floor *and* fragmentation (a cell returns to the buddy
+only when it completely empties, so a bigger cell is harder to empty).
+
+### What was also learned about the workloads
+
+untar's `zero_blocks=2048` of 2061 total blocks means the dataset is
+**almost entirely zeros** -- inode tables, bitmaps, padding.  Its
+870-byte `compr_bytes` is not a compression win; it is session 31's
+zero-block sentinel doing its job.  So untar measures zero-handling and
+cell granularity, **not** compression on real data.  `distinct` is
+incompressible, untar is zeros: **no workload in the rig measures
+compression ratio on genuinely compressible non-zero data.**  That is
+now the largest unmeasured question in the series.
+
+## The cell_order sweep (order 2 / 4 / 6, both workloads)
+
+Ran `TEST_CELLORDER=2/4/6` across untar and churn, churn twice to check
+reproducibility.  The axis already exists in the rig
+(`cellzram.cell_order`, module param, range 2..10, default 6).
+
+**untar -- order 2 wins decisively:**
+
+| order | cell | RAM held | untar MB/s | verify | rm |
+|---|---|---:|---:|---:|---:|
+| 2 | 16 KiB | **16 KiB** | 20.3 | **79.5** | **60.8** |
+| 4 | 64 KiB | 64 KiB | 20.2 | 77.4 | 55.8 |
+| 6 | 256 KiB | 256 KiB | 20.6 | 76.1 | 55.5 |
+| *zram* | -- | *80 KiB* | *20.4* | *75.5* | *64.4* |
+
+The floor is **exactly one cell** at every order, which confirms the
+mechanism.  At order 2 that is **16 KiB, beating zram's 80 KiB by 5x**
+-- where order 6 lost to zram by 3.2x.  Throughput is flat-to-better:
+`rm` improves 9.5% (smaller cells return to the buddy sooner on
+delete), verify +4.5%.
+
+**churn -- order 2 nearly closes the throughput gap but costs RAM:**
+
+| order | cell | avg MB/s | gc_recoveries | phys held |
+|---|---|---:|---:|---:|
+| 2 | 16 KiB | **133.6 / 131.9** | **0 / 0** | 16.6 MiB |
+| 4 | 64 KiB | 109.1 / 108.2 | 148 / 148 | 17.3 MiB |
+| 6 | 256 KiB | 125.3 / 125.2 | 58 / 58 | **10.25 MiB** |
+| *zram* | -- | *136.3* | -- | *8.0 MiB* |
+
+Both integer columns reproduce **byte-identically** across two
+independent boots (gc = 0/148/58 twice), and throughput tracks gc
+inversely.  Three findings:
+
+1. **order 2 nearly matches zram on throughput** (2% gap, down from 8%
+   at order 6) because `gc_recoveries = 0`: a 16 KiB cell holds 4
+   blocks, so it empties naturally under random overwrite and returns
+   inline.  The compaction pass -- session 25's accepted ~9% cost --
+   never fires.  This is the mechanism predicted from first principles,
+   now measured.
+2. **But phys is worse at order 2** (16.6 vs 10.25 MiB).  With no GC
+   there is no compaction, so fragmentation accumulates until the
+   directory is nearly full.  GC at order 6 was doing real work:
+   evacuating sparse cells and coalescing toward the live set.
+3. **order 4 is a genuine local minimum** -- worse than both neighbors
+   on throughput (109 MB/s) with the *most* GC activity (148).  It
+   reproduces exactly, so it is not noise.  The likely mechanism:
+   between the two regimes -- too big to empty naturally (so GC runs),
+   too small for each pass to coalesce much (so it runs often).
+   Untested hypothesis, but the gc column is unambiguous.
+
+### What was also fixed
+
+While verifying the device-size cost of small cells, found a **false
+claim in a comment** (`bbea20a5e864`): the disksize sizing path said
+the cell-count hint "is clamped to U16_MAX inside cell_pool_create".
+There is no such clamp -- `cell_pool_create` takes the hint as given
+and `kvcalloc()`s the directory array, and `cell_store.c` states
+explicitly that no clamp is needed because the caller owns the
+arithmetic.  The stale claim implied a safety bound that does not
+exist.  The real ceiling is the directory array itself, scaling as
+1/cell_size: order 2 needs 64x more slots than order 6 for the same
+disksize, so a large device at a small cell_order can exhaust memory on
+the directory before storing a byte.
+
+### What We Decided (this section supersedes the split plan)
+
+- **The split is parked, not finished.**  Steps 1-4a stay committed and
+  dormant at ratio 1 (byte-identical, revertible).  Step 4 -- the ~200
+  lines of RMW correctness core -- is not built, because its measured
+  payoff on a realistic workload is 936 bytes.
+- **`cell_order` is the axis that matters**, and the direction is
+  *down*, not up.  It fixes the untar RAM floor (16 KiB beats zram's
+  80 KiB) and churn throughput (gc goes to zero) at once.
+- **The churn RAM/throughput trade is real and unresolved**: order 2
+  wins throughput, order 6 wins RAM.  Which dominates depends on the
+  deployment, and no default should change until that is chosen
+  deliberately.
+- **The compression-ratio question is open and now the priority.**  No
+  rig workload measures compressible non-zero data.  Every conclusion
+  about "where cellzram wins" rests on zero-heavy or incompressible
+  synthetic data.
+
+### Files Changed (this section)
+
+| File | Purpose |
+|------|---------|
+| `mm/cellzram.c` | corrected the false U16_MAX clamp claim; documented the real 1/cell_size directory cost |
+
+### Next Steps (revised)
+
+1. **Decide the cell_order default deliberately**, on the
+   throughput-vs-RAM trade, not by inertia.  Order 2 is better on both
+   measured workloads except churn RAM; that is a strong case, but it
+   caps device size via the directory array and that limit needs a
+   number before the default moves.
+2. **Build the compressible-non-zero workload.**  This is the largest
+   gap in the series: a real dataset (text, binaries, logs) written to
+   the device, measuring compression ratio and RAM against zram.  Every
+   "cellzram wins here" claim depends on it and none has been measured.
+3. **Decide the split's fate** on the strength of (2).  If a
+   compressible workload shows the entry table or the compression-ratio
+   gain from 64K context matters, step 4 becomes worth building.  If
+   not, revert steps 1-4a and record why.
