@@ -251,19 +251,92 @@ Three gates re-run at default, all green, identical to step 1:
 churn avg 124.3 MB/s vs step 1's 124.3 -- unchanged, as required for
 a rekey that is the identity at ratio 1.
 
+## Step 3: the validity bitmap, zero-cost at ratio 1 (commit 98bc5eeaa7f7)
+
+### What We Did
+
+1. **Added a trailing flexible array `valid[]` to `shmem_comp_entry`**,
+   sized `BITS_TO_LONGS(unit_ratio)` words when the split is on and
+   **zero words when it is off.**  At ratio 1 the entry's *existence*
+   is already the bitmap, so `struct_size(ent, valid, 0) ==
+   sizeof(*ent)` and the default allocation is byte-identical to
+   before the field existed.
+2. **Verified the zero-cost claim numerically** rather than asserting
+   it: a standalone struct with the same layout prints
+   `sizeof=40  struct_size(valid,0)=40  struct_size(valid,1)=48`.
+   40 == 40 at ratio 1, +8 bytes at 16 sectors.  An entry-table
+   shrink must not begin by growing the entry.
+3. **Landed the bitmap in the entry, uncompressed** -- the decision
+   from the design section, now in code with the reasoning in the
+   struct comment.
+4. **Added `pool->unit_ratio`** with `shmem_comp_pool_set_unit_ratio()`
+   and `shmem_comp_pool_unit_ratio()`.  cellzram sets it immediately
+   after `pool_create`, **before the first entry alloc**, because the
+   ratio sizes every entry and is not retroactive.  NULL/0 pools read
+   as 1 so callers can divide by it unconditionally.
+5. **Did not wire the bitmap into any path.**  Read, write and discard
+   still ignore `valid[]`.  That is deliberate: it is what keeps this
+   step a no-op at *every* ratio, not just the default.
+
+### What We Learned
+
+#### Technical
+
+- **`ksize()`-based RAM accounting survives a flexible array
+  automatically.**  `shmem_comp_ram_entry_bytes` uses `ksize(ent)`,
+  which returns the real allocation including bitmap words.  No change
+  was needed and none was made -- the accounting got *more* accurate
+  for free.  Worth checking rather than assuming a field addition
+  breaks derived accounting; here it did not.
+
+- **`kfree_rcu(ent, rcu)` is unaffected by a trailing flexible
+  array.**  It resolves `rcu` via `offsetof` at compile time; the
+  array lives after it and does not move it.  Checked because getting
+  this wrong is a silent free-of-the-wrong-address, not a crash with
+  a useful trace.
+
+- **`struct_size()` needs `<linux/overflow.h>` and `bitmap_fill()` /
+  `BITS_TO_LONGS` need `<linux/bitmap.h>`,** and `shmem_compress.c`
+  included neither.  Added both.  Trivial, but it is the kind of
+  thing that only surfaces at the first compile of the step that
+  needs it.
+
+#### Process
+
+- **Verify a "zero-cost" claim with a number, not a sentence.**  The
+  flexible-array trick is *usually* zero-cost at count 0, but "usually"
+  is how a 40-byte entry quietly becomes 48.  One standalone compile
+  settled it in fifteen seconds and turned an assumption into a
+  measured fact -- the same discipline this session applies to the
+  kernel, pointed at the host toolchain.
+
+### Test Results
+
+Three gates re-run at default, all green, identical to steps 1-2:
+
+| gate | result | step 2 |
+|------|--------|--------|
+| cellzram | 106/0 | 106/0 |
+| fsdev (blkdev ext4) | 19/0 | 19/0 |
+| churn | 2/0 | 2/0 |
+
+churn avg 123.8 MB/s vs step 2's 124.3 -- within in-boot noise, as
+required for a step that allocates byte-identical entries.
+
 ### Files Changed
 
 | File | Purpose |
 |------|---------|
 | `mm/cellzram.c` | `logical_block_size` / `physical_block_size` params, power-of-2 + cell-size validation, `cellzram_unit_ratio`, queue_limits derived from params (step 1) |
 | `mm/cellzram.c` | `cellzram_unit_of()`, block table rekeyed by unit index at all four bio boundaries, read/write helpers take `unit_nr`, ratio>1 rejected until step 4 (step 2) |
+| `mm/cellzram.c` | sets pool unit ratio after `pool_create`, before first entry alloc (step 3) |
+| `include/linux/shmem_compress.h` | `valid[]` flexible array on `shmem_comp_entry` with the post-decompress rationale; `unit_ratio` on the pool; ratio setter/getter decls (step 3) |
+| `mm/shmem_compress.c` | `<overflow.h>` + `<bitmap.h>`; bitmap sized at alloc (0 words at ratio 1), `bitmap_fill` on fresh units; ratio setter/getter (step 3) |
 
 ### Next Steps
 
-Within this session (steps 3-5 of the design above):
+Within this session (steps 4-5 of the design above):
 
-3. **Per-entry valid bitmap** -- `DECLARE_BITMAP`, sized
-   `physical/logical`.  At ratio 1 it is one bit, always set.
 4. **Enable ratio > 1** -- the correctness core: write-RMW
    (decompress whole unit, patch sector, recompress whole unit), read
    masks by bitmap, discard flips bits and frees the unit when the
