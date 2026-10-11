@@ -222,10 +222,46 @@ gap is inside the noise -- the honest number is the stable `ram_total`
 gauge.  Single boot per arm; M-boot medians are the standing rigor
 item.
 
+### Pressure pass (256M, knee)
+
+All three arms through the squeeze, non-KASAN 256M VM, dataset
+resident, incompressible anon filler (xorshift, not zeros) driven
+toward a MemFree target.  Session 39's methodology lesson applied up
+front: the target must reach the knee, not a comfortable level.
+
+**The first target I chose (2 MB free) was an invalid test point, and
+the reconciliation is worth recording.**  At 2 MB ALL THREE arms
+OOM-killed -- but the victim was the *filler* (`test_zbench` at
+anon-rss ~157 MB), not the tmpfs data.  No arm compresses anon memory,
+so an unreachable target makes the anon filler hit the mmap wall and
+OOM regardless of backend; that pressure point discriminates nothing.
+Session 39's runs had settled at `stressed_free_kb` 4-8 MB, not 2 MB.
+
+At the achievable knee (8 MB free target), zero OOM on every arm:
+
+| arm | anon headroom absorbed (filled_kb) | stressed free | OOM |
+|---|---|---|---|
+| 1 tmpfs+zramswap | 118-121 MB | 5-8 MB | 0 |
+| 2 zsmalloc | 139 MB | 6-7 MB | 0 |
+| 3 cells | 139-141 MB | 6-7 MB | 0 |
+
+Readings: arms 2 and 3 absorb ~20 MB more anon headroom than arm 1
+(the compressed dataset leaves more room for the filler) -- cells
+edges zsmalloc by ~2 MB, inside noise.  `swapused_kb=0` on every arm
+including arm 1, so even at the knee the canonical answer never
+swapped: its compression stays hypothetical while the compression
+arms are unconditionally resident.  The survival story (arm 1 dies,
+compression arms live) needs a target that actually kills arm 1's
+*workload* rather than the filler's anon -- a workload-shaped stress
+(the OpenWrt small-file churn from log 40 next step 2), not a raw anon
+mmap, is the honest instrument for that row.
+
 ## Next Steps
 
-1. **Pressure pass** -- all three arms through the squeeze so the
-   survival row reads survives-vs-OOM per arm, not just arm 1/2.
+1. **Workload-shaped pressure** -- the survival-vs-OOM row needs an
+   OpenWrt-style churn under the squeeze (log 40 next step 2), not a
+   raw anon filler; the anon-filler knee measures headroom, which is
+   now done (arms 2/3 ~20 MB over arm 1).
 2. **M-boot wrapper** for medians + IQR across boots (the in-boot reps
    give spread; the RFC table needs boot medians).
 3. **cell_order sweep** -- spec 03's improvement target 1; price
