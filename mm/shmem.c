@@ -519,7 +519,6 @@ static int shmem_replace_entry(struct address_space *mapping,
 	void *item;
 
 	VM_BUG_ON(!expected);
-	VM_BUG_ON(!replacement);
 	item = xas_load(&xas);
 	if (item != expected)
 		return -ENOENT;
@@ -1182,6 +1181,17 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 
 	if (info->fallocend > start && info->fallocend <= end && !unfalloc)
 		info->fallocend = start;
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Two-table: a compressed page's entry lives in entries[], not in
+	 * i_pages, so the walks below never see it.  Free the range's
+	 * entries here (a both-state folio, if any, is dropped by the
+	 * walks below); each freed entry drops one logical page's swapped
+	 * charge, folded into nr_swaps_freed for the final recalc.
+	 */
+	nr_swaps_freed += shmem_comp_truncate_range(inode, start, end);
+#endif
 
 	folio_batch_init(&fbatch);
 	index = start;
@@ -2528,26 +2538,6 @@ repeat:
 	}
 
 	if (xa_is_value(folio)) {
-#ifdef CONFIG_TMPFS_COMPRESSION
-		/*
-		 * Compressed entry: decompress + install a folio,
-		 * replacing the entry. -EEXIST/-ENOENT: the slot changed
-		 * or the entry vanished (races); retry against the slot.
-		 */
-		if (xa_is_shmem_comp(folio)) {
-			swp_entry_t comp_entry;
-
-			comp_entry = radix_to_swp_entry(folio);
-			error = shmem_decompress_folio(inode, index,
-							comp_entry, gfp,
-							&folio);
-			if (error == -EEXIST || error == -ENOENT)
-				goto repeat;
-
-			*foliop = folio;
-			return error;
-		}
-#endif
 		error = shmem_swapin_folio(inode, index, &folio,
 					   sgp, gfp, vmf, fault_type);
 		if (error == -EEXIST)
@@ -2556,6 +2546,24 @@ repeat:
 		*foliop = folio;
 		return error;
 	}
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Two-table compressed page: i_pages[index] is empty but
+	 * entries[index] names a compressed entry (compressed, or "both"
+	 * with a reclaimable folio).  Decompress into a folio, keeping the
+	 * entry. -EEXIST/-ENOENT: the folio slot filled or the entry
+	 * vanished (races); retry against the updated tables.
+	 */
+	if (!folio && shmem_comp_entries_present(inode, index)) {
+		error = shmem_decompress_folio(inode, index, gfp, &folio);
+		if (error == -EEXIST || error == -ENOENT)
+			goto repeat;
+
+		*foliop = folio;
+		return error;
+	}
+#endif
 
 	if (folio) {
 		folio_lock(folio);

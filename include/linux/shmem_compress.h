@@ -126,20 +126,25 @@ struct shmem_comp_entry {
 	unsigned int gen;
 	/*
 	 * Two-counter reference scheme:
-	 *   slots  — page-cache xarray slots that point at this entry.
+	 *   slots  — entries[] slots (the per-inode two-table mapping)
+	 *            that name this entry; the durable reference.  One per
+	 *            entries[] slot (a merge group writes one per page).
 	 *            Decrement when a slot is cleared (truncate,
-	 *            decompress-after-read, file deletion).
+	 *            write-invalidate, file deletion).
 	 *   refs   — slots plus temporary pins taken by readers during
 	 *            decompression.  The entry (and its storage) is
 	 *            freed when refs reaches zero.
 	 *
 	 * The separation exists because a reader must pin the entry
-	 * before loading from storage, but the page-cache slot may be
+	 * before loading from storage, but an entries[] slot may be
 	 * cleared concurrently by truncate.  If a single counter were
 	 * used, truncate could free the entry while a reader is mid-
 	 * decompress.  With two counters, truncate decrements only
 	 * slots; the reader's pin on refs keeps the entry alive until
-	 * the decompress completes.
+	 * the decompress completes.  Decompress does NOT release a slot:
+	 * the entry is kept as the durable backing of the uncompressed
+	 * folio cache (the "both" state), so reclaim can drop the folio
+	 * and a later read re-decompresses.
 	 */
 	atomic_t refs;
 	atomic_t slots;
@@ -455,9 +460,36 @@ void shmem_comp_note_unmap(struct inode *inode);
 void shmem_comp_free_swap(struct address_space *mapping, void *radswap);
 
 /*
- * Eviction hook (shmem_evict_inode): free an inode's per-inode entries[]
- * table (the two-table mapping, specs/02).  Safe on NULL (most inodes
- * never compress).  Must run after truncate, which releases any slots.
+ * Two-table mapping (specs/02): a compressed page's entry id lives in
+ * the per-inode entries[] xarray (same pgoff index space, 0/NULL = no
+ * compressed copy), NOT in the page cache.  i_pages[] holds only folios.
+ * The entries[] slot owns the entry's durable reference.
+ */
+
+/*
+ * Quick presence test: true if entries[index] names a compressed entry.
+ * Used by the read path to distinguish a compressed page (i_pages empty,
+ * entries[] set) from a genuine hole (both empty).  No reference is taken.
+ */
+bool shmem_comp_entries_present(struct inode *inode, pgoff_t index);
+
+/*
+ * Truncate hook (shmem_undo_range): clear and free every compressed
+ * entry in [start, end).  Drops each entry's durable reference (driving
+ * teardown when the last reference -- entry or reader pin -- goes),
+ * restores the per-mount compression accounting, and returns the number
+ * of logical pages whose entries were freed so the caller can drop the
+ * shmem swapped charge in one recalc.  Safe on an absent table.
+ */
+unsigned int shmem_comp_truncate_range(struct inode *inode, pgoff_t start,
+				       pgoff_t end);
+
+/*
+ * Eviction hook (shmem_evict_inode): free any remaining entries[] and
+ * the table itself (the two-table mapping, specs/02).  Safe on NULL
+ * (most inodes never compress).  shmem_comp_truncate_range() has
+ * normally already emptied the table; this is the safety net that
+ * guarantees no compressed block outlives its inode.
  */
 void shmem_comp_entries_destroy(struct inode *inode);
 
@@ -469,8 +501,7 @@ void shmem_comp_entries_destroy(struct inode *inode);
 int shmem_compress_folio(struct inode *inode, pgoff_t index,
 			 struct folio *folio);
 int shmem_decompress_folio(struct inode *inode, pgoff_t index,
-			   swp_entry_t comp_entry, gfp_t gfp,
-			   struct folio **foliop);
+			   gfp_t gfp, struct folio **foliop);
 
 /*
  * shmem primitives exported for the tmpfs compression backend

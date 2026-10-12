@@ -96,7 +96,12 @@
 /* GC implementation lives after the entry table (needs the xarray) */
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool);
 static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
-				  unsigned int id);
+				  unsigned int id, unsigned int gen);
+static unsigned int shmem_comp_entries_lookup(struct inode *inode,
+				      pgoff_t index,
+				      unsigned int *gen);
+static unsigned int shmem_comp_invalidate_index(struct inode *inode,
+						pgoff_t index);
 static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
 					   struct shrink_control *sc);
 static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
@@ -3012,10 +3017,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		kunmap_local(dst);
 		folio_mark_uptodate(sib);
 
-		ret = shmem_add_to_page_cache(sib, mapping, sidx,
-					       swp_to_radix_entry(
-						       make_shmem_comp_entry(id, gen)),
-					       gfp);
+		ret = shmem_add_to_page_cache(sib, mapping, sidx, NULL, gfp);
 		if (ret) {
 			folio_unlock(sib);
 			folio_put(sib);
@@ -3030,12 +3032,10 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 
 		folio_add_lru(sib);
 
-		/* Pair with the per-slice recalc in the compress path. */
-		shmem_recalc_inode(inode, 0, -1);
-
-		/* Consume this slice's slot reference; the pin taken
-		 * above keeps the entry (and cbuf) alive regardless. */
-		shmem_comp_entry_release(id, gen);
+		/* Both state: entries[sidx] still names the group entry, so
+		 * no per-slice release and the entry's swapped charge is
+		 * retained.  Reclaim drops the folio later, keeping the
+		 * entry. */
 
 		if (sidx == index) {
 			folio_set_referenced(sib);
@@ -3047,15 +3047,9 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		ret = 0;
 	}
 
-	/* One group decompressed: update accounting once */
-	atomic_long_sub(nr_pages, &sbinfo->comp->pages);
-	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
-	shmem_comp_update_stats(false, (unsigned int)nr_pages * PAGE_SIZE,
-				comp_len);
-
-	/* Drop the group pin taken at function entry: entry teardown
-	 * (zsmalloc chunks + handle array) runs here if the slice loop
-	 * consumed every slot reference. */
+	/* The group entry survives (entries[] still names it); the
+	 * compressed gauge is NOT decremented here -- it drops when the
+	 * entry is freed on truncate/evict.  Drop the group pin. */
 	shmem_comp_entry_put(id);
 
 	kfree(cbuf);
@@ -3221,11 +3215,17 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 
 	/* Swap every folio of the group for the replicated ID entry */
 	for (i = 0; i < nr; i++) {
-		shmem_delete_from_page_cache(folios[i],
-			swp_to_radix_entry(make_shmem_comp_entry(id, gen)));
-		/* Phase-1 shadow: one entry id covers the whole group, so
-		 * each index of the group records the same id. */
-		shmem_comp_entries_set(inode, folios[i]->index, id);
+		/* Free a modified both-state folio's stale compressed copy
+		 * before overwriting its entries[] slot (see the single-page
+		 * path). */
+		shmem_recalc_inode(inode, 0,
+			   -(long)shmem_comp_invalidate_index(inode,
+							folios[i]->index));
+		shmem_delete_from_page_cache(folios[i], NULL);
+		/* Two-table: entries[index] names the compressed entry;
+		 * i_pages[index] is cleared (the folio leaves the page
+		 * cache).  One {id,gen} covers the whole group. */
+		shmem_comp_entries_set(inode, folios[i]->index, id, gen);
 		folio_unlock(folios[i]);
 		folio_put(folios[i]);
 	}
@@ -3313,25 +3313,26 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
  * shmem_decompress_folio - Decompress a page from the compression pool
  * @inode: shmem inode
  * @index: page index in the file
- * @comp_entry: compression entry found in the page cache
  * @gfp: allocation flags for the replacement folio
  * @foliop: output, receives the decompressed folio
  *
  * Return: 0 on success, negative errno on failure
  *
- * Loads the compressed data from the zsmalloc pool, decompresses it
- * into a freshly allocated folio and atomically swaps the compression
- * entry for that folio in the page cache xarray. The folio is returned
- * locked and with a reference, matching the shmem_get_folio() contract.
+ * Resolves the compressed entry from the per-inode entries[] table (the
+ * two-table mapping), loads and decompresses it into a freshly allocated
+ * folio, and installs the folio in the empty page-cache slot.  The entry
+ * is KEPT -- entries[index] continues to name it, putting the page in the
+ * "both" state -- so reclaim can later drop the folio and a later read
+ * re-decompresses.  The folio is returned locked and with a reference,
+ * matching the shmem_get_folio() contract.
  *
- * Races with a concurrent compress/decompress of the same index are
- * resolved by shmem_add_to_page_cache(): it only installs the folio if
- * the slot still holds @comp_entry, otherwise -EEXIST is returned and
- * the caller retries.
+ * A racing truncate that clears entries[index] frees the entry; the
+ * generation-validated pin rejects the recycled id with -ENOENT and the
+ * caller retries against the updated table.  A folio that loses the
+ * install race gets -EEXIST and the caller retries.
  */
 int shmem_decompress_folio(struct inode *inode, pgoff_t index,
-				  swp_entry_t comp_entry, gfp_t gfp,
-				  struct folio **foliop)
+			   gfp_t gfp, struct folio **foliop)
 {
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
@@ -3350,16 +3351,12 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	if (!sbinfo->comp)
 		return -ENODEV;
 
-	/*
-	 * Pin the entry: handle/comp_len are used below outside RCU,
-	 * and truncate can erase our slot (dropping the last slot
-	 * reference) at any point. Generation-validated: the slot value
-	 * this pin is derived from can be stale (entry died, ID
-	 * recycled); fails with -ENOENT and the caller retries against
-	 * the updated slot.
-	 */
-	id = shmem_comp_entry_id(comp_entry);
-	gen = shmem_comp_entry_gen(comp_entry);
+	/* Resolve entries[index] -> {id, gen} and pin generation-validated.
+	 * A racing truncate that cleared the slot freed the entry; the
+	 * generation check rejects the recycled id (-ENOENT -> retry). */
+	id = shmem_comp_entries_lookup(inode, index, &gen);
+	if (!id)
+		return -ENOENT;
 	if (!shmem_comp_entry_get_gen(id, gen, &handle, &comp_len,
 				       &nr_pages, NULL, NULL))
 		return -ENOENT;
@@ -3449,11 +3446,13 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	folio_mark_uptodate(folio);
 
 	/*
-	 * Atomically replace the compression entry with the folio.
-	 * @comp_entry is passed as the expected xarray slot contents.
+	 * Install the folio in the empty slot (expected NULL).  The
+	 * compressed entry is KEPT: entries[index] still names it (the
+	 * "both" state).  A racing fill of the slot yields -EEXIST
+	 * (retry); a racing truncate that freed the entry yields -ENOENT
+	 * on the next re-pin.
 	 */
-	ret = shmem_add_to_page_cache(folio, mapping, index,
-				       swp_to_radix_entry(comp_entry), gfp);
+	ret = shmem_add_to_page_cache(folio, mapping, index, NULL, gfp);
 	if (ret) {
 		folio_unlock(folio);
 		folio_put(folio);
@@ -3462,23 +3461,15 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	}
 
 	/*
-	 * nrpages rose with the folio install; drop the swap-style
-	 * charge the compression raised (see shmem_compress_folio()).
+	 * Both-state accounting: the folio adds nrpages while the entry
+	 * keeps its swapped charge, so alloced (the size= budget) is
+	 * unchanged -- the folio is a reclaimable cache of the one logical
+	 * page, not a second copy charged to the budget.  The compressed
+	 * gauge stays (the entry survives); it drops when the entry is
+	 * freed on truncate/evict.  Drop our pin: entries[index] holds the
+	 * durable reference now.
 	 */
-	shmem_recalc_inode(inode, 0, -1);
-
 	folio_add_lru(folio);
-
-	/* Consume the slot's reference; our pin keeps the entry (and
-	 * its zsmalloc block) alive until put() below, which runs the
-	 * teardown when no other reference remains. */
-	shmem_comp_entry_release(id, gen);
-
-	/* Update accounting */
-	atomic_long_dec(&sbinfo->comp->pages);
-	atomic_long_sub(comp_len, &sbinfo->comp->bytes);
-	shmem_comp_update_stats(false, PAGE_SIZE, comp_len);
-
 	shmem_comp_entry_put(id);
 
 	folio_set_referenced(folio);
@@ -3507,24 +3498,51 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
  */
 
 /*
- * shmem_comp_entries_set - record the compressed id for a page index
+ * The per-inode entries[] table (the two-table mapping, specs/02).  Each
+ * present slot packs {id, gen} of the compressed entry backing that page
+ * index, stored as a plain xa_value.  No swap-type tag: entries[] is a
+ * dedicated table that never holds folios or real swap entries, so the
+ * value needs no type discrimination.  The slot owns the entry's durable
+ * reference (counted by the entry's `slots` counter); the packed
+ * generation rejects a stale id once the entry is freed and the id
+ * recycled.
+ */
+
+static inline void *shmem_comp_pack(unsigned int id, unsigned int gen)
+{
+	return xa_mk_value(((unsigned long)(gen & SHMEM_COMP_ENTRY_GEN_MASK)
+			    << 32) | id);
+}
+
+static inline void shmem_comp_unpack(void *entry, unsigned int *id,
+				     unsigned int *gen)
+{
+	unsigned long v = xa_to_value(entry);
+
+	*id = (unsigned int)v;
+	*gen = (unsigned int)(v >> 32);
+}
+
+/*
+ * shmem_comp_entries_set - record the compressed {id, gen} for a page index
  * @inode: shmem inode
  * @index: page index
  * @id: entry ID from shmem_comp_entry_alloc()
+ * @gen: entry generation from shmem_comp_entry_alloc()
  *
- * Phase-1 of the two-table mapping (specs/02): populate the per-inode
- * entries[] table alongside the authoritative {id,gen} page-cache slot.
- * This is a SHADOW write -- nothing reads entries[] yet, and it holds no
- * entry reference (the slot path owns that).  It exists so the plumbing
- * (lazy per-inode xarray, lifecycle, evict) is proven under the full
- * suite before the read path switches over in Phase 2.
+ * The two-table mapping (specs/02): the compressed mapping lives in the
+ * per-inode entries[] table, NOT in the page cache (i_pages holds only
+ * folios).  Storing {id, gen} here makes the entry the authoritative
+ * compressed backing for @index; the caller has already cleared
+ * i_pages[index].  The entry's durable reference is the `slots` counter
+ * set at alloc (one per entries[] slot the group writes).
  *
  * Returns 0; -ENOMEM if the lazy per-inode xarray could not be allocated
- * (the shadow is then simply absent -- the slot remains authoritative, so
- * this is not a correctness failure in Phase 1).
+ * (the compressed page then has no entries[] backing -- treated as a skip
+ * by the compress path, which frees the entry instead).
  */
 static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
-				  unsigned int id)
+				  unsigned int id, unsigned int gen)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct xarray *xa;
@@ -3543,26 +3561,150 @@ static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
 			xa = old;
 		}
 	}
-	/* Plain id as an xa_value; id 0 is never allocated, so 0/NULL =
-	 * no compressed copy.  No reference is taken here (Phase-1 shadow
-	 * only); the page-cache slot owns the entry's lifetime. */
-	xa_store(xa, index, xa_mk_value(id), GFP_KERNEL);
+	xa_store(xa, index, shmem_comp_pack(id, gen), GFP_KERNEL);
 	return 0;
 }
 
 /*
- * shmem_comp_entries_destroy - free an inode's per-inode entries[] table
+ * shmem_comp_entries_lookup - resolve entries[index] to {id, gen}
+ *
+ * Unpacks the compressed entry id (and its generation) backing @index.
+ * Returns the id, or 0 if there is no compressed copy.  Takes NO
+ * reference; the caller must pin generation-validated before use.
+ */
+static unsigned int shmem_comp_entries_lookup(struct inode *inode,
+					      pgoff_t index,
+					      unsigned int *gen)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa = READ_ONCE(info->comp_entries);
+	void *entry;
+	unsigned int id = 0;
+
+	*gen = 0;
+	if (!xa)
+		return 0;
+	entry = xa_load(xa, index);
+	if (entry && xa_is_value(entry))
+		shmem_comp_unpack(entry, &id, gen);
+	return id;
+}
+
+bool shmem_comp_entries_present(struct inode *inode, pgoff_t index)
+{
+	unsigned int gen;
+
+	return shmem_comp_entries_lookup(inode, index, &gen) != 0;
+}
+
+/*
+ * shmem_comp_entry_drop - drop one entries[] slot's durable reference
+ * @inode: shmem inode
+ * @id, @gen: the packed entry identity from entries[index]
+ *
+ * Returns 1 (one logical page whose shmem swapped charge the caller must
+ * drop via a single recalc), or 0 if the entry was already gone (stale
+ * id -- its accounting ran when it died).  Generation-validated get +
+ * release, mirroring shmem_comp_free_swap(); the per-mount compression
+ * gauge is corrected once, on the entry's last slot.
+ */
+static unsigned int shmem_comp_entry_drop(struct inode *inode,
+					  unsigned int id, unsigned int gen)
+{
+	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
+	unsigned int length = 0, nr = 1;
+	bool got, last;
+
+	got = shmem_comp_entry_get_gen(id, gen, NULL, &length, &nr,
+					NULL, NULL);
+	last = shmem_comp_entry_release(id, gen);
+	if (got)
+		shmem_comp_entry_put(id);
+	if (comp && last && got) {
+		atomic_long_sub(nr, &comp->pages);
+		atomic_long_sub(length, &comp->bytes);
+		shmem_comp_update_stats(false, nr * PAGE_SIZE, length);
+	}
+	return 1;
+}
+
+/*
+ * shmem_comp_invalidate_index - free a modified page's stale compressed copy
+ * @inode: shmem inode
+ * @index: page index being modified (re-compressed)
+ *
+ * A both-state folio that was written still names its (now stale)
+ * compressed copy in entries[index].  The compress point is the single
+ * choke point that overwrites entries[index], so freeing the old entry
+ * here keeps a re-compressed page from leaking it, and drops that
+ * entry's swapped charge.  Returns the shmem swapped pages to recalc.
+ */
+static unsigned int shmem_comp_invalidate_index(struct inode *inode,
+						pgoff_t index)
+{
+	unsigned int gen, id;
+
+	id = shmem_comp_entries_lookup(inode, index, &gen);
+	if (!id)
+		return 0;
+	return shmem_comp_entry_drop(inode, id, gen);
+}
+
+/*
+ * shmem_comp_truncate_range - free compressed entries in [start, end)
+ *
+ * The truncate hook (shmem_undo_range): clear every entries[] slot in the
+ * range, dropping each entry's durable reference (the entry frees when the
+ * last reference -- slot or reader pin -- goes).  Returns the number of
+ * logical pages freed so the caller drops the shmem swapped charge in one
+ * recalc.  Safe on an absent table.
+ */
+unsigned int shmem_comp_truncate_range(struct inode *inode, pgoff_t start,
+				       pgoff_t end)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa = READ_ONCE(info->comp_entries);
+	unsigned int freed = 0;
+	unsigned long index = start;
+	void *entry;
+
+	if (!xa || start >= end)
+		return 0;
+
+	/* One truncator per inode (i_rwsem / evict), so no second clearer to
+	 * serialise against.  xa_find/xa_find_after is the safe
+	 * erase-during-iterate pattern: clear the current slot, then continue
+	 * from the next present entry. */
+	entry = xa_find(xa, &index, end - 1, XA_PRESENT);
+	while (entry) {
+		if (xa_is_value(entry)) {
+			unsigned int id, gen;
+
+			shmem_comp_unpack(entry, &id, &gen);
+			xa_store(xa, index, NULL, GFP_KERNEL);
+			freed += shmem_comp_entry_drop(inode, id, gen);
+		}
+		entry = xa_find_after(xa, &index, end - 1, XA_PRESENT);
+	}
+	return freed;
+}
+
+/*
+ * shmem_comp_entries_destroy - free an inode's entries[] and the table
  * @inode: shmem inode being evicted
  *
- * Called from shmem_evict_inode() after truncate.  The table holds plain
- * ids (Phase-1 shadow: no references), so xa_destroy + kfree is all that
- * is needed; the slot path owns the entry lifetimes.  Safe on NULL (most
- * inodes never compress, so the table is never allocated).
+ * Called from shmem_evict_inode() after truncate.  shmem_comp_truncate_range()
+ * has normally already emptied the table; this is the safety net that
+ * frees any straggler so no compressed block outlives its inode (the
+ * shmem swapped recalc is skipped -- the inode is going away).  Safe on
+ * NULL (most inodes never compress, so the table is never allocated).
  */
 void shmem_comp_entries_destroy(struct inode *inode)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct xarray *xa;
+
+	shmem_comp_truncate_range(inode, 0, (pgoff_t)-1);
 
 	xa = xchg(&info->comp_entries, NULL);
 	if (xa)
@@ -3575,7 +3717,6 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 {
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
-	swp_entry_t comp_entry;
 	void *src, *comp_buf;
 	unsigned int comp_len;
 	unsigned int id;
@@ -3663,29 +3804,30 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 		folio_unlock(folio);
 		return -ENOMEM;
 	}
-	comp_entry = make_shmem_comp_entry(id, gen);
+	/* A modified both-state folio still names its (now stale)
+	 * compressed copy; free it here -- the compress point is the
+	 * single choke point that overwrites entries[index], so this
+	 * keeps a re-compressed page from leaking its old entry (and
+	 * drops that entry's swapped charge). */
+	shmem_recalc_inode(inode, 0,
+			   -(long)shmem_comp_invalidate_index(inode, index));
 
 	/*
 	 * Compressed slots are accounted like swap pages: raise
-	 * swapped before the slot swap lowers nrpages, so a racing
+	 * swapped before the slot clear lowers nrpages, so a racing
 	 * shmem_recalc_inode() never sees the page as freed (the
 	 * same ordering shmem_writeout() relies on). Pairs with the
-	 * -nr_swaps_freed recalc at the end of shmem_undo_range(),
-	 * which restores the charge when the slot is truncated.
+	 * -freed recalc at the end of shmem_undo_range(), which
+	 * restores the charge when the entry is truncated.
 	 */
 	shmem_recalc_inode(inode, 0, 1);
 
-	/*
-	 * Atomically swap the folio for the compression entry in the
-	 * page cache xarray. shmem_delete_from_page_cache() replaces
-	 * the slot under xa_lock and drops the page cache's reference
-	 * to the folio; the caller keeps its own reference.
-	 */
-	shmem_delete_from_page_cache(folio, swp_to_radix_entry(comp_entry));
-
-	/* Phase-1 shadow: record the id in the per-inode entries[] table
-	 * alongside the authoritative slot.  Failure only omits the shadow. */
-	shmem_comp_entries_set(inode, index, id);
+	/* Two-table mapping: clear i_pages[index] (the folio leaves the
+	 * page cache; the caller keeps its own reference) and record the
+	 * compressed entry in entries[index].  The compressed mapping
+	 * lives in entries[] now, not in the page cache. */
+	shmem_delete_from_page_cache(folio, NULL);
+	shmem_comp_entries_set(inode, index, id, gen);
 
 	/* Update accounting */
 	atomic_long_inc(&sbinfo->comp->pages);
