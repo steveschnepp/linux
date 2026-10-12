@@ -91,48 +91,81 @@ minimal.
 ```
 write_end:   shmem_comp_should_compress(inode)
                -> shmem_compress_folio(inode, index, folio)   [after unlock]
-read/fault:  shmem_get_folio -> xa_is_shmem_comp(slot)
-               -> shmem_decompress_folio(...)                  [replaces slot]
-eviction:    shmem_free_swap -> shmem_comp_free_swap(slot)     [release entry]
-truncate:    shmem_undo_range -> slot release                  [drop ref]
+read/fault:  shmem_get_folio -> i_pages[N] empty but entries[N] set
+               -> shmem_decompress_folio(...)   [folio set, entries[N] KEPT]
+reclaim:     release_folio -> drop folio, keep entries[N]  [compressed survives]
+modify:      write to a cached folio -> free entry, clear entries[N]
+truncate:    shmem_undo_range -> clear i_pages[N] + entries[N]  [drop ref]
 put_super:   shmem_comp_put_super(sbinfo)                      [destroy pool]
 show_options:shmem_comp_show_options(seq, sbinfo)              [/proc/mounts truth]
 ```
 
-### The xarray encoding (the load-bearing decision)
+### The two-table mapping (the load-bearing decision)
 
-tmpfs's page cache xarray already holds folio pointers and swap entries. A
-compressed page is a third slot kind: a small `{id, gen}` pair stored as an
-`xa_value` using a reserved swap type, `SWP_SHMEM_COMPRESS`. The heavy
-metadata (zsmalloc handle, length, refcounts) lives in a global ID table in
-`shmem_compress.c`, not in the xarray, because zsmalloc handles are kernel
-pointers and cannot be packed into an xarray value.
+A compressed page must be representable as **compressed, uncompressed, or
+both** -- never compressed-XOR-uncompressed. That distinction is what lets a
+read materialize an uncompressed folio while the compressed entry survives, so
+reclaim can drop the folio and a later read re-decompresses. A single slot
+cannot hold "both", so the mapping is two parallel tables, same `pgoff_t`
+index space:
 
 ```
-slot value = make_shmem_comp_entry(id, gen)   // {id,gen} in a SWP_SHMEM_COMPRESS value
-global table[id] -> { handle (zs_malloc), length, nr_pages, refs, slots, gen }
+mapping->i_pages[N]   -> folio       (the existing page cache; NULL = no folio)
+comp->entries[N]      -> entry id    (new per-inode xarray; 0 = no compressed copy)
 ```
 
-The `{id, gen}` packing (23-bit id, 32-bit gen in a 55-bit swp_entry) and the
-generation validation are in `include/linux/swapops.h`. Generation is the
-incarnation stamp: a stale slot (entry freed by truncate, id recycled by a
-rewrite) is rejected by `shmem_comp_entry_get_gen()` without touching the new
-incarnation and counted in `stale_value_retries`.
+`i_pages` *is* the folio table -- the MM (fault path, `filemap`, truncate)
+operates on it and it cannot be replaced. `entries` is new, lazily allocated
+per inode (only when the inode first compresses a page, so uncompressed files
+pay ~nothing). Both are keyed by the same page index, so `entries[N]` is the
+compressed backing for exactly `i_pages[N]`'s page N. The heavy metadata
+(zsmalloc handle, length, refcounts) still lives in a global ID table in
+`shmem_compress.c`; `entries[N]` holds only the small id.
 
-### Two-counter refcounting
+This replaces -- and **removes** -- the earlier design where a compressed page
+was a third slot kind in `i_pages`: a `{id, gen}` pair packed into an `xa_value`
+under a reserved swap type, `SWP_SHMEM_COMPRESS`, multiplexed alongside folios
+and real swap entries. That encoding was flagged as the single biggest
+upstream review risk (a reserved swap type colliding with real swap entries or
+a future pte-marker scheme). The two-table mapping dissolves it: the
+compressed mapping lives in its own per-inode xarray, not in the page cache. A
+private per-inode map alongside the page cache is *more* orthodox FS design
+(btrfs extent maps, f2fs node maps) than the multiplexing it replaces, and
+there is no reserved swap type, no `swp_entry` packing, no type-tagging.
 
-Each compressed page's entry carries two counters:
+### Page lifecycle (the "both" state)
 
-- **slots** -- page-cache xarray slots pointing at the entry; one per merged
-  group member (v1: always 1).
-- **refs** -- slots plus temporary reader pins taken during decompression.
+The compressed entry is durable; the uncompressed folio is a reclaimable
+cache of it. A page is in one of these states, and the two tables make each
+transition a single independent write (no slot flip):
 
-The separation exists because a reader must pin the entry before loading from
-storage, but truncate can clear the reader's slot concurrently. With one
-counter, truncate could free the entry mid-decompress; with two, truncate
-decrements only `slots` and the reader's pin on `refs` keeps the entry alive
-until decompress completes. The entry frees its zsmalloc block when `refs`
-reaches zero, by whichever of release/put gets there first.
+```
+write        i_pages[N]=folio(dirty)  entries[N]=0        uncompressed
+GC compress  i_pages[N]=0             entries[N]=id       compressed (folio freed)
+read         i_pages[N]=folio         entries[N]=id       BOTH (entry kept)
+reclaim      i_pages[N]=0             entries[N]=id       compressed (folio dropped)
+read again   i_pages[N]=folio         entries[N]=id       BOTH (re-decompress)
+modify       i_pages[N]=folio(dirty)  entries[N]=0        uncompressed (id freed, stale)
+```
+
+Each axis is independent: reclaim clears `i_pages[N]` and leaves `entries[N]`
+alone; invalidate-on-write clears `entries[N]` and leaves `i_pages[N]` alone.
+A dirty folio must have `entries[N]==0` (its compressed copy, if any, is
+stale); a clean folio may have `entries[N]` set (it is a cache of that entry).
+
+**The cost, stated honestly:** a hot compressed page occupies the folio (4K)
+*and* the compressed blob (~2K) = ~6K, marginally more than uncompressed alone.
+Under pressure the uncompressed folios are reclaimable and drop to
+compressed-only, so the steady state degrades to ~2K/page + the hot set. For
+tmpfs at or beyond RAM (the target regime) the reclaimable property is worth
+far more than the hot-page premium -- it is the write path's "unconditional
+compression buys survival" thesis extended to reads, and it is what makes
+reading a >RAM tmpfs work at all.
+
+**Accounting:** shmem charges `alloced == nrpages + swapped`. A hot compressed
+page is both a page-cache folio and a compressed blob, so the accounting must
+say so honestly and reclaim must uncharge the folio on drop without losing the
+entry's charge. This is priced under Risks.
 
 ### Compression path (write end)
 
@@ -151,22 +184,47 @@ shmem_comp_compress_one(inode, index, folio):
   comp_len = shmem_comp_compress(pool, src, PAGE_SIZE, dst, &cap)
   if comp_len did not shrink: skip       // store raw, no decompress cycle
   handle = shmem_comp_store(pool, dst, comp_len)     // zs_malloc
-  id = shmem_comp_entry_alloc(pool, handle, comp_len, 1, ..., &gen)
-  slot = make_shmem_comp_entry(id, gen)
-  replace the folio's xarray slot with slot; free the uncompressed folio
+  id = shmem_comp_entry_alloc(pool, handle, comp_len, 1, ...)
+  xa_store(comp->entries, index, id)     // entries[N] = id
+  free the uncompressed folio; clear i_pages[N]
 ```
 
 The raw/compressed discriminator is the stored length: a block that did not
 shrink is stored raw and never pays a decompress cycle on read. Compression
 runs after `folio_unlock` so the write is already visible; the folio is freed
-once its slot is swapped.
+once `entries[N]` is set. Result: `entries[N]=id`, `i_pages[N]=NULL` --
+compressed-only.
 
 ### Decompression path (read / fault)
 
-`shmem_get_folio()` finds an `xa_is_shmem_comp` slot, pins the entry with
-generation validation, decompresses into a fresh folio, and swaps the slot
-back to the folio pointer. A stale slot (generation mismatch) is treated as
-"entry vanished" and the lookup is retried.
+`shmem_get_folio()` finds `i_pages[N]` empty but `entries[N]=id`, pins the
+entry, decompresses into a fresh folio, and sets `i_pages[N]=folio` **without
+clearing `entries[N]`** -- this is the "both" state. The entry stays alive,
+so reclaim can later drop the folio and a subsequent read re-decompresses. A
+stale id (entry freed by truncate, id recycled) is rejected by a generation
+check on the entry and the lookup is retried.
+
+### Invalidation on modify
+
+A write to a folio whose `entries[N]` is set makes the compressed copy stale:
+the write frees the entry, clears `entries[N]`, and the dirty folio becomes
+the sole copy. GC re-compresses it later. This keeps the invariant *dirty
+folio implies `entries[N]==0`*.
+
+### Two-counter refcounting
+
+Each compressed page's entry carries two counters:
+
+- **entries-ref** -- one per `entries[N]` naming the id (the durable
+  reference; v1: always 1).
+- **refs** -- that plus temporary reader pins taken during decompression.
+
+The separation exists because a reader must pin the entry before loading from
+storage, but truncate can clear `entries[N]` concurrently. With one counter,
+truncate could free the entry mid-decompress; with two, truncate decrements
+only the entries-ref and the reader's pin on `refs` keeps the entry alive
+until decompress completes. The entry frees its zsmalloc block when `refs`
+reaches zero, by whichever of release/put gets there first.
 
 ### Pool and compression contexts
 
@@ -235,11 +293,15 @@ block device.
 |---|---|
 | `fs/Kconfig` | `CONFIG_TMPFS_COMPRESSION` (bool, default n, depends TMPFS) selecting `CRYPTO` acomp + lz4, `ZSMALLOC` |
 | `mm/Makefile` | `shmem_compress.o` (and `cell_store.o` in the arm-3 phase) |
-| `mm/shmem.c` | the ~16 hook hunks (write_end, get_folio, free_swap, undo_range, put_super, show_options) + 3 fs_parameters |
-| `mm/shmem_compress.c` | the core: pool, entry table, data path, stats, sysfs |
+| `mm/shmem.c` | the ~16 hook hunks (write_end, get_folio, release_folio, undo_range, put_super, show_options) + 3 fs_parameters |
+| `mm/shmem_compress.c` | the core: pool, entry table, `entries[]` per-inode map, data path, stats, sysfs |
 | `include/linux/shmem_compress.h` | v1 API with the ownership contracts |
-| `include/linux/swap.h`, `swapops.h` | `SWP_SHMEM_COMPRESS` type + `{id,gen}` packing |
 | `include/linux/shmem_fs.h`, `mm/internal.h` | plumbing (no exports; `shmem.c` and `shmem_compress.c` link into the same image) |
+
+The two-table mapping **removes** the earlier `SWP_SHMEM_COMPRESS` /
+`swapops.h` `{id,gen}`-in-swp_entry encoding: the compressed mapping lives in
+the per-inode `entries[]` xarray, not multiplexed into the page cache. No
+reserved swap type, no `swp_entry` packing.
 
 ### File manifest
 
@@ -250,7 +312,6 @@ block device.
 | `mm/cell_store.c` | Later phase | cell bulk-tier backend (arm 3) |
 | `mm/shmem.c` | Modify | hook hunks + 3 mount options |
 | `include/linux/shmem_compress.h` | Modify | v1 API |
-| `include/linux/swap.h`, `swapops.h` | Modify | `SWP_SHMEM_COMPRESS` + `{id,gen}` |
 | `include/linux/shmem_fs.h`, `mm/internal.h`, `mm/Makefile`, `fs/Kconfig` | Modify | plumbing |
 | `Documentation/filesystems/tmpfs.rst` | Modify | mount options + `comp_stats` docs (Sphinx-verify) |
 | `tools/testing/selftests/tmpfs/` | Create | port the s1 smoke gate + remount-cycle gate |
@@ -265,23 +326,30 @@ below are the *remaining* path to upstream, plus the arm-3 payload.
 options, eager write-end compression, read-only stats, graceful pool failure.
 Gate: `test_s1_smoke` 6/6.
 
-**Phase 2 -- memory-failure answer.** A memory-failure hook for
-`SWP_SHMEM_COMPRESS` entries (the hook surface is known; a standing s1 item).
-Keeps the build green; a corrupted compressed entry must not poison a read.
+**Phase 2 -- the two-table mapping + "both" lifecycle.** Implement `entries[]`,
+the compressed/uncompressed/both states, the entry pin via `entries[N]`,
+write-invalidate, and reclaim drop-folio-keep-entry. Remove the
+`SWP_SHMEM_COMPRESS` swap-type encoding. Gate: the 3G/2G read-back works on a
+plain `read()` (no OOM), plus the existing smoke/remount gates.
 
-**Phase 3 -- in-tree selftests.** Port `test_s1_smoke` + the remount-cycle
+**Phase 3 -- memory-failure answer.** A memory-failure hook for compressed
+entries (the hook surface is known; a standing s1 item). Keeps the build
+green; a corrupted compressed entry must not poison a read.
+
+**Phase 4 -- in-tree selftests.** Port `test_s1_smoke` + the remount-cycle
 gate into `tools/testing/selftests/`. The zbench methodology ports.
 
-**Phase 4 -- docs.** Port the rst to v1's exact surface (3 options,
+**Phase 5 -- docs.** Port the rst to v1's exact surface (3 options,
 `comp_stats`), Sphinx-verify (blocked on no-install in the environment).
 
-**Phase 5 -- RFC assembly (local until posted).** Cut the fine-grained series
-from the branch: prep -> encoding -> dormant core -> decompress -> compress ->
-truncate release -> options -> mf handling -> stats -> selftests -> docs.
-Cover letter front-loads the `SWP_SHMEM_COMPRESS`-vs-pte-marker question and
-the arm 1/2 rationalization table.
+**Phase 6 -- RFC assembly (local until posted).** Cut the fine-grained series
+from the branch: prep -> two-table mapping -> dormant core -> decompress ->
+compress -> truncate release -> options -> mf handling -> stats -> selftests
+-> docs. The two-table mapping means the RFC **no longer carries a reserved
+swap type**, removing the encoding question from the cover letter; it leads
+with the arm 1/2 rationalization table.
 
-**Phase 6 -- arm 3, the cell bulk tier (payload; parallel track).** Add the
+**Phase 7 -- arm 3, the cell bulk tier (payload; parallel track).** Add the
 cell backend to the pool, drive it through `test_zbench` with the three named
 improvement targets. Separate series, after v1 has a shape.
 
@@ -290,7 +358,9 @@ improvement targets. Separate series, after v1 has a shape.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | 1.9x write / 1.3x read CPU cost is a hard sell vs zram on CPU-bound boxes | Med | Med | The story targets the survival regime (64M-1G) where arm 1 dies; the 2G build boxes are honestly arm 1's home and get no work |
-| `SWP_SHMEM_COMPRESS` reusing the swap-type range collides with a real swap entry or a pte-marker scheme upstream | Med | High | The open `{id,gen}`-vs-pte-marker encoding question is front-loaded in the RFC; alternatives documented before posting |
+| A hot compressed page costs folio (4K) + blob (~2K) = ~6K, more than uncompressed alone | Med | Med | The uncompressed folio is reclaimable (the entry survives), so under pressure it drops to compressed-only; the steady state is ~2K/page + the hot set. Priced in the Motivation as the survival trade |
+| The `entries[]` + folio double-charge confuses shmem's `alloced == nrpages + swapped` accounting | Med | High | Compress charges `swapped` (the blob) and the folio charges `nrpages`; reclaim uncharges the folio on drop without losing the entry's charge. Verified in the Phase-2 gate with an accounting assertion |
+| `entries[N]` staleness: a reader that pinned an id while truncate cleared it could act on a recycled id | Low | High | A generation on the entry (validated at pin time) rejects the stale id; simpler than the old value-encoding but not zero |
 | Stats-as-gauges misread by reviewers as "compression did not run" | High | Low | Documented in the rst and the sysfs help; live-sampling rule stated at every snapshot |
 | Large-folio / THP tmpfs silently uncompressed | Med | Low | Explicit `folio_order` skip in v1; a documented limitation, not a silent one |
 | Cell tier (arm 3) does not beat zsmalloc on the bench, orphaning the payload | Med | High | Arm 3 is driven through `test_zbench` before any blind cell change (session-33 rule); the verdict is measured, and parking is an accepted outcome (cellzram precedent) |
@@ -298,9 +368,14 @@ improvement targets. Separate series, after v1 has a shape.
 
 ### Open Questions
 
-- **Encoding at upstream:** `{id,gen}` in a `SWP_SHMEM_COMPRESS` value vs a
-  pte-marker-style encoding. The single biggest review risk; resolved before
-  the RFC by documenting both against mainline's swap/pte-marker direction.
+- **The `entries[]` staleness generation** -- whether a full generation
+  counter is needed or a lighter epoch suffices, given `entries[]` is now a
+  dedicated table (not multiplexed with real swap entries). Pinned down during
+  the Phase-2 implementation.
+- **Hot-page premium tuning** -- whether to proactively drop clean cached
+  folios under low pressure (not just at the reclaim watermark) to keep the
+  uncompressed footprint near the hot set. Deferred until the Phase-2 numbers
+  exist.
 - **Arm-3 backend value:** does the cell tier beat zsmalloc on the target
   fleet, measured? Determines whether arm 3 is a second series or parked.
 - **Threshold default:** the v1 `compress_threshold` default (1 = compress
@@ -314,6 +389,9 @@ improvement targets. Separate series, after v1 has a shape.
   7.3-rc6; the source of truth for the code described here.
 - `mission_log/2026-10-11_upstream-s1-reimplementation.md` -- the v1 slice,
   its build/gate state, and the standing s1 items.
+- `mission_log/2026-10-12_fill-test-and-two-table-mapping.md` -- the fill
+  test, the read-back OOM, and the two-table mapping decision (the source of
+  the "both" lifecycle and the removal of the swap-type encoding).
 - `mission_log/2026-10-11_ztmpfs-rationalization-bench.md` -- the 3-arm bench,
   the arm 1/2 numbers in Motivation, the stats-as-gauges and non-KASAN rules.
 - `mission_log/2026-10-11_openwrt-refocus.md` -- the fleet, the refocus on
@@ -326,3 +404,5 @@ improvement targets. Separate series, after v1 has a shape.
   discipline behind `blkzcell` (`specs/01_BLKZCELL_NAND_LAYER.md`).
 - `specs/01_BLKZCELL_NAND_LAYER.md` -- the companion block layer for
   SD/MMC; shares the cell-allocator concept, no code path.
+- `specs/03_ZTMPFS_ZCELL_FUSION.md` -- arm 3; inherits this page lifecycle and
+  the two-table mapping.
