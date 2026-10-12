@@ -1049,6 +1049,21 @@ static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 static atomic64_t shmem_comp_gen_counter = ATOMIC64_INIT(0);
 static atomic64_t shmem_comp_stale_retries;
 
+/*
+ * GC drain strategy (reverse index vs full entry-table scan).
+ *
+ * The reverse index (specs/04) makes a drain O(entries in the victim)
+ * instead of O(total entries).  This knob exists for the A/B perf
+ * measurement: 0 restores the old xa_for_each full scan so both drains
+ * run on the same kernel and can be toggled at runtime via
+ * /sys/module/shmem_compress/parameters/gc_use_index.  Default 1 (the
+ * index); the full-scan path is kept only as the comparison baseline.
+ */
+static bool gc_use_index = true;
+module_param(gc_use_index, bool, 0644);
+MODULE_PARM_DESC(gc_use_index,
+		 "cell GC drain uses the reverse index (default Y; N = full entry-table scan)");
+
 
 /*
  * Entry lookup and reference discipline.
@@ -1402,11 +1417,73 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
  * callers use as a stop signal so a re-linked victim is not re-harvested
  * forever.
  */
+/*
+ * shmem_comp_drain_victim_scan - the pre-index full-table drain
+ * @pool: cell-backed compression pool
+ * @vic: victim cell, held for write by the caller
+ *
+ * The original drain: walk the WHOLE entry table to find the entries whose
+ * handle names @vic.  O(total entries) per victim.  Kept ONLY as the A/B
+ * baseline for gc_use_index=0 (specs/04 Phase 4); the reverse-index drain
+ * is the real path.  The relocate step moves the reverse-index node too, so
+ * the index stays correct even while this scan path is selected.
+ */
+static unsigned int shmem_comp_drain_victim_scan(struct shmem_comp_pool *pool,
+						 struct cell *vic)
+{
+	struct cell_pool *cp = pool->cells;
+	unsigned int moved = 0;
+	unsigned long id;
+	struct shmem_comp_entry *ent;
+
+	xa_for_each(&shmem_comp_entries, id, ent) {
+		unsigned long h;
+		u32 cellid, offset;
+		unsigned int len;
+		u32 nc, no;
+		int ret;
+
+		if (ent->pool != pool)
+			continue;
+		h = READ_ONCE(ent->handle);
+		if (!h)
+			continue;
+		shmem_comp_unpack_loc(h, &cellid, &offset);
+		if (cellid != vic->cellid)
+			continue;
+		if (!atomic_inc_not_zero(&ent->refs))
+			continue;
+		len = ent->length;
+		if (offset + len > (1UL << cp->cell_order) * PAGE_SIZE) {
+			shmem_comp_entry_put(id);
+			continue;
+		}
+		ret = cell_relocate_one(cp, vic, vic->base + offset, len,
+					&nc, &no);
+		if (ret == 0) {
+			WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
+			if (pool->use_cells) {
+				spin_lock(&pool->index_lock);
+				list_move_tail(&ent->cell_node,
+					       &pool->cell_index[nc]);
+				spin_unlock(&pool->index_lock);
+			}
+			moved++;
+		}
+		shmem_comp_entry_put(id);
+	}
+	return moved;
+}
+
 static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 					    struct cell *vic)
 {
 	struct cell_pool *cp = pool->cells;
 	unsigned int moved = 0;
+
+	/* A/B baseline: the old full-table scan, when gc_use_index=0. */
+	if (!gc_use_index)
+		return shmem_comp_drain_victim_scan(pool, vic);
 
 	/*
 	 * Reverse-index drain: walk pool->cell_index[vic->cellid], not the
