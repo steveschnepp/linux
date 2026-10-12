@@ -182,6 +182,25 @@ struct shmem_comp_pool {
 	 * is the number a headroom sweep needs.
 	 */
 	atomic64_t gc_recoveries;
+	/*
+	 * Reverse index (cell-backed pools only): one entry list per
+	 * directory slot, so GC drains a victim by walking its own cells
+	 * instead of the whole entry table.  cell_index is an array of
+	 * cp->nslots list heads, allocated only when use_cells.  Every
+	 * live cell-backed entry sits on cell_index[cellid] (from its
+	 * handle's cellid) for its whole life -- alloc links, free
+	 * unlinks, GC relocate moves.  A live entry missing from its
+	 * cell's list is invisible to GC and leaks the cell, so the three
+	 * mutations are exhaustive by construction.
+	 *
+	 * index_lock is a SINGLE leaf spinlock guarding all list ops.  It
+	 * is never held across an alloc, memcpy, cell_free(), or
+	 * cell_relocate_one(); lock order is gc_lock -> cell rwsem ->
+	 * index_lock, and the alloc/free paths take it with no other lock
+	 * held.  See specs/04_GC_REVERSE_INDEX.md.
+	 */
+	struct list_head *cell_index;
+	spinlock_t index_lock;
 	struct list_head list;			/* global pools list */
 };
 
@@ -337,6 +356,29 @@ static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
  * The pool is added to the global list for tracking.
  * Callers must call shmem_comp_pool_put() when done.
  */
+/*
+ * shmem_comp_pool_cells_teardown - free the cell backend + reverse index
+ * @pool: pool whose cell storage (if any) is being torn down
+ *
+ * Frees the reverse index, its lock's lists' backing array, the cell pool,
+ * and its shrinker, in that order.  Idempotent on a pool that never had cell
+ * storage (both fields NULL): the create() failure paths call this on the
+ * zsmalloc branch too, where both are NULL and it is a no-op.  This is the
+ * single teardown point for the cell backend so the create() failure paths
+ * and pool_destroy() cannot drift apart.
+ */
+static void shmem_comp_pool_cells_teardown(struct shmem_comp_pool *pool)
+{
+	if (pool->cells && pool->cells->shrinker)
+		shrinker_free(pool->cells->shrinker);
+	kvfree(pool->cell_index);
+	pool->cell_index = NULL;
+	if (pool->cells)
+		cell_pool_destroy(pool->cells);
+	pool->cells = NULL;
+	pool->use_cells = false;
+}
+
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
 						unsigned int nr_cells)
@@ -374,6 +416,29 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 		}
 		pool->use_cells = true;
 		pool->zs_pool = NULL;
+
+		/*
+		 * Reverse index: one entry list per directory slot, sized
+		 * to the cell pool's nslots (known only now, after
+		 * cell_pool_create).  Init every head and the single leaf
+		 * lock that guards them.
+		 */
+		spin_lock_init(&pool->index_lock);
+		pool->cell_index = kvcalloc(pool->cells->nslots,
+					   sizeof(*pool->cell_index),
+					   GFP_KERNEL);
+		if (!pool->cell_index) {
+			pr_warn("shmem_comp: cell_index alloc failed\n");
+			cell_pool_destroy(pool->cells);
+			kfree(pool);
+			return ERR_PTR(-ENOMEM);
+		}
+		{
+			u32 s;
+
+			for (s = 0; s < pool->cells->nslots; s++)
+				INIT_LIST_HEAD(&pool->cell_index[s]);
+		}
 
 		/*
 		 * Register the shrinker: sparse cells are reclaimed
@@ -414,6 +479,7 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 	pool->pcpu = alloc_percpu(struct shmem_comp_pcpu);
 	if (!pool->pcpu) {
 		zs_destroy_pool(pool->zs_pool);
+		shmem_comp_pool_cells_teardown(pool);
 		kfree(pool);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -434,6 +500,7 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 			}
 			free_percpu(pool->pcpu);
 			zs_destroy_pool(pool->zs_pool);
+			shmem_comp_pool_cells_teardown(pool);
 			kfree(pool);
 			return ERR_PTR(ret);
 		}
@@ -482,11 +549,7 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 	}
 
 	/* Destroy storage pool */
-	if (pool->cells) {
-		if (pool->cells->shrinker)
-			shrinker_free(pool->cells->shrinker);
-		cell_pool_destroy(pool->cells);
-	}
+	shmem_comp_pool_cells_teardown(pool);
 	if (pool->zs_pool)
 		zs_destroy_pool(pool->zs_pool);
 
@@ -986,6 +1049,7 @@ static DEFINE_XARRAY_FLAGS(shmem_comp_entries, XA_FLAGS_ALLOC);
 static atomic64_t shmem_comp_gen_counter = ATOMIC64_INIT(0);
 static atomic64_t shmem_comp_stale_retries;
 
+
 /*
  * Entry lookup and reference discipline.
  *
@@ -1027,6 +1091,26 @@ static void shmem_comp_entry_free(unsigned int id)
 	if (ent->handles)
 		atomic_long_sub(ksize(ent->handles),
 				 &shmem_comp_ram_merged_bytes);
+
+	/*
+	 * Reverse index: unlink from the owning cell's list BEFORE
+	 * releasing storage.  cell_free() may return the cell to the
+	 * buddy synchronously and the slot be reused as a new cell; a
+	 * stale node left on cell_index[cellid] would then point at a
+	 * freed entry from a slot that now names different data, and the
+	 * next GC walk of that list would touch freed memory.  Unlinking
+	 * first closes that window.  Only the refs==0 thread runs here
+	 * (dec_and_test + xa_erase guard), so no other thread can be
+	 * unlinking this node concurrently.  Zsmalloc entries were never
+	 * linked (cell_node stays an initialised singleton) -- list_del
+	 * on an unlinked node is a no-op by INIT, but we guard on
+	 * use_cells to keep the intent explicit and skip the lock.
+	 */
+	if (ent->pool->use_cells) {
+		spin_lock(&ent->pool->index_lock);
+		list_del(&ent->cell_node);
+		spin_unlock(&ent->pool->index_lock);
+	}
 
 	/*
 	 * Release the backing storage.  Cell storage needs the block
@@ -1135,6 +1219,29 @@ void shmem_comp_entry_put(unsigned int id)
 	shmem_comp_entry_free(id);
 }
 
+/*
+ * shmem_comp_entry_put_ptr - drop a pin taken by pointer
+ * @ent: entry the caller pinned via atomic_inc_not_zero
+ *
+ * The reverse-index GC drain walks cell_index and pins entries by
+ * pointer (no id in hand, and no xa_load per entry -- that is the whole
+ * point of the index).  This drops such a pin.  Because the caller holds
+ * a live pin, refs >= 1 on entry, so the entry and its stored id are
+ * stable: the dec_and_test -> 0 path may drive teardown via ent->id,
+ * which names the same table slot the entry still occupies (only GC
+ * relocates, and gc_lock serialises that against this put).
+ */
+static void shmem_comp_entry_put_ptr(struct shmem_comp_entry *ent)
+{
+	if (!atomic_dec_and_test(&ent->refs)) {
+		if (unlikely(atomic_read(&ent->refs) < 0))
+			panic("shmem_comp: entry %u refs underflow -- "
+			      "reference accounting corrupted", ent->id);
+		return;
+	}
+	shmem_comp_entry_free(ent->id);
+}
+
 bool shmem_comp_entry_release(unsigned int id, unsigned int gen)
 {
 	struct shmem_comp_entry *ent;
@@ -1219,6 +1326,7 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 		kfree(ent);
 		return 0;
 	}
+	ent->id = id;
 
 	/* Live RAM footprint: slab-rounded entry + handle array size */
 	atomic_inc(&shmem_comp_ram_entries);
@@ -1226,6 +1334,27 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
 	if (handles)
 		atomic_long_add(ksize(handles),
 				 &shmem_comp_ram_merged_bytes);
+
+	/*
+	 * Reverse index: link onto the owning cell's list so GC can find
+	 * this block without scanning the whole entry table.  Only cell-
+	 * backed pools index; zsmalloc entries leave cell_node unlinked
+	 * (their compaction is internal to zsmalloc).  Runs after xa_alloc
+	 * so the entry is reachable by id, before return so the invariant
+	 * "every live cell entry is on its cell's list" holds from the
+	 * moment the entry can be seen.  The handle's cellid is the list
+	 * index; it is stable for the entry's life here (only GC relocates,
+	 * and gc_lock serialises that against this alloc).
+	 */
+	INIT_LIST_HEAD(&ent->cell_node);
+	if (pool->use_cells) {
+		u32 cellid, offset;
+
+		shmem_comp_unpack_loc(handle, &cellid, &offset);
+		spin_lock(&pool->index_lock);
+		list_add_tail(&ent->cell_node, &pool->cell_index[cellid]);
+		spin_unlock(&pool->index_lock);
+	}
 
 	if (gen)
 		*gen = g;
@@ -1278,46 +1407,105 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 {
 	struct cell_pool *cp = pool->cells;
 	unsigned int moved = 0;
-	unsigned long id;
-	struct shmem_comp_entry *ent;
 
-	xa_for_each(&shmem_comp_entries, id, ent) {
+	/*
+	 * Reverse-index drain: walk pool->cell_index[vic->cellid], not the
+	 * whole entry table.  This is O(entries in the victim), not
+	 * O(total entries) -- the point of the index (specs/04).
+	 *
+	 * Per iteration we detach ONE live entry, relocate it outside the
+	 * lock, then either move it to the destination list (success) or
+	 * put it back and stop (failure).  We cannot "put back and
+	 * continue" like the old xa_for_each did: re-adding to the head
+	 * list would re-find the same entry next scan and spin.  So a
+	 * failure stops the drain; the entry stays reachable on the
+	 * victim's list for a later pass, and cell_gc's moved==0 stop
+	 * signal bounds the non-progress case.
+	 */
+	for (;;) {
+		struct shmem_comp_entry *ent = NULL, *iter;
 		unsigned long h;
-		u32 cellid;
-		u32 offset;
+		u32 cellid, offset;
 		unsigned int len;
-		u32 nc;
-		u32 no;
+		u32 nc, no;
 		int ret;
 
-		if (ent->pool != pool)
-			continue;
+		/*
+		 * Detach the first LIVE entry on the victim's list.  Under
+		 * index_lock so a concurrent entry_free() unlink (also under
+		 * index_lock) cannot yank a node out from under the walk.
+		 * A dying entry (pin fails) is left on the list: its own
+		 * entry_free() unlinks it and its cell_free() does the
+		 * live_bytes accounting -- GC need not touch dying entries.
+		 */
+		spin_lock(&pool->index_lock);
+		list_for_each_entry(iter, &pool->cell_index[vic->cellid],
+				    cell_node) {
+			if (atomic_inc_not_zero(&iter->refs)) {
+				list_del_init(&iter->cell_node);
+				ent = iter;
+				break;
+			}
+		}
+		spin_unlock(&pool->index_lock);
+		if (!ent)
+			break;	/* no live entries remain in this victim */
 
+		/*
+		 * Pinned (refs >= 1) and detached: the entry cannot be freed
+		 * and its handle cannot change under us (only GC relocates,
+		 * serialised by gc_lock).  The pin -- not the index_lock --
+		 * is what keeps vic->base valid across the memcpy below.
+		 */
 		h = READ_ONCE(ent->handle);
-		if (!h)
-			continue;	/* merged zsmalloc entry */
 		shmem_comp_unpack_loc(h, &cellid, &offset);
 
-		if (cellid != vic->cellid)
-			continue;
-
-		/* Pin: skip entries whose last reference is dropping */
-		if (!atomic_inc_not_zero(&ent->refs))
-			continue;
+		/* The reverse index is keyed by the handle's cellid, so a
+		 * live entry on this list must name this cell.  A violation
+		 * means the alloc/free/reloc linkage is broken; catch it
+		 * loudly rather than read the wrong cell's memory. */
+		VM_BUG_ON(cellid != vic->cellid);
 
 		len = ent->length;
 		if (offset + len > (1UL << cp->cell_order) * PAGE_SIZE) {
-			shmem_comp_entry_put(id);
-			continue;
+			/* Defensive: a live entry should never be too big for
+			 * its own cell (would mean corrupt accounting).  Put it
+			 * back and stop -- cannot loop-and-continue. */
+			spin_lock(&pool->index_lock);
+			list_add(&ent->cell_node,
+				 &pool->cell_index[vic->cellid]);
+			spin_unlock(&pool->index_lock);
+			shmem_comp_entry_put_ptr(ent);
+			break;
 		}
 
 		ret = cell_relocate_one(cp, vic, vic->base + offset, len,
 					&nc, &no);
-		if (ret == 0) {
-			WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
-			moved++;
+		if (ret) {
+			/* Relocate failed (directory full / ENOMEM).  Put the
+			 * entry back on the victim's list so it is not stranded
+			 * off-index, drop the pin, and stop. */
+			spin_lock(&pool->index_lock);
+			list_add(&ent->cell_node,
+				 &pool->cell_index[vic->cellid]);
+			spin_unlock(&pool->index_lock);
+			shmem_comp_entry_put_ptr(ent);
+			break;
 		}
-		shmem_comp_entry_put(id);
+
+		WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
+		/* Relink onto the destination cell's list: the handle now
+		 * names nc, so the "list == handle's cellid" invariant
+		 * requires the move. */
+		spin_lock(&pool->index_lock);
+		list_add_tail(&ent->cell_node, &pool->cell_index[nc]);
+		spin_unlock(&pool->index_lock);
+		moved++;
+
+		/* Drop our pin; may hit refs==0 -> entry_free unlinks from
+		 * the DESTINATION list (handle already updated), decrementing
+		 * nc's live_bytes -- correct. */
+		shmem_comp_entry_put_ptr(ent);
 	}
 	return moved;
 }

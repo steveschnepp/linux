@@ -108,6 +108,14 @@ struct shmem_comp_entry {
 	 * interpretation is stable for the lifetime of the entry.
 	 */
 	unsigned long handle;
+	/*
+	 * The xarray index this entry occupies in shmem_comp_entries,
+	 * assigned by xa_alloc().  Stable for the entry's life (a new
+	 * entry gets a fresh xa_alloc).  The GC drain walks the reverse
+	 * index by pointer and needs the id to drop its pin / drive the
+	 * refs==0 teardown without an xa_load per entry.
+	 */
+	unsigned int id;
 	unsigned int length;		/* compressed size in bytes */
 	unsigned short nr_pages;	/* pages merged into this block */
 	/*
@@ -153,6 +161,16 @@ struct shmem_comp_entry {
 	 * decompression.
 	 */
 	struct shmem_comp_pool *pool;
+	/*
+	 * Reverse-index linkage: which cell holds this block.  For
+	 * cell-backed pools only (zsmalloc entries leave it unlinked).
+	 * The block lives on pool->cell_index[cellid] for the whole time
+	 * its handle names that cell; alloc links it, free unlinks it,
+	 * GC relocate moves it.  Guarded by pool->index_lock.  The 16 B
+	 * cost is the price of O(entries-in-victim) GC instead of an
+	 * O(total-entries) table scan; see specs/04_GC_REVERSE_INDEX.md.
+	 */
+	struct list_head cell_node;
 	struct rcu_head rcu;
 };
 
