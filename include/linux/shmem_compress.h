@@ -455,6 +455,13 @@ void shmem_comp_note_unmap(struct inode *inode);
 void shmem_comp_free_swap(struct address_space *mapping, void *radswap);
 
 /*
+ * Eviction hook (shmem_evict_inode): free an inode's per-inode entries[]
+ * table (the two-table mapping, specs/02).  Safe on NULL (most inodes
+ * never compress).  Must run after truncate, which releases any slots.
+ */
+void shmem_comp_entries_destroy(struct inode *inode);
+
+/*
  * Compression data path (mm/shmem_compress.c), called from the three
  * dispatch sites in mm/shmem.c (write_end, get_folio_gfp) and from the
  * eviction hook.

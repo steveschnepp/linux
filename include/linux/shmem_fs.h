@@ -52,6 +52,23 @@ struct shmem_inode_info {
 	struct list_head        xattrs;		/* list of xattrs */
 	pgoff_t			fallocend;	/* highest fallocate endindex */
 	unsigned int		fsflags;	/* for FS_IOC_[SG]ETFLAGS */
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Per-inode reverse mapping: page index -> compressed entry id,
+	 * the "entries[]" table parallel to the page cache (i_pages) in the
+	 * two-table representation (specs/02).  A page can be compressed
+	 * (entries[N] set, i_pages[N] empty), uncompressed (i_pages[N] set,
+	 * entries[N] empty), or BOTH -- a decompressed folio caching a live
+	 * compressed entry, which is what lets reclaim drop the folio without
+	 * losing data.
+	 *
+	 * Lazily allocated: NULL until the inode first compresses a page, so
+	 * uncompressed inodes pay only this pointer.  Private to
+	 * mm/shmem_compress.c; shmem.c only passes the inode to the
+	 * compress/truncate/evict hooks.
+	 */
+	struct xarray		*comp_entries;
+#endif
 	atomic_t		stop_eviction;	/* hold when working on inode */
 #ifdef CONFIG_TMPFS_QUOTA
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];

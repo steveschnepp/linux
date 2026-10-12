@@ -95,6 +95,8 @@
 
 /* GC implementation lives after the entry table (needs the xarray) */
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool);
+static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
+				  unsigned int id);
 static unsigned long shmem_comp_cell_count(struct shrinker *shrinker,
 					   struct shrink_control *sc);
 static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
@@ -3221,6 +3223,9 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 	for (i = 0; i < nr; i++) {
 		shmem_delete_from_page_cache(folios[i],
 			swp_to_radix_entry(make_shmem_comp_entry(id, gen)));
+		/* Phase-1 shadow: one entry id covers the whole group, so
+		 * each index of the group records the same id. */
+		shmem_comp_entries_set(inode, folios[i]->index, id);
 		folio_unlock(folios[i]);
 		folio_put(folios[i]);
 	}
@@ -3500,6 +3505,71 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
  * - The compression pool is not available
  * - Memory allocation fails
  */
+
+/*
+ * shmem_comp_entries_set - record the compressed id for a page index
+ * @inode: shmem inode
+ * @index: page index
+ * @id: entry ID from shmem_comp_entry_alloc()
+ *
+ * Phase-1 of the two-table mapping (specs/02): populate the per-inode
+ * entries[] table alongside the authoritative {id,gen} page-cache slot.
+ * This is a SHADOW write -- nothing reads entries[] yet, and it holds no
+ * entry reference (the slot path owns that).  It exists so the plumbing
+ * (lazy per-inode xarray, lifecycle, evict) is proven under the full
+ * suite before the read path switches over in Phase 2.
+ *
+ * Returns 0; -ENOMEM if the lazy per-inode xarray could not be allocated
+ * (the shadow is then simply absent -- the slot remains authoritative, so
+ * this is not a correctness failure in Phase 1).
+ */
+static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
+				  unsigned int id)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa;
+	struct xarray *old;
+
+	xa = READ_ONCE(info->comp_entries);
+	if (!xa) {
+		xa = kmalloc(sizeof(*xa), GFP_KERNEL);
+		if (!xa)
+			return -ENOMEM;
+		xa_init(xa);
+		old = cmpxchg(&info->comp_entries, NULL, xa);
+		if (old) {
+			/* lost the lazy-init race; use the winner's */
+			kfree(xa);
+			xa = old;
+		}
+	}
+	/* Plain id as an xa_value; id 0 is never allocated, so 0/NULL =
+	 * no compressed copy.  No reference is taken here (Phase-1 shadow
+	 * only); the page-cache slot owns the entry's lifetime. */
+	xa_store(xa, index, xa_mk_value(id), GFP_KERNEL);
+	return 0;
+}
+
+/*
+ * shmem_comp_entries_destroy - free an inode's per-inode entries[] table
+ * @inode: shmem inode being evicted
+ *
+ * Called from shmem_evict_inode() after truncate.  The table holds plain
+ * ids (Phase-1 shadow: no references), so xa_destroy + kfree is all that
+ * is needed; the slot path owns the entry lifetimes.  Safe on NULL (most
+ * inodes never compress, so the table is never allocated).
+ */
+void shmem_comp_entries_destroy(struct inode *inode)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa;
+
+	xa = xchg(&info->comp_entries, NULL);
+	if (xa)
+		xa_destroy(xa);
+	kfree(xa);
+}
+
 static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 				   struct folio *folio, bool allow_clean)
 {
@@ -3612,6 +3682,10 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 	 * to the folio; the caller keeps its own reference.
 	 */
 	shmem_delete_from_page_cache(folio, swp_to_radix_entry(comp_entry));
+
+	/* Phase-1 shadow: record the id in the per-inode entries[] table
+	 * alongside the authoritative slot.  Failure only omits the shadow. */
+	shmem_comp_entries_set(inode, index, id);
 
 	/* Update accounting */
 	atomic_long_inc(&sbinfo->comp->pages);

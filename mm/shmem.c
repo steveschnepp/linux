@@ -1472,6 +1472,11 @@ static void shmem_evict_inode(struct inode *inode)
 		inode->i_size = 0;
 		mapping_set_exiting(inode->i_mapping);
 		shmem_truncate_range(inode, 0, (loff_t)-1);
+#ifdef CONFIG_TMPFS_COMPRESSION
+		/* Free the per-inode entries[] table after truncate has
+		 * released any slots.  NULL-safe (most inodes never compress). */
+		shmem_comp_entries_destroy(inode);
+#endif
 		if (!list_empty(&info->shrinklist)) {
 			spin_lock(&sbinfo->shrinklist_lock);
 			if (!list_empty(&info->shrinklist)) {
@@ -3148,6 +3153,9 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 		shmem_set_inode_flags(inode, info->fsflags, NULL);
 	INIT_LIST_HEAD(&info->shrinklist);
 	INIT_LIST_HEAD(&info->swaplist);
+#ifdef CONFIG_TMPFS_COMPRESSION
+	info->comp_entries = NULL;	/* lazy: alloc'd on first compress */
+#endif
 	cache_no_acl(inode);
 	if (sbinfo->noswap)
 		mapping_set_unevictable(inode->i_mapping);
