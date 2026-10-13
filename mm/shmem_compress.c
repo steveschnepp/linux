@@ -3673,6 +3673,26 @@ static unsigned int shmem_comp_invalidate_index(struct inode *inode,
 }
 
 /*
+ * shmem_comp_invalidate_write - a write made this page's compressed copy stale
+ *
+ * The write-invalidate (specs/02): a write to a folio that still has a
+ * surviving compressed backing (the "both" state) makes that backing
+ * stale, so free it -- the folio becomes the sole copy and write_end's
+ * recompress stores a fresh one.  This keeps the invariant "a dirty folio
+ * has no compressed backing" from the moment of the write, rather than
+ * only once the page happens to be re-compressed.  Called from
+ * shmem_write_begin() (process context, i_rwsem held), so the entry
+ * teardown and the swapped recalc are safe.
+ */
+void shmem_comp_invalidate_write(struct inode *inode, pgoff_t index)
+{
+	unsigned int freed = shmem_comp_invalidate_index(inode, index);
+
+	if (freed)
+		shmem_recalc_inode(inode, 0, -(long)freed);
+}
+
+/*
  * shmem_comp_truncate_range - free compressed entries in [start, end)
  *
  * The truncate hook (shmem_undo_range): clear every entries[] slot in the
@@ -3768,13 +3788,30 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 	 * folio may be under DMA. Order-0 only: the compress and
 	 * replace paths below assume a single page. write_end just
 	 * dirtied this folio; clean means the state changed under us
-	 * (allow_clean=false). The aging pass allows clean pages: a
-	 * decompressed-on-read survivor is exactly the cold data worth
-	 * re-compressing. Skipping is not an error: the page simply
-	 * stays uncompressed.
+	 * (allow_clean=false). The aging pass allows clean pages, but
+	 * skips a clean both-state folio (already compressed, below).
+	 * Skipping is not an error: the page simply stays as it was.
 	 */
 	if (folio_mapped(folio) || folio_maybe_dma_pinned(folio) ||
 	    folio_order(folio) || (!allow_clean && !folio_test_dirty(folio))) {
+		folio_unlock(folio);
+		return 0;
+	}
+
+	/*
+	 * A clean both-state folio is already compressed: entries[index]
+	 * names its durable copy and the folio is just a reclaimable cache
+	 * of it.  Re-compressing would free that entry and store an
+	 * identical one -- pure churn for no memory gain, so skip.  Only
+	 * the aging pass reaches this (write_end requires dirty); a DIRTY
+	 * both-state folio's entry is stale and IS worth re-compressing,
+	 * which the choke-point invalidate below handles.  This replaces
+	 * the old "re-compress a decompressed-on-read survivor" policy,
+	 * which was right when decompress freed the entry but is wrong now
+	 * that the entry survives.
+	 */
+	if (allow_clean && !folio_test_dirty(folio) &&
+	    shmem_comp_entries_present(inode, index)) {
 		folio_unlock(folio);
 		return 0;
 	}

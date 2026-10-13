@@ -485,6 +485,14 @@ unsigned int shmem_comp_truncate_range(struct inode *inode, pgoff_t start,
 				       pgoff_t end);
 
 /*
+ * Write-invalidate hook (shmem_write_begin): a write to a folio with a
+ * surviving compressed backing (the "both" state) makes it stale; free it
+ * so the folio becomes the sole copy, keeping "a dirty folio has no
+ * compressed backing".  Process context only (i_rwsem held).
+ */
+void shmem_comp_invalidate_write(struct inode *inode, pgoff_t index);
+
+/*
  * Eviction hook (shmem_evict_inode): free any remaining entries[] and
  * the table itself (the two-table mapping, specs/02).  Safe on NULL
  * (most inodes never compress).  shmem_comp_truncate_range() has

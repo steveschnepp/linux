@@ -3373,6 +3373,13 @@ shmem_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 		return -EIO;
 	}
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* A write makes any surviving compressed copy of this page stale;
+	 * free it so the folio becomes the sole copy (specs/02
+	 * write-invalidate).  write_end's recompress stores a fresh one. */
+	shmem_comp_invalidate_write(inode, index);
+#endif
+
 	*foliop = folio;
 	return 0;
 }
