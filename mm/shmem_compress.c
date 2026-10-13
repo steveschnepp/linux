@@ -3851,8 +3851,16 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 	 * reference and releases it after we return. Return 1 = compressed,
 	 * 0 = skipped, negative = error (the aging budget counts 1 as work
 	 * done).
+	 *
+	 * Drain the folio's lock waiters (entry-race lost-wakeup fix):
+	 * folio_unlock()'s wake walk may skip an exclusive waiter when the
+	 * lock bit momentarily reads set, betting on a future unlock -- but
+	 * the folio is out of the mapping now, so no future lock/unlock on
+	 * it is guaranteed, and a skipped waiter would sleep forever.  With
+	 * the bit clear the extra walk cannot skip.
 	 */
 	folio_unlock(folio);
+	wake_up_folio_waiters(folio);
 
 	return 1;
 }

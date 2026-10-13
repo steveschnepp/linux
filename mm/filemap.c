@@ -1519,6 +1519,44 @@ void folio_unlock(struct folio *folio)
 EXPORT_SYMBOL(folio_unlock);
 
 /**
+ * wake_up_folio_waiters - Collect any lock waiters on a folio
+ * @folio: the folio, already unlocked
+ *
+ * folio_unlock()'s wake walk can skip an exclusive waiter when the lock
+ * bit momentarily reads set (the lock-handoff path bets on a future
+ * unlock to collect it).  Once a folio has been removed from its page
+ * cache, no future lock/unlock on it is guaranteed, and a waiter skipped
+ * at that point would sleep forever (the tmpfs-compression entry-race
+ * stall).  Filesystems that remove a folio from the mapping while it may
+ * have waiters call this after unlocking; with the lock bit clear the
+ * walk cannot skip.  Process context only.
+ */
+void wake_up_folio_waiters(struct folio *folio)
+{
+	unsigned int i;
+
+	/*
+	 * The folio is out of its mapping: no future lock/unlock on it is
+	 * guaranteed, so every waiter must be collected NOW.  A single
+	 * walk proved insufficient (the entry-race stall: waiters
+	 * enqueued in the gap around the removal's final walk survived an
+	 * unconditional post-removal wake).  PG_waiters is cleared when
+	 * the hashed queue for this folio empties, so loop until it does.
+	 * Bounded as a safety valve: if the core wait machinery ever
+	 * breaks, warn instead of hanging the removal path.
+	 */
+	for (i = 0; i < 100000 && folio_test_waiters(folio); i++) {
+		folio_wake_bit(folio, PG_locked);
+		if (!(i & 0xfff))
+			cond_resched();
+	}
+	if (folio_test_waiters(folio))
+		pr_warn("wake_up_folio_waiters: folio %p still has waiters\n",
+			folio);
+}
+EXPORT_SYMBOL(wake_up_folio_waiters);
+
+/**
  * folio_end_read - End read on a folio.
  * @folio: The folio.
  * @success: True if all reads completed successfully.

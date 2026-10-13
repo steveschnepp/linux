@@ -2561,6 +2561,12 @@ repeat:
 		/* Has the folio been truncated or swapped out? */
 		if (unlikely(folio->mapping != inode->i_mapping)) {
 			folio_unlock(folio);
+			/* Detached folio: this may be the last lock/unlock on
+			 * it, so drain any lock waiters before dropping the
+			 * ref -- a waiter left behind can never be collected
+			 * (entry-race lost-wakeup fix, with the compress-side
+			 * drain in shmem_comp_compress_one). */
+			wake_up_folio_waiters(folio);
 			folio_put(folio);
 			goto repeat;
 		}
