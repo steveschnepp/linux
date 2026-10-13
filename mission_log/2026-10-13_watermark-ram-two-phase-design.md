@@ -137,3 +137,44 @@ gate for the kept 1 Hz pass.
    implementation thread.
 3. Standing items unchanged: RFC assembly (spec 02 Phase 6), M-boot
    median+IQR wrapper, arm-3 rm/synchronous-free at 64M.
+
+---
+
+## Refinement pass: gc_percent per mount, per-mount worker (2026-10-13)
+
+### What We Did
+
+Two review questions on the spec, both resolved against the code:
+
+1. **`gc_percent` per mount: yes, and nearly free.**  Verified the
+   pool is per mount (`comp->pool = shmem_comp_pool_create(...)` in
+   `shmem_comp_fill_sb`) and `cell_free()` already receives the pool,
+   so the 50% `CELL_IS_SPARSE` classifier becomes a pool field
+   (`gc_percent=N`, default 50 = today's behavior, clamped 10..90)
+   behind a threshold-taking inline.  Spec 06 gained the `gc_percent`
+   section, build/manifest rows, migration Phase D, and a risk row;
+   the stale "SPARSE_THRESHOLD objects" comment at cell_store.h:175
+   is a folded-in fix.
+2. **Worker per mount: already is, and should stay.**  `age_work`
+   was `INIT_DELAYED_WORK`-ed per mount in `shmem_comp_fill_sb`;
+   `maint_work` keeps that.  A single global worker was considered
+   and rejected in the spec's comparison table: lifecycle hazards
+   (put_super must cancel one own work vs a global worker pinning
+   every mount), zero-cost idleness (unarmed mounts cost nothing vs
+   a always-on global tick under the mount-list lock), pass
+   isolation, and natural kick routing (a flip schedules exactly its
+   own mount).  The global list stays event-driven (gc_all,
+   shrinker) as today.  Also specified: the kick's pass re-arms the
+   cadence while hot, keeping the GC interleave alive during pressure
+   since hot-mode writes never arm it.
+
+### What We Decided
+
+- `gc_percent` is in spec 06 (Phase D), per mount, default 50.
+- The unified worker is per mount; no global worker.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `specs/06_WATERMARK_RAM_TWO_PHASE.md` | gc_percent section, per-mount worker verdict, hot-cadence re-arm, Phase D |

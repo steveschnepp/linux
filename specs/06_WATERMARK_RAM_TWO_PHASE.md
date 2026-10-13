@@ -62,9 +62,8 @@ Calm-mode compression should only touch settled pages.
 - No shrinker/reclaim integration change (the shrinker remains one of
   the GC's async drivers, untouched).
 - No change to `compress=`, `compress_threshold=`, `merge_pages=`, or
-  cell geometry options; no `gc_percent` knob (the 50%
-  `CELL_IS_SPARSE` classifier stays fixed until spec 05's churn
-  profiles say otherwise).
+  cell geometry options.  (`gc_percent` was requested per mount during
+  review and is included below.)
 - No guaranteed LRU-ordered backlog walk (see Open Questions).
 
 ## Design
@@ -171,6 +170,24 @@ static void shmem_comp_maint_work(struct work_struct *work)
 | 1 Hz cadence | existing arming: `write_end` arms on a non-compressing write; the pass re-arms while its budget was exhausted | calm-mode maintenance at today's cadence |
 | highwater kick | chill->hot flip, once per flip | immediate full backlog compression under pressure |
 
+The kick's pass re-arms the cadence while the mount is hot, so the GC
+interleave stays alive during pressure even though hot-mode writes
+(which compress inline) never arm the cadence themselves.
+
+**The worker stays per mount.**  `age_work` was already per-mount
+(`INIT_DELAYED_WORK` inside `shmem_comp_fill_sb`); `maint_work` keeps
+that.  A single global worker was considered and rejected:
+
+| | per mount (kept) | single global worker |
+|---|---|---|
+| lifecycle | `put_super` cancels its own work; no cross-mount refs | worker must pin every mount it touches; unmount races multiply |
+| idleness | a mount with no writes and no backlog never arms; costs zero | global tick iterates all mounts under the global lock, always |
+| isolation | one mount's slow pass cannot stall another | head-of-line blocking; one huge inode list starves the rest |
+| kick routing | the flip schedules exactly its own mount's work | flip must queue onto the shared worker with cross-mount locking |
+
+The global mount list (`shmem_comp_mounts`) stays event-driven only
+(`gc_now`'s `gc_all`, the shrinker), as today.
+
 **The age gate.**  `shmem_comp_age_round()` today compresses every
 plain folio it finds via `find_get_entries()`.  The gate adds a
 per-folio "seen" marker (one spare `PG_*` folio flag, test-and-set):
@@ -191,6 +208,31 @@ inode `__iget` pinning, cancellation at `put_super`
 (`cancel_delayed_work_sync` as today).  Auto-skip: duty 1 ends early
 when `shmem_comp_maintain` finds no candidates ("end of
 not-yet-compressed"); duty 2 ends early when the sparse list is empty.
+
+### gc_percent (per mount)
+
+The 50% `CELL_IS_SPARSE` classifier becomes a per-mount knob.  It is
+cheap because the pool is per mount (`comp->pool =
+shmem_comp_pool_create(...)` in `shmem_comp_fill_sb`) and
+`cell_free()` already receives the pool:
+
+- Mount option: `gc_percent=N` (byte-utilization percent; default 50
+  = today's behavior exactly; clamped 10..90 so both extremes stay
+  meaningful).
+- `CELL_IS_SPARSE` becomes a threshold-taking inline:
+  `cell_is_sparse(cp, live_bytes)` =
+  `live_bytes * 100 <= (1UL << cp->cell_order << PAGE_SHIFT) *
+  cp->gc_percent`.
+- Surface: printed in the seq_show mount line and as a `cell_stats`
+  gauge; parsed with the other cell options; out-of-range values
+  refused at mount like other options.
+- (Fold-in: fix the stale "below SPARSE_THRESHOLD objects" comment at
+  `include/linux/cell_store.h:175` -- the classifier is byte
+  utilization, not object count.)
+- Semantics: a cell becomes a GC candidate below N% byte utilization,
+  evaluated on free() as today; the async flush drivers are unchanged.
+- Note the free path reads `cp->gc_percent` from the same cache line
+  it already touches; no measurable cost.
 
 ### The taxonomy, final
 
@@ -219,7 +261,9 @@ are untouched.
 | Target | Change |
 |---|---|
 | `mm/shmem_compress.c` | write-path flip (`shmem_comp_wm_update`, RAM signal); rename/generalize `age_work` -> `maint_work` with the highwater kick; age gate in `shmem_comp_age_round` (seen marker); duty ordering |
-| `include/linux/shmem_compress.h` | `struct shmem_comp_sb`: add `wm_kick_spent`; spare folio flag for the seen marker (or reuse per-folio storage if cheaper) |
+| `include/linux/shmem_compress.h` | `struct shmem_comp_sb`: add `wm_kick_spent`; spare folio flag for the seen marker (or reuse per-folio storage if cheaper); `gc_percent` option parse + seq_show |
+| `mm/cell_store.c` | `gc_percent` threshold in the sparse classifier; `cell_stats` gauge |
+| `include/linux/cell_store.h` | pool `gc_percent` field; `CELL_IS_SPARSE` -> threshold inline; stale comment fix (L175) |
 | `mm/shmem.c` | no change (call site already routes through `should_compress`) |
 
 ## File Manifest
@@ -229,6 +273,8 @@ are untouched.
 | `specs/06_WATERMARK_RAM_TWO_PHASE.md` | Create | This spec |
 | `mm/shmem_compress.c` | Modify | Phase 1 + unified worker + age gate |
 | `include/linux/shmem_compress.h` | Modify | State fields, folio marker |
+| `mm/cell_store.c` | Modify | gc_percent in the sparse classifier + gauge |
+| `include/linux/cell_store.h` | Modify | Pool field, threshold inline, stale comment fix |
 
 ## Migration
 
@@ -256,6 +302,15 @@ are untouched.
 1. Full 21-combo triangle rerun at 2G/2G + the torture policy matrix.
 2. Results and envelope update as a mission log.
 
+### Phase D: gc_percent (per mount) -- est. 2 hours
+
+1. Pool field + option parse + clamp (10..90, default 50), threshold
+   inline replacing `CELL_IS_SPARSE`, seq_show + `cell_stats` gauge,
+   stale comment fix.
+2. Gate: KASAN suite green; default (50) shows byte-identical GC
+   behavior to today; a gc_percent=20 mount evicts at a visibly
+   different density in `cell_stats`.
+
 ## Risks
 
 | Risk | Likelihood | Impact | Mitigation |
@@ -266,6 +321,7 @@ are untouched.
 | Global signal: all compressed mounts flip together | Low | Low | per-mount hysteresis independent; documented |
 | Kick + cadence contend on the same worker (schedule_work while running) | Low | Low | `schedule_work` on a running work is a no-op; the running pass picks up the mode change via `READ_ONCE(comp->hot)` |
 | One-shot semantics from the earlier iteration are gone: worker runs at 1 Hz forever | Low | Low | that is today's behavior, which the user explicitly wants kept |
+| gc_percent misconfig (low -> frequent evacuation copy cost; high -> exhaustion-path GC only) | Low | Low | clamped 10..90; default 50 is exactly today's behavior |
 
 ## Open Questions
 
