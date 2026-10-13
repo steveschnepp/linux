@@ -304,3 +304,73 @@ in the "wake never delivered" world, not the "missing unlock" world.
 4. Optional later: re-run with erlk-only probes to name the last
    contended locker (mechanistic completeness, not needed for the
    fix).
+
+---
+
+## The fix attempt (2026-10-13)
+
+Implemented the waiter drain on the pristine kernel.  Result: **partial**
+-- strictly beneficial, committed (`2ca2601bd2e5`), residual mechanism
+sharpened to a single unexplained state.
+
+### What We Did
+
+1. `wake_up_folio_waiters()` (exported from filemap.c): walks the
+   folio's PG_locked wait queue until PG_waiters clears, bounded with
+   a warning.  First a single unconditional wake; then upgraded to the
+   loop after stats showed partial effect.
+2. Drain sites: `shmem_comp_compress_one()` after the folio leaves the
+   page cache; `shmem_get_folio_gfp()`'s mapping-mismatch exit (each
+   departing stale-ref holder drains before dropping its ref).
+3. ERHUNT probes removed from init.sh for verification runs (probe
+   overhead dissolves the race -- six for six).
+
+### Test Results (the pristine oracle, 10 runs each, no instrumentation)
+
+| kernel | phase A (cells) | phase A2 (zsmalloc) |
+|---|---|---|
+| unpatched | 0/10 (deterministic in early 3/3 runs) | 0/10 early runs (no 10x baseline taken) |
+| single wake after removal | 0/10 | 3/10 |
+| drain loop (waiters flag) | 0/10 | 6/10 |
+| + reader-side drain | 0/10 | 6/10 |
+
+The zsmalloc improvement is real; the cells phase is untouched by any
+variant.  (Build-to-build timing noise is acknowledged: the 3/10 vs
+6/10 spread may partially reflect that.)
+
+### The residual mechanism, sharpened
+
+The stalled folios' flags (0x12c / 0x2c) have **PG_waiters (bit 7)
+CLEAR while the wait entry is verified still linked in the hashed
+bucket**.  Consequences:
+
+- Every later `folio_unlock` takes the fast path (xor sees no waiters)
+  and never walks -- nobody can ever collect that entry again.
+- The drain-loop's guard (`folio_test_waiters`) reads the very flag
+  that is wrongly clear, so the loop exits without walking -- the
+  single-wake variant was actually the better collector.
+- The ONLY `folio_clear_waiters` call site in all of mm is the
+  wake-tail (`filemap.c`): `if (!waitqueue_active(q) ||
+  !key.page_match) folio_clear_waiters(folio)`.  The anomalous state
+  requires a walk for F that found the bucket non-empty but with NO
+  matching entry for F (so page_match stayed 0) at a moment when F's
+  waiter was out of the bucket -- the waiter's `goto repeat` gap
+  (woken without DONE, re-test fails, re-enqueue) -- AND, per the
+  code as read, the repeat path re-sets PG_waiters under q->lock, so
+  static analysis still cannot close the loop.  One link between the
+  observed state and the code remains unexplained.
+
+### Next Steps (revised, precise)
+
+1. Phase A still hangs 10/10 on the CURRENT (fixed) kernel with NO
+   probes -- so gdb raw-state inspection works again: next session
+   should read, on a stalled folio: PG_waiters, the waiter's
+   `wait->flags` (WOKEN?), the bucket list integrity, and the
+   `sysctl_page_lock_unfairness`-derived CUSTOM path involvement.
+   The single unexplained fact to kill: "queued entry + clear
+   PG_waiters".
+2. Candidates once explained: a fix at the true clear site, or the
+   general rule "any wake of a detached folio must walk regardless of
+   PG_waiters" (make the drain unconditional, drop the flag guard).
+3. Then: restore spec 06 (`git stash pop`), rebuild, suite, Phase C.
+4. Rig cleanup of the debug block and phase selector.
