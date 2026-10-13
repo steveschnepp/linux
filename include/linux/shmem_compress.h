@@ -183,11 +183,11 @@ struct shmem_comp_entry {
 /*
  * Encode/decode a cell location into the handle field.
  *
- * The offset field is 22 bits because a valid offset is always
- * < cell_size and the largest cell is 4 MiB (CELL_ORDER_MAX); the
- * cellid field takes the next 33 bits (u32 + the +1 bias).
+ * The offset field is 24 bits because a valid offset is always
+ * < cell_size and the largest cell is 16 MiB (CELL_ORDER_MAX); the
+ * cellid field takes the remaining 40 bits (u32 + the +1 bias).
  */
-#define CELL_LOC_OFFSET_BITS	22
+#define CELL_LOC_OFFSET_BITS	24
 #define CELL_LOC_OFFSET_MAX	(1UL << CELL_LOC_OFFSET_BITS)
 
 /*
@@ -199,14 +199,14 @@ struct shmem_comp_entry {
  * without the bias, that object would be silently discarded on every
  * fresh pool.
  *
- * Layout: [63..55 unused][cellid+1, 33 bits at 22][offset, 22 bits].
- * offset never exceeds 22 bits (max cell size is 4 MiB, so a valid
- * offset is < 2^22); cellid+1 needs up to 33 bits because cellid is
- * a u32 (a directory can hold up to UINT_MAX cells, though the
- * kvcalloc fails long before that).  The handle is a full unsigned
- * long stored in entry.handle -- not a swp_entry -- so all 64 bits
- * are available (see the 55-bit {id,gen} packing in swapops.h, which
- * is a separate, tighter encoding for tmpfs xarray values).
+ * Layout: [cellid+1, 40 bits at 24][offset, 24 bits].
+ * offset never exceeds 24 bits (max cell size is 16 MiB, so a valid
+ * offset is < 2^24); cellid+1 takes the remaining 40 bits, more than
+ * enough for a u32 cellid (a directory can hold up to UINT_MAX cells,
+ * though the kvcalloc fails long before that).  The handle is a full
+ * unsigned long stored in entry.handle -- not a swp_entry -- so all 64
+ * bits are available (the {id,gen} xarray packing is a separate,
+ * tighter encoding).
  *
  * When widening or narrowing the fields, re-price THIS encoding, not
  * the struct cell declaration: the u16 cellid wall was never in the

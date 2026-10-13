@@ -2168,6 +2168,7 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	unsigned int wm_low, wm_high;
 	char *algo;
 	unsigned int cell_order;
+	unsigned int nr_cells;
 
 	sbinfo->comp = NULL;
 
@@ -2232,10 +2233,10 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	 * cell_seen flag distinguishes that from "not given",
 	 * which triggers the size-based derivation below.
 	 *
-	 * The pool's directory stays at the default capacity:
-	 * tmpfs page cache is compressible and bounded by
-	 * size= accounting, so it cannot walk into the
-	 * incompressible-storage wall a block device hits.
+	 * The pool's directory is sized from size= below, so the
+	 * cell-backed pool can hold the compressed image of the whole
+	 * mount (the legacy 256-cell default capped storage at
+	 * 256 x cell_size and starved large fills).
 	 */
 	if (cell_order == 0 && !opts->cell_seen) {
 		unsigned int merge_pages = opts->merge_pages ?: 1;
@@ -2251,7 +2252,27 @@ int shmem_comp_fill_sb(struct super_block *sb,
 			cell_order++;
 	}
 
-	comp->pool = shmem_comp_pool_create(algo, cell_order, 0);
+	/*
+	 * Directory capacity from the filesystem size: a bigger mount
+	 * gets a bigger cell array, so the pool can hold the compressed
+	 * image of the whole tmpfs.  size=/cell_size gives ~2x headroom
+	 * over the ~2:1 compressed image and covers COW churn (the store
+	 * path allocates before the free path drops the old block, and a
+	 * freed block only returns its cell when the cell empties).  Bound
+	 * it to keep the directory metadata sane: floor at the legacy
+	 * default, cap at SHMEM_COMP_CELL_MAX_CELLS.
+	 */
+	{
+		unsigned long n = tmpfs_bytes / (PAGE_SIZE << cell_order);
+
+		if (n < CELL_DEFAULT_MAX_CELLS)
+			n = CELL_DEFAULT_MAX_CELLS;
+		if (n > SHMEM_COMP_CELL_MAX_CELLS)
+			n = SHMEM_COMP_CELL_MAX_CELLS;
+		nr_cells = (unsigned int)n;
+	}
+
+	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");

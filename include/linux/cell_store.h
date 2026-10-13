@@ -63,13 +63,15 @@
  * Cell size bounds.  Minimum 16 KiB: smaller cells cannot hold even a
  * single merged compression group (merge_pages * PAGE_SIZE) without
  * splitting, and the per-cell metadata (struct cell ≈ 128 B) becomes
- * a significant fraction of the cell itself.  Maximum 4 MiB: large
- * enough for any merge group, small enough that a single alloc_pages()
- * order-10 request has a reasonable chance of succeeding under
- * memory pressure.
+ * a significant fraction of the cell itself.  Maximum 16 MiB: large
+ * cells cut the directory/array size and the per-cell metadata cost
+ * for big mounts.  A cell is one alloc_pages(order) call, so an order
+ * above the buddy's max (MAX_PAGE_ORDER) needs
+ * CONFIG_ARCH_FORCE_MAX_ORDER; cell_pool_create() refuses those
+ * cleanly rather than build a pool that cannot allocate its cells.
  */
 #define CELL_ORDER_MIN	2		/* 16 KiB  */
-#define CELL_ORDER_MAX	10		/* 4 MiB   */
+#define CELL_ORDER_MAX	12		/* 16 MiB  */
 #define CELL_ORDER_DEF	4		/* 64 KiB  */
 
 /*
@@ -79,6 +81,18 @@
  * and size=-accounted.
  */
 #define CELL_DEFAULT_MAX_CELLS	256
+
+/*
+ * Upper bound on a tmpfs pool's cell directory.  The directory is sized
+ * from the mount's size= (bigger mount -> bigger array) so the pool can
+ * hold the compressed image of the whole filesystem; without this the
+ * legacy 256-cell default caps storage at 256 x cell_size (~16 MiB with
+ * 64 KiB cells), which is why a large cell-backed fill ran out of cells.
+ * The cap bounds the directory metadata (a slot is a struct cell, ~100 B)
+ * for absurdly large mounts with tiny cells -- which the size-based
+ * cell-order derivation avoids in practice by growing the cell instead.
+ */
+#define SHMEM_COMP_CELL_MAX_CELLS	(2U << 20)	/* 2 Mi cells */
 
 /*
  * A cell is a GC candidate when more than half its capacity is

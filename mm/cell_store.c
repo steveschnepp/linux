@@ -41,6 +41,15 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 
 	if (order < CELL_ORDER_MIN || order > CELL_ORDER_MAX)
 		return NULL;
+	/*
+	 * A cell is one alloc_pages(order) call.  An order above the buddy's
+	 * max cannot come from a single allocation without
+	 * CONFIG_ARCH_FORCE_MAX_ORDER; refuse cleanly here rather than build
+	 * a pool that can never allocate its cells (a store would just fail
+	 * and leave every block uncompressed).
+	 */
+	if (order > MAX_PAGE_ORDER)
+		return NULL;
 
 	/*
 	 * Directory capacity bounds the pool's PHYSICAL storage: at most
