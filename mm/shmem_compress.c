@@ -3030,15 +3030,18 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			continue;
 		}
 
+		/* A decompression cache is a file page, not swappable anon
+		 * memory (see shmem_decompress_folio()). */
+		__folio_clear_swapbacked(sib);
 		folio_add_lru(sib);
 
 		/* Both state: entries[sidx] still names the group entry, so
 		 * no per-slice release and the entry's swapped charge is
 		 * retained.  Reclaim drops the folio later, keeping the
-		 * entry. */
+		 * entry.  Not marked referenced -- a reclaimable cache, see
+		 * shmem_decompress_folio(). */
 
 		if (sidx == index) {
-			folio_set_referenced(sib);
 			*foliop = sib;	/* locked, ref for caller */
 		} else {
 			folio_unlock(sib);
@@ -3468,11 +3471,23 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	 * gauge stays (the entry survives); it drops when the entry is
 	 * freed on truncate/evict.  Drop our pin: entries[index] holds the
 	 * durable reference now.
+	 *
+	 * The folio is a reclaimable CACHE of the compressed entry, not a
+	 * swappable anon page -- the entry is its durable backing, like a
+	 * disk block.  Clear the swapbacked bit (shmem's own add-to-page-
+	 * cache requires it set, so it goes only after the install) so the
+	 * folio lands on the FILE lru: reclaim scans file pages even with no
+	 * swap and drops this clean cache via __remove_mapping, which is what
+	 * lets a >RAM read-back survive.  A swapbacked folio would sit on the
+	 * anon lru, which reclaim skips without swap (get_scan_count ->
+	 * SCAN_FILE), accumulating until OOM.  It is also deliberately NOT
+	 * marked referenced: a cache cheap to re-materialise should be dropped
+	 * promptly under pressure, not retained as a hot page.
 	 */
+	__folio_clear_swapbacked(folio);
 	folio_add_lru(folio);
 	shmem_comp_entry_put(id);
 
-	folio_set_referenced(folio);
 	/* Hand back the folio locked, with a reference for the caller */
 	*foliop = folio;
 	return 0;
@@ -3642,11 +3657,18 @@ static unsigned int shmem_comp_entry_drop(struct inode *inode,
 static unsigned int shmem_comp_invalidate_index(struct inode *inode,
 						pgoff_t index)
 {
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa = READ_ONCE(info->comp_entries);
 	unsigned int gen, id;
 
 	id = shmem_comp_entries_lookup(inode, index, &gen);
 	if (!id)
 		return 0;
+	/* Clear the slot FIRST: entries[index] must never dangle onto a
+	 * freed entry (a recycled id could otherwise be mistaken for live
+	 * backing by a concurrent reader). */
+	if (xa)
+		xa_store(xa, index, NULL, GFP_KERNEL);
 	return shmem_comp_entry_drop(inode, id, gen);
 }
 
