@@ -20,18 +20,19 @@ struct seq_file;
  * - Pages are compressed via the kernel crypto acomp API (lz4 default,
  *   any installed algorithm selectable per mount)
  * - Compressed data is stored in zsmalloc pools (grow on demand)
- * - The page cache xarray stores xa_value slots carrying a small entry
- *   ID (SWP_SHMEM_COMPRESS type). zsmalloc handles are kernel pointers
- *   and cannot be packed into xarray values, so a global ID table
- *   (struct shmem_comp_entry in mm/shmem_compress.c) maps ID ->
- *   {zsmalloc handle, compressed length, group size, refcounts}
+ * - Each page's compressed backing lives in a per-inode entries[] table
+ *   (an xarray of xa_value slots carrying {id, gen}); zsmalloc handles
+ *   are kernel pointers and cannot be packed into xarray values, so a
+ *   global ID table (struct shmem_comp_entry in mm/shmem_compress.c)
+ *   maps ID -> {zsmalloc handle, compressed length, group size,
+ *   refcounts}
  * - Decompression happens transparently on page fault/read access
  *
  * Compression Flow:
- *   write() -> compress_folio() -> zs_malloc() -> entry_alloc() -> swap xarray slot
+ *   write() -> compress_folio() -> zs_malloc() -> entry_alloc() -> entries[index]
  *
  * Decompression Flow:
- *   read()/fault -> xa_is_shmem_comp() -> entry_get() -> decompress_folio()
+ *   read()/fault -> entries[index] -> entry_get() -> decompress_folio()
  *
  * Entry lifetime:
  *   Each page cache slot holding the ID owns one entry reference;
@@ -89,8 +90,8 @@ struct kobject;
  *        itself when the last reference drops
  * @rcu: for kfree_rcu() after removal from the ID table
  *
- * Registered in a global ID table; the page cache xarray only stores
- * the small {id, generation} pair via make_shmem_comp_entry().
+ * Registered in a global ID table; the per-inode entries[] table only
+ * stores the small {id, generation} pair.
  */
 struct shmem_comp_entry {
 	/*
@@ -273,51 +274,11 @@ struct shmem_comp_stats {
 };
 
 /*
- * Compressed entry xarray representation.
- *
- * The page cache xarray stores only a small entry ID, encoded via
- * make_shmem_comp_entry()/shmem_comp_entry_id() in <linux/swapops.h>.
- * The zsmalloc handle lives in the ID table (struct shmem_comp_entry)
- * because handles are kernel pointers and do not fit xarray values.
+ * The compressed mapping lives in the per-inode entries[] table (a
+ * dedicated xarray of xa_value slots), not in the page cache, so no
+ * reserved swap type or page-cache type tag is needed.  See
+ * mm/shmem_compress.c for the entry table and its {id, gen} packing.
  */
-
-/*
- * XArray entry type checking functions.
- *
- * The tmpfs page cache xarray can contain three types of entries:
- * 1. Folio pointers (uncompressed pages) - normal case
- * 2. Swap entries (xa_mk_value with swap type) - existing swap support
- * 3. Compressed entries (xa_mk_value with compression type) - new
- *
- * We use a reserved swap type range to distinguish compressed entries.
- * This avoids needing a separate encoding scheme.
- */
-
-/**
- * shmem_comp_type_check - Check if xa_value is a compression entry
- * @entry: xa_value to check
- *
- * Return: true if entry is a compressed page entry, false otherwise
- *
- * Checks if the xa_value uses the reserved compression type tag.
- * This must be called only after xa_is_value() returns true.
- */
-bool shmem_comp_type_check(const void *entry);
-
-/**
- * xa_is_shmem_comp - Check if xarray entry is a compressed page
- * @entry: xarray entry to check
- *
- * Return: true if entry is a compressed page, false otherwise
- *
- * Convenience wrapper that checks both xa_is_value() and compression type.
- */
-static inline bool xa_is_shmem_comp(const void *entry)
-{
-	if (!xa_is_value(entry))
-		return false;
-	return shmem_comp_type_check(entry);
-}
 
 /*
  * Per-mount compression state and parsed mount options (carve C3/C4).
@@ -448,16 +409,6 @@ void shmem_comp_arm_aging(struct inode *inode);
  * died without paying a compression cycle (death-before-pop's saving).
  */
 void shmem_comp_note_unmap(struct inode *inode);
-
-/*
- * Eviction hook (shmem_free_swap): release one compressed page-cache
- * slot through the entry ID table. Compression entries are not swap
- * entries; routing them through the swap code WARNs and leaks the
- * compressed block. The xarray erase itself stays in shmem_free_swap()
- * (under the xas lock); this only drops the slot reference and updates
- * per-mount accounting.
- */
-void shmem_comp_free_swap(struct address_space *mapping, void *radswap);
 
 /*
  * Two-table mapping (specs/02): a compressed page's entry id lives in
@@ -751,8 +702,8 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
  *
  * Return: entry ID (>0) on success, 0 on allocation failure
  *
- * The ID+generation pair is stored once per page cache slot of the
- * group via make_shmem_comp_entry(); refs and slots are both
+ * The ID+generation pair is stored once per entries[] slot of the
+ * group; refs and slots are both
  * initialised to @nr_pages. Each slot is released with
  * shmem_comp_entry_release(). @gen receives the entry generation the
  * caller must carry in every xarray value it installs and pass to

@@ -135,84 +135,18 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
 
 #ifdef CONFIG_TMPFS_COMPRESSION
 /*
- * Compression entries carry {id, generation} in the xarray value.
- *
- * A page cache slot can go stale between the reader's xarray load and
- * its entry-table pin: truncate frees the entry and a rewrite can
- * recycle the same ID for a different block. Without a generation the
- * stale value is indistinguishable from the new incarnation -- the
- * pin lands on the wrong entry (torn reads) and its slot release is
- * charged to an entry the stale reader never owned (refs underflow).
- * The generation makes staleness detectable: get/release validate it
- * and reject the stale value (-ENOENT), so the caller retries
- * against the updated slot.
- *
- * Bit budget: the swp offset field is 55 bits on 64-bit targets
- * (64 - SWP_OFFSET_SHIFT + SWP_TYPE_BITS = 64 - 14 + 5). 32-bit ID
- * (allocation range unchanged) + 23-bit generation = 55. Generation
- * wrap at 2^23 allocations is harmless: ABA would require the same
- * ID to be recycled exactly 2^23 allocations later inside a
- * sub-microsecond load-to-pin window.
+ * The per-inode entries[] table (the two-table mapping, specs/02)
+ * carries {id, generation} in an xa_value.  A stale id -- freed by a
+ * racing truncate and recycled for a different block -- must be
+ * distinguishable from the new incarnation, so get/release validate the
+ * generation and reject the stale id (-ENOENT), letting the caller
+ * retry against the updated slot.  The generation is masked to 23 bits:
+ * wrap at 2^23 allocations is harmless, since ABA would need the same
+ * id recycled exactly 2^23 allocations later inside a sub-microsecond
+ * load-to-pin window.
  */
 #define SHMEM_COMP_ENTRY_GEN_BITS	23
 #define SHMEM_COMP_ENTRY_GEN_MASK	((1U << SHMEM_COMP_ENTRY_GEN_BITS) - 1)
-
-/**
- * make_shmem_comp_entry - Create a compression xarray entry
- * @id: entry ID from shmem_comp_entry_alloc()
- * @gen: generation from shmem_comp_entry_alloc()
- *
- * Return: swp_entry_t encoding {id, generation} of the compression
- * entry. Only this small pair is packed into the entry; the zsmalloc
- * handle is a kernel pointer and cannot be stored in the xarray value
- * bits. The ID indexes a global xarray mapping ID -> struct
- * shmem_comp_entry; the generation distinguishes incarnations of the
- * same ID.
- */
-static inline swp_entry_t make_shmem_comp_entry(unsigned int id,
-						 unsigned int gen)
-{
-	pgoff_t offset = ((pgoff_t)(gen & SHMEM_COMP_ENTRY_GEN_MASK) << 32) |
-			 (pgoff_t)id;
-
-	return swp_entry(SWP_SHMEM_COMPRESS, offset);
-}
-
-/**
- * shmem_comp_entry_id - Extract entry ID from a compression entry
- * @entry: swp_entry_t from page cache xarray
- *
- * Return: entry ID of the shmem compression entry (0 is never allocated;
- *         it is the failure sentinel of shmem_comp_entry_alloc())
- */
-static inline unsigned int shmem_comp_entry_id(swp_entry_t entry)
-{
-	return (unsigned int)swp_offset(entry);
-}
-
-/**
- * shmem_comp_entry_gen - Extract the generation from a compression entry
- * @entry: swp_entry_t from page cache xarray
- *
- * Return: generation this value was created with; pass it to
- * shmem_comp_entry_get_gen()/shmem_comp_entry_release() so a stale
- * value cannot be charged against a recycled ID.
- */
-static inline unsigned int shmem_comp_entry_gen(swp_entry_t entry)
-{
-	return (unsigned int)(swp_offset(entry) >> 32);
-}
-
-/**
- * is_shmem_comp_entry - Check if entry is a compressed page entry
- * @entry: swp_entry_t to check
- *
- * Return: true if entry is a compressed page, false otherwise
- */
-static inline bool is_shmem_comp_entry(swp_entry_t entry)
-{
-	return swp_type(entry) == SWP_SHMEM_COMPRESS;
-}
 #endif /* CONFIG_TMPFS_COMPRESSION */
 
 #if IS_ENABLED(CONFIG_DEVICE_PRIVATE)

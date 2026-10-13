@@ -1025,18 +1025,8 @@ static long shmem_free_swap(struct address_space *mapping,
 	xas_unlock_irq(&xas);
 
 	if (nr_pages) {
-#ifdef CONFIG_TMPFS_COMPRESSION
-		/*
-		 * Compression entries are not swap entries: release the
-		 * slot via the entry ID table, not the swap code (which
-		 * WARNs "Bad swap file entry" and leaks the block).
-		 */
-		if (is_shmem_comp_entry(radix_to_swp_entry(radswap)))
-			shmem_comp_free_swap(mapping, radswap);
-		else
-#endif
-			swap_put_entries_direct(radix_to_swp_entry(radswap),
-						nr_pages);
+		swap_put_entries_direct(radix_to_swp_entry(radswap),
+					nr_pages);
 	}
 
 	return nr_pages;

@@ -46,10 +46,10 @@
  *   1. Page is compressed via shmem_comp_compress()
  *   2. Compressed data stored via shmem_comp_store() (zsmalloc handle
  *      or cell {cellid, offset}, depending on the pool backend)
- *   3. Page cache slot replaced with the entry ID (SWP_SHMEM_COMPRESS)
+ *   3. entries[index] records the entry ID (the folio leaves i_pages)
  *
  * Decompression Flow:
- *   1. xarray entry ID decoded via shmem_comp_entry_id()
+ *   1. entries[index] resolved to {id, gen}
  *   2. Data loaded via shmem_comp_load() / shmem_comp_load_entry()
  *   3. Page decompressed via shmem_comp_decompress()
  *
@@ -609,39 +609,6 @@ void shmem_comp_pool_put(struct shmem_comp_pool *pool)
 	if (atomic_dec_and_test(&pool->refcount))
 		shmem_comp_pool_destroy(pool);
 }
-
-/*
- * XArray entry type checking.
- */
-
-/**
- * shmem_comp_type_check - Check if xa_value is a compression entry
- * @entry: xa_value to check
- *
- * Return: true if entry is a compressed page entry, false otherwise
- *
- * Checks if the xa_value uses the SWP_SHMEM_COMPRESS type tag.
- * This function should only be called after xa_is_value() returns true.
- *
- * The check extracts the swap type from the value and compares it
- * against SWP_SHMEM_COMPRESS. If CONFIG_TMPFS_COMPRESSION is disabled,
- * this always returns false.
- */
-bool shmem_comp_type_check(const void *entry)
-{
-#ifdef CONFIG_TMPFS_COMPRESSION
-	swp_entry_t swap;
-
-	/* Convert xa_value back to swp_entry_t format */
-	swap.val = xa_to_value(entry);
-
-	/* Check if this is a compression entry */
-	return swp_type(swap) == SWP_SHMEM_COMPRESS;
-#else
-	return false;
-#endif
-}
-EXPORT_SYMBOL_GPL(shmem_comp_type_check);
 
 /*
  * Compression/decompression operations.
@@ -2459,41 +2426,6 @@ void shmem_comp_show_options(struct seq_file *seq,
 		seq_printf(seq, ",merge_pages=%u", comp->merge_pages);
 }
 
-/*
- * shmem_comp_free_swap - Release one compressed page-cache slot
- * @mapping: mapping whose mount owns the entry
- * @radswap: the radix entry holding the compression ID
- *
- * Called from shmem_free_swap() for compression entries only. The slot
- * erase happens there under the xas lock; here we drop the slot's
- * entry reference and update the once-per-group accounting. get/release
- * are generation-validated: between the erase and this call the entry
- * can die and the ID be recycled -- a stale value must not be charged
- * against the new incarnation. On a stale value got/last are both
- * false: the old entry's accounting already ran when IT died.
- */
-void shmem_comp_free_swap(struct address_space *mapping, void *radswap)
-{
-	struct shmem_comp_sb *comp =
-		shmem_comp_get_sb(mapping->host->i_sb)->comp;
-	swp_entry_t entry = radix_to_swp_entry(radswap);
-	unsigned int id = shmem_comp_entry_id(entry);
-	unsigned int gen = shmem_comp_entry_gen(entry);
-	unsigned int length = 0, entry_nr = 1;
-	bool got, last;
-
-	got = shmem_comp_entry_get_gen(id, gen, NULL, &length, &entry_nr,
-					NULL, NULL);
-	last = shmem_comp_entry_release(id, gen);
-	if (got)
-		shmem_comp_entry_put(id);
-	if (comp && last && got) {
-		atomic_long_sub(entry_nr, &comp->pages);
-		atomic_long_sub(length, &comp->bytes);
-		shmem_comp_update_stats(false, entry_nr * PAGE_SIZE, length);
-	}
-}
-
 #ifdef CONFIG_SYSFS
 /*
  * Sysfs attributes under /sys/fs/tmpfs, group "compression".
@@ -3620,8 +3552,8 @@ bool shmem_comp_entries_present(struct inode *inode, pgoff_t index)
  * Returns 1 (one logical page whose shmem swapped charge the caller must
  * drop via a single recalc), or 0 if the entry was already gone (stale
  * id -- its accounting ran when it died).  Generation-validated get +
- * release, mirroring shmem_comp_free_swap(); the per-mount compression
- * gauge is corrected once, on the entry's last slot.
+ * release; the per-mount compression gauge is corrected once, on the
+ * entry's last slot.
  */
 static unsigned int shmem_comp_entry_drop(struct inode *inode,
 					  unsigned int id, unsigned int gen)
