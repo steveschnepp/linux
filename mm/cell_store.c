@@ -34,7 +34,8 @@ static gfp_t cell_gfp(struct cell_pool *cp)
 }
 
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
-				   unsigned int nr_cells)
+				   unsigned int nr_cells,
+				   unsigned int gc_percent)
 {
 	struct cell_pool *cp;
 	u32 i;
@@ -79,6 +80,7 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	INIT_LIST_HEAD(&cp->sparse);
 	cp->cell_order = order;
 	cp->use_thp = use_thp;
+	cp->gc_percent = gc_percent ? : CELL_IS_SPARSE_PERCENT_DEFAULT;
 	cp->max_cells = nr_cells;
 	/* +1 slot: compaction-only bootstrap, see invariant #6 */
 	cp->nslots = cp->max_cells + 1;
@@ -362,19 +364,16 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	cell_dbg("free: cell=%u offset=%u len=%u (live_bytes=%u, objects=%u)%s",
 		 cellid, offset, len, c->live_bytes, c->live_objects,
 		 empty ? " -> empty" :
-		 CELL_IS_SPARSE(c->live_bytes,
-				1UL << cp->cell_order << PAGE_SHIFT) ?
-		 " -> sparse" : "");
+		 cell_is_sparse(cp, c->live_bytes) ? " -> sparse" : "");
 
-	if (!empty &&
-	    CELL_IS_SPARSE(c->live_bytes,
-			   1UL << cp->cell_order << PAGE_SHIFT)) {
+	if (!empty && cell_is_sparse(cp, c->live_bytes)) {
 		/*
-		 * Sparse: hand to the async GC.  Evacuation never runs in
-		 * the freeing thread's context — one GC pass batches many
-		 * cells into a single entry-table scan and a single
-		 * active-cell fill, which is strictly cheaper per cell
-		 * than per-free synchronous evacuation.
+		 * Sparse (gc_percent byte utilization, default 50): hand to
+		 * the async GC.  Evacuation never runs in the freeing
+		 * thread's context -- one GC pass batches many cells into a
+		 * single entry-table scan and a single active-cell fill,
+		 * which is strictly cheaper per cell than per-free
+		 * synchronous evacuation.
 		 */
 		if (list_empty(&c->node))
 			list_add(&c->node, &cp->sparse);

@@ -66,6 +66,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/mm.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
@@ -108,7 +109,7 @@ static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
 					  struct shrink_control *sc);
 
 /* Stage 2: walk-based aging (deferred compression) */
-static void shmem_comp_maintain(struct shmem_comp_sb *comp);
+static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot);
 static void shmem_comp_age_work(struct work_struct *work);
 
 /*
@@ -155,8 +156,9 @@ struct shmem_comp_sb {
 	bool enabled;
 	char *compressor;		/* owned; freed with the sb */
 	unsigned int threshold_bytes;		/* min file size to compress (write time), bytes */
-	unsigned int watermark_low;		/* chill return, percent usage (0:0 = eager) */
-	unsigned int watermark_high;		/* hot compress, percent usage */
+	unsigned int watermark_low;		/* chill return, RAM-usage percent (0:0 = eager) */
+	unsigned int watermark_high;		/* hot compress, RAM-usage percent */
+	unsigned int gc_percent;		/* cell GC sparse threshold (mirror of pool) */
 	unsigned int merge_pages;		/* pages per compression group */
 	unsigned int cell_order;	/* cell storage order, informational */
 	struct shmem_comp_pool *pool;	/* compression pool */
@@ -164,8 +166,9 @@ struct shmem_comp_sb {
 	atomic_long_t bytes;		/* compressed bytes stored (this mount) */
 	/* Stage 2: deferred-compression policy state */
 	struct super_block *sb;		/* owning sb (inode walk, usage, s_umount) */
-	bool hot;			/* mode flag: WRITE_ONCE in maintain,
+	bool hot;			/* mode flag: WRITE_ONCE in wm_update,
 					 * READ_ONCE on the write path */
+	bool wm_kick_spent;		/* one highwater kick per flip; reset at LOW */
 	struct delayed_work age_work;	/* per-mount maintenance pass */
 	struct list_head list;		/* on shmem_comp_mounts */
 	atomic_long_t aged_pages;	/* pages compressed by the aging pass */
@@ -250,6 +253,10 @@ static atomic_long_t shmem_comp_skipped_dead;
 #define SHMEM_COMP_AGE_BATCH_INODES	64U	/* inodes pinned per pass */
 #define SHMEM_COMP_AGE_DELAY_MS		1000U	/* armed-work delay */
 #define SHMEM_COMP_AGE_MAX_ROUNDS	4U	/* rounds per pass (~2 MiB) */
+
+/* gc_percent= mount option: clamped range and default */
+#define SHMEM_COMP_GC_PERCENT_MIN	10U
+#define SHMEM_COMP_GC_PERCENT_MAX	90U
 
 /* Global statistics */
 static struct shmem_comp_stats shmem_comp_global_stats = {
@@ -388,7 +395,8 @@ static void shmem_comp_pool_cells_teardown(struct shmem_comp_pool *pool)
 
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
-						unsigned int nr_cells)
+						unsigned int nr_cells,
+						unsigned int gc_percent)
 {
 	struct shmem_comp_pool *pool;
 	int cpu;
@@ -415,7 +423,7 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 	/* Cell storage: no zsmalloc pool needed */
 	if (cell_order > 0) {
 		pool->cells = cell_pool_create(cell_order, cell_order >= 4,
-					       nr_cells);
+					       nr_cells, gc_percent);
 		if (!pool->cells) {
 			pr_warn("shmem_comp: failed to create cell pool\n");
 			kfree(pool);
@@ -1869,9 +1877,10 @@ int shmem_comp_cell_stats_show(char *buf, size_t size)
 			continue;
 
 		off += scnprintf(buf + off, size - off,
-			"pool %d: order=%u use_thp=%d nr_cells=%u pages_used=%ld\n",
+			"pool %d: order=%u use_thp=%d nr_cells=%u pages_used=%ld gc_percent=%u\n",
 			pool_id, cp->cell_order, cp->use_thp,
-			cp->nr_cells, atomic_long_read(&cp->pages_used));
+			cp->nr_cells, atomic_long_read(&cp->pages_used),
+			cp->gc_percent);
 
 		for (i = 0; i < cp->nr_cells; i++) {
 			struct cell *c = &cp->cells[i];
@@ -2096,6 +2105,31 @@ int shmem_comp_opts_set_watermark(struct shmem_comp_opts *opts, const char *val)
 	return 0;
 }
 
+/*
+ * shmem_comp_opts_set_gc_percent - Parse the gc_percent= mount option
+ * @opts: options to update
+ * @val: byte-utilization percent (decimal), clamped 10..90
+ *
+ * Return: 0 on success, -EINVAL on a bad value (mount fails).
+ * Default (not given) is CELL_IS_SPARSE_PERCENT_DEFAULT (50), the
+ * historical threshold.  The _seen flag lets fill_sb() pass 0 (pool
+ * default) only when the mount did not ask.
+ */
+int shmem_comp_opts_set_gc_percent(struct shmem_comp_opts *opts,
+				   const char *val)
+{
+	unsigned int pct;
+	char *rest;
+
+	pct = simple_strtoul(val, &rest, 10);
+	if (*rest || pct < SHMEM_COMP_GC_PERCENT_MIN ||
+	    pct > SHMEM_COMP_GC_PERCENT_MAX)
+		return -EINVAL;
+	opts->gc_percent = pct;
+	opts->gc_percent_seen = true;
+	return 0;
+}
+
 static unsigned int shmem_comp_default_merge_get(void)
 {
 	unsigned int v;
@@ -2272,7 +2306,8 @@ int shmem_comp_fill_sb(struct super_block *sb,
 		nr_cells = (unsigned int)n;
 	}
 
-	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells);
+	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells,
+					   opts->gc_percent);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");
@@ -2288,6 +2323,7 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	comp->threshold_bytes = opts->threshold_bytes ?: 65536;
 	comp->watermark_low = wm_low;
 	comp->watermark_high = wm_high;
+	comp->gc_percent = opts->gc_percent;
 	comp->cell_order = cell_order;
 	comp->merge_pages = opts->merge_pages ?:
 		      (shmem_comp_default_merge_get() ?: 1);
@@ -2296,9 +2332,10 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	/* Stage 2: deferred-compression policy state */
 	comp->sb = sb;
 	/*
-	 * Initial mode: eager (0:0) mounts start hot so today's inline
-	 * behavior is unchanged. Any positive HIGH watermark starts chill
-	 * (usage at mount is 0) -- the first maintenance pass flips it.
+	 * Initial mode: eager (0:0) mounts start hot so inline behavior
+	 * is unchanged. Any positive HIGH watermark starts chill (RAM
+	 * usage at mount is 0) -- the write path flips it when pressure
+	 * arrives (shmem_comp_wm_update).
 	 */
 	comp->hot = (wm_high == 0);
 	INIT_DELAYED_WORK(&comp->age_work, shmem_comp_age_work);
@@ -2310,9 +2347,10 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	sbinfo->comp = comp;
 
 	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u "
-		"cell_order=%u watermark=%u:%u\n",
+		"cell_order=%u watermark=%u:%u gc_percent=%u\n",
 		comp->compressor, comp->merge_pages, comp->threshold_bytes,
-		comp->cell_order, comp->watermark_low, comp->watermark_high);
+		comp->cell_order, comp->watermark_low, comp->watermark_high,
+		comp->gc_percent);
 	return 0;
 }
 
@@ -2361,40 +2399,105 @@ void shmem_comp_put_super(struct shmem_sb_info *sbinfo)
 	sbinfo->comp = NULL;
 }
 
+/*
+ * shmem_comp_ram_usage_pct - Percent of RAM that is NOT available
+ *
+ * The watermark signal (specs/06): compression buys RAM, so RAM
+ * pressure is the honest trigger -- mount usage was a proxy that
+ * inverts in the overcommit/exact-fit regimes.  si_mem_available()
+ * accounts free pages plus evictable file cache, the same number
+ * sysinfo(2) reports as "available".
+ */
+static unsigned int shmem_comp_ram_usage_pct(void)
+{
+	long avail = si_mem_available();
+	long total = (long)totalram_pages();
+
+	if (total <= 0)
+		return 0;
+	if (avail < 0)
+		avail = 0;
+	return (unsigned int)clamp((total - avail) * 100 / total, 0L, 100L);
+}
+
+/*
+ * shmem_comp_wm_update - Evaluate the hot/chill flip against RAM usage
+ * @comp: the per-mount compression state
+ *
+ * Called from shmem_comp_should_compress() on the write path, so the
+ * flip is evaluated where the decision takes effect: at exact-fit a
+ * 1 Hz poll loses the race to sub-second RAM exhaustion (the zcell
+ * triangle: every non-eager combo OOM'd with the flip arriving at
+ * 92% -- the deathbed).  Hysteresis unchanged: >= HIGH -> hot,
+ * <= LOW -> chill, band holds.  The first chill->hot transition arms
+ * the maintenance pass for an immediate backlog drain (the one-shot
+ * highwater kick; a return to chill resets it).
+ */
+static void shmem_comp_wm_update(struct shmem_comp_sb *comp)
+{
+	unsigned int usage;
+	bool hot = READ_ONCE(comp->hot);
+
+	/* eager sentinel: 0:0 is permanently hot, never flinches */
+	if (comp->watermark_high == 0) {
+		if (!hot)
+			WRITE_ONCE(comp->hot, true);
+		return;
+	}
+	usage = shmem_comp_ram_usage_pct();
+	if (usage >= comp->watermark_high)
+		hot = true;
+	else if (usage <= comp->watermark_low)
+		hot = false;
+	else
+		return;	/* hysteresis band: hold */
+
+	if (hot == READ_ONCE(comp->hot))
+		return;
+	WRITE_ONCE(comp->hot, hot);
+	pr_info("tmpfs: mount %s compression %s (ram usage %u%%)\n",
+		comp->sb->s_id, hot ? "hot" : "chill", usage);
+	if (hot) {
+		/* highwater kick: run a backlog pass NOW (mod_delayed_work
+		 * re-arms a pending cadence timer to 0).  Once per flip:
+		 * wm_kick_spent is reset by the return to chill. */
+		if (!comp->wm_kick_spent) {
+			comp->wm_kick_spent = true;
+			mod_delayed_work(system_wq, &comp->age_work, 0);
+		}
+	} else {
+		comp->wm_kick_spent = false;
+	}
+}
+
 bool shmem_comp_should_compress(struct inode *inode)
 {
 	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
 
 	/*
-	 * Stage 2: the write path consults the hot/chill mode flag with a
-	 * single READ_ONCE. In chill mode (usage below the LOW watermark)
-	 * writes land uncompressed; the maintenance pass ages them later
-	 * (death-before-pop). Eager mounts (0:0) keep hot=true always.
+	 * Write-path decision (specs/06 phase 1): evaluate the
+	 * hot/chill flip against RAM usage here, then read the cached
+	 * mode.  In chill mode writes land uncompressed and the
+	 * maintenance pass ages them later (death-before-pop, now
+	 * age-gated in calm mode).  Eager mounts (0:0) keep hot=true
+	 * always.
 	 */
-	return comp && comp->enabled && comp->pool &&
-		READ_ONCE(comp->hot) &&
+	if (!comp || !comp->enabled || !comp->pool)
+		return false;
+	shmem_comp_wm_update(comp);
+	return READ_ONCE(comp->hot) &&
 		i_size_read(inode) >= comp->threshold_bytes;
 }
 
 /*
- * shmem_comp_arm_aging - Ask for a maintenance pass on this mount
- * @inode: an inode on a compressed mount
+ * shmem_comp_arm_aging - REMOVED (specs/06)
  *
- * Called from shmem_write_end() when a write did NOT compress inline
- * (chill mode, or a sub-threshold write in hot mode). The page it left
- * behind is a candidate for the aging pass. Scheduling an already-
- * pending delayed_work is cheap (test-and-set), so this stays off the
- * hot path's critical section. No-op on uncompressed mounts.
+ * The write path no longer arms the maintenance pass on every
+ * uncompressed write: the pass is armed by the 1 Hz cadence (while a
+ * backlog exists) and kicked immediately at the highwater flip
+ * (shmem_comp_wm_update).  A young chilled page is protected by the
+ * calm-mode age gate instead of by deferral.
  */
-void shmem_comp_arm_aging(struct inode *inode)
-{
-	struct shmem_comp_sb *comp = shmem_comp_get_sb(inode->i_sb)->comp;
-
-	if (!comp || !comp->pool)
-		return;
-	schedule_delayed_work(&comp->age_work,
-			      msecs_to_jiffies(SHMEM_COMP_AGE_DELAY_MS));
-}
 
 /*
  * shmem_comp_note_unmap - Record an uncompressed page leaving the cache
@@ -2443,6 +2546,10 @@ void shmem_comp_show_options(struct seq_file *seq,
 	seq_printf(seq, ",compress=%s", comp->compressor);
 	seq_printf(seq, ",compress_watermark=%u:%u",
 		   comp->watermark_low, comp->watermark_high);
+	if (comp->pool && comp->pool->use_cells)
+		seq_printf(seq, ",gc_percent=%u",
+			   comp->gc_percent ?:
+			   CELL_IS_SPARSE_PERCENT_DEFAULT);
 	if (comp->merge_pages > 1)
 		seq_printf(seq, ",merge_pages=%u", comp->merge_pages);
 }
@@ -2745,11 +2852,13 @@ static ssize_t gc_now_store(struct kobject *kobj,
 	 * mount pass is the deterministic test trigger for the policy
 	 * matrix -- it exercises aging without waiting for the armed work.
 	 * Held under shmem_comp_mounts_lock so the pass is serialized
-	 * against put_super's teardown.
+	 * against put_super's teardown.  hot=true: an explicit gc_now is
+	 * an immediate-relief request, so it bypasses the calm-mode age
+	 * gate (specs/06).
 	 */
 	mutex_lock(&shmem_comp_mounts_lock);
 	list_for_each_entry(comp, &shmem_comp_mounts, list)
-		shmem_comp_maintain(comp);
+		shmem_comp_maintain(comp, true);
 	mutex_unlock(&shmem_comp_mounts_lock);
 
 	shmem_comp_cell_gc_all();
@@ -3915,7 +4024,8 @@ int shmem_compress_folio(struct inode *inode, pgoff_t index,
 static unsigned int shmem_comp_age_round(struct shmem_comp_sb *comp,
 					 struct inode **batch,
 					 unsigned int nb,
-					 unsigned int *budget)
+					 unsigned int *budget,
+					 bool hot)
 {
 	unsigned int aged = 0;
 	unsigned int i;
@@ -3937,6 +4047,20 @@ static unsigned int shmem_comp_age_round(struct shmem_comp_sb *comp,
 
 				if (xa_is_value(folio))
 					continue;	/* compressed entry or swap */
+				/*
+				 * Calm-mode age gate (specs/06): a young
+				 * chilled page that gets bg-compressed and
+				 * then immediately read pays compression AND
+				 * decompression for nothing (the ripple).
+				 * First sight just marks (PG_referenced);
+				 * only pages that survived a previous pass
+				 * are compressed.  Under pressure (hot) the
+				 * gate lifts: the backlog goes immediately.
+				 */
+				if (!hot && !folio_test_referenced(folio)) {
+					folio_set_referenced(folio);
+					continue;
+				}
 				ret = shmem_comp_compress_one(batch[i],
 							       indices[j], folio, true);
 				if (ret > 0) {
@@ -3994,7 +4118,7 @@ static unsigned int shmem_comp_age_round(struct shmem_comp_sb *comp,
  * likely remain, so schedule age_work again; otherwise idle until the
  * next write (or the shrinker) arms it.
  */
-static void shmem_comp_maintain(struct shmem_comp_sb *comp)
+static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 {
 	struct super_block *sb = comp->sb;
 	struct inode *inode;
@@ -4006,32 +4130,12 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp)
 		return;
 
 	/*
-	 * Mode flip with hysteresis. usage = used_blocks * 100 /
-	 * max_blocks. The band (LOW, HIGH) keeps the current mode. For
-	 * 0:0 (eager) the hot condition always holds -> permanently hot,
-	 * never flips to chill (1 page on a large tmpfs reads usage 0;
-	 * the sentinel must not flinch).
+	 * The hot/chill flip moved to the write path (specs/06:
+	 * shmem_comp_wm_update, RAM-usage signal).  This pass no longer
+	 * flips; it captures the mode once and runs the two duties:
+	 * age-gated backlog compression (calm) or immediate (hot), then
+	 * the evacuation GC interleave.
 	 */
-	if (comp->watermark_high == 0) {
-		WRITE_ONCE(comp->hot, true);
-	} else {
-		struct shmem_sb_info *sbinfo = sb->s_fs_info;
-		unsigned long max_blocks = sbinfo->max_blocks;
-		unsigned long used = percpu_counter_sum(&sbinfo->used_blocks);
-		unsigned int usage = max_blocks ? (used * 100 / max_blocks) : 0;
-		bool hot = READ_ONCE(comp->hot);
-
-		if (usage >= comp->watermark_high)
-			hot = true;
-		else if (usage <= comp->watermark_low)
-			hot = false;
-		/* else: usage in the hysteresis band, keep current mode */
-		if (hot != READ_ONCE(comp->hot)) {
-			WRITE_ONCE(comp->hot, hot);
-			pr_info("tmpfs: mount %s compression %s (usage %u%%)\n",
-				sb->s_id, hot ? "hot" : "chill", usage);
-		}
-	}
 
 	if (!down_read_trylock(&sb->s_umount))
 		return;	/* unmount in progress; skip this pass */
@@ -4057,7 +4161,7 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp)
 	for (r = 0; r < SHMEM_COMP_AGE_MAX_ROUNDS; r++) {
 		unsigned int budget = SHMEM_COMP_AGE_BUDGET;
 		unsigned int aged = shmem_comp_age_round(comp, batch, nb,
-							 &budget);
+							 &budget, hot);
 
 		if (aged) {
 			atomic_long_add(aged, &comp->aged_pages);
@@ -4081,12 +4185,9 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp)
 
 	up_read(&sb->s_umount);
 
-	/*
-	 * Re-arm while still holding shmem_comp_mounts_lock: put_super
-	 * delists under the same mutex BEFORE canceling the work (see the
-	 * teardown ordering comment), so this schedule can no longer
-	 * target a comp on its way out.
-	 */
+	/* (specs/06 bisect) re-arm only on remaining budget; the hot
+	 * cadence variant is under investigation for the entry-race
+	 * hang. */
 	if (more)
 		schedule_delayed_work(&comp->age_work,
 				      msecs_to_jiffies(SHMEM_COMP_AGE_DELAY_MS));
@@ -4104,9 +4205,12 @@ static void shmem_comp_age_work(struct work_struct *work)
 {
 	struct shmem_comp_sb *comp = container_of(to_delayed_work(work),
 						  struct shmem_comp_sb, age_work);
+	/* mode captured once per pass (specs/06): hot = pressure, so the
+	 * backlog half compresses immediately; calm = age-gated. */
+	bool hot = READ_ONCE(comp->hot);
 
 	mutex_lock(&shmem_comp_mounts_lock);
-	shmem_comp_maintain(comp);
+	shmem_comp_maintain(comp, hot);
 	mutex_unlock(&shmem_comp_mounts_lock);
 }
 
@@ -4128,9 +4232,11 @@ static void shmem_comp_pressure_pass(struct work_struct *work)
 {
 	struct shmem_comp_sb *comp;
 
+	/* hot=true: memory pressure lifts the calm-mode age gate
+	 * (specs/06) -- the backlog must go now. */
 	mutex_lock(&shmem_comp_mounts_lock);
 	list_for_each_entry(comp, &shmem_comp_mounts, list)
-		shmem_comp_maintain(comp);
+		shmem_comp_maintain(comp, true);
 	mutex_unlock(&shmem_comp_mounts_lock);
 }
 

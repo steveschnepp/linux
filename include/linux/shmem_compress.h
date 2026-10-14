@@ -341,6 +341,9 @@ struct shmem_comp_opts {
 	unsigned int merge_pages;		/* pages; 0 = sysfs default */
 	unsigned int cell_order;	/* 0 = derive from tmpfs size */
 	bool cell_seen;			/* cell= given (incl. cell=0 opt-out) */
+	unsigned int gc_percent;	/* cell GC sparse threshold, percent byte
+					 * utilization; 0 = default (50) */
+	bool gc_percent_seen;		/* gc_percent= given */
 };
 
 void shmem_comp_opts_init(struct shmem_comp_opts *opts);
@@ -355,6 +358,8 @@ void shmem_comp_opts_free(struct shmem_comp_opts *opts);
  */
 int shmem_comp_opts_set_algo(struct shmem_comp_opts *opts, char *algo);
 int shmem_comp_opts_set_cell(struct shmem_comp_opts *opts, const char *val);
+int shmem_comp_opts_set_gc_percent(struct shmem_comp_opts *opts,
+				   const char *val);
 
 /*
  * Parse the compress_watermark=LOW:HIGH mount option (percents,
@@ -388,20 +393,14 @@ void shmem_comp_show_options(struct seq_file *seq,
 			     struct shmem_sb_info *sbinfo);
 
 /*
- * Write-path hook (shmem_write_end): true when this inode's mount has
- * an enabled pool, the mount is in hot mode, and the file is at/over
- * the compression threshold (threshold_bytes). In chill mode this
- * returns false and the write lands uncompressed (see arm_aging).
+ * Write-path hook (shmem_write_end): evaluates the hot/chill flip
+ * against RAM usage (shmem_comp_wm_update, specs/06), then returns
+ * true when this inode's mount has an enabled pool, the mount is in
+ * hot mode, and the file is at/over the compression threshold
+ * (threshold_bytes). In chill mode this returns false and the write
+ * lands uncompressed (the maintenance pass ages it later).
  */
 bool shmem_comp_should_compress(struct inode *inode);
-
-/*
- * Write-path hook (shmem_write_end): arm the mount's aging pass when a
- * write did NOT compress inline (chill mode or sub-threshold write).
- * No-op on uncompressed mounts; scheduling an already-pending work is
- * cheap.
- */
-void shmem_comp_arm_aging(struct inode *inode);
 
 /*
  * Truncate hook (shmem_undo_range): record an uncompressed folio
@@ -527,7 +526,8 @@ void shmem_comp_sysfs_unregister(void);
  */
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
-						unsigned int nr_cells);
+						unsigned int nr_cells,
+						unsigned int gc_percent);
 
 /**
  * shmem_comp_pool_destroy - Destroy a compression pool

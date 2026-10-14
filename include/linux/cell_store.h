@@ -95,14 +95,18 @@
 #define SHMEM_COMP_CELL_MAX_CELLS	(2U << 20)	/* 2 Mi cells */
 
 /*
- * A cell is a GC candidate when more than half its capacity is
- * waste: live_bytes * 2 <= cell_size.  Utilization, not object
- * count — twelve 2 KB blocks in a 64 KiB cell is 75% waste whether
- * we call that "a few objects" or not, and evacuating returns a
- * whole cell to the buddy for the price of twelve memcpys.  The
- * active cell is never a candidate (it takes new allocations), so
- * every pass strictly reduces memory held.
+ * A cell is a GC candidate when it is below gc_percent byte
+ * utilization: live_bytes * 100 <= cell_size * gc_percent.  Byte
+ * utilization, not object count -- twelve 2 KB blocks in a 64 KiB
+ * cell is 75% waste whether we call that "a few objects" or not, and
+ * evacuating returns a whole cell to the buddy for the price of
+ * twelve memcpys.  Default 50 (the historical threshold); per-mount
+ * via gc_percent=, clamped 10..90 at parse.  The active cell is never
+ * a candidate (it takes new allocations), so every pass strictly
+ * reduces memory held.
  */
+#define CELL_IS_SPARSE_PERCENT_DEFAULT	50U
+
 #define CELL_IS_SPARSE(live_bytes, cell_size) \
 	((live_bytes) * 2 <= (cell_size))
 
@@ -171,8 +175,10 @@ struct cell_pool {
 	 */
 	u32		nslots;
 	u8		cell_order;	/* alloc_pages order, same for all cells */
+	unsigned int	gc_percent;	/* sparse threshold: byte-utilization
+					 * percent (mount gc_percent=, default 50) */
 	bool		use_thp;	/* request THP-backed pages */
-	struct list_head sparse;	/* cells below SPARSE_THRESHOLD objects */
+	struct list_head sparse;	/* cells below gc_percent utilization */
 	atomic_long_t	pages_used;	/* (1 << cell_order) * live cells */
 	/*
 	 * Registered by the compression layer when the pool is cell-
@@ -195,8 +201,19 @@ struct cell_pool {
  * CELL_DEFAULT_MAX_CELLS.  Counts above UINT_MAX are clamped (the
  * handle encoding itself would also stop at cellid < 2^32).
  */
+static inline bool cell_is_sparse(const struct cell_pool *cp,
+				  unsigned long live_bytes)
+{
+	unsigned long cell_size = 1UL << (cp->cell_order + PAGE_SHIFT);
+	unsigned long pct = cp->gc_percent ? cp->gc_percent :
+					       CELL_IS_SPARSE_PERCENT_DEFAULT;
+
+	return live_bytes * 100 <= cell_size * pct;
+}
+
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
-				   unsigned int nr_cells);
+				   unsigned int nr_cells,
+				   unsigned int gc_percent);
 void cell_pool_destroy(struct cell_pool *cp);
 
 /*

@@ -3435,15 +3435,12 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	 * takes the lock itself and folio_lock() is not recursive.
 	 * The caller's reference keeps the folio alive.
 	 *
-	 * Stage 2: when the write does NOT compress inline (chill mode,
-	 * or a sub-threshold write in hot mode), arm the mount's aging
-	 * pass -- the page it left behind is a survivor the maintenance
-	 * pass may compress later (death-before-pop).
+	 * specs/06: should_compress() evaluates the hot/chill flip
+	 * (RAM usage) on the write path; a chilled write lands
+	 * uncompressed and the maintenance pass ages it later.
 	 */
 	if (shmem_comp_should_compress(inode))
 		shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
-	else
-		shmem_comp_arm_aging(inode);
 #endif
 
 	folio_put(folio);
@@ -4614,6 +4611,7 @@ enum shmem_param {
 	Opt_compress_watermark,
 	Opt_compress_merge,
 	Opt_cell,
+	Opt_gc_percent,
 #endif
 	Opt_casefold_version,
 	Opt_casefold,
@@ -4656,6 +4654,7 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_u32   ("merge_pages", Opt_compress_merge),
 	fsparam_string("compress_watermark", Opt_compress_watermark),
 	fsparam_string("cell", Opt_cell),
+	fsparam_string("gc_percent", Opt_gc_percent),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -4899,6 +4898,12 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_cell:
 		if (shmem_comp_opts_set_cell(&ctx->comp_opts, param->string))
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_gc_percent:
+		if (shmem_comp_opts_set_gc_percent(&ctx->comp_opts,
+						   param->string))
 			goto bad_value;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
