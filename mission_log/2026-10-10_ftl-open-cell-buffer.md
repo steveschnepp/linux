@@ -1,0 +1,651 @@
+---
+name: ftl-open-cell-buffer
+description: FTL-style open-cell write-gathering buffer for cellzram -- replaces the parked split's per-write RMW with gather-and-close; a design/spec log, nothing built yet
+project: linux
+---
+
+# Mission Log: The Open-Cell Write-Gathering Buffer
+
+Part 18 of the tmpfs transparent-compression series.  Session 34
+(2026-10-10), **design only** -- nothing is implemented.  This log IS
+the spec: the build follows it in bisectable steps.
+
+Session 33 parked the logical/physical split because its payoff did not
+exist on a realistic workload: finishing the read-modify-write core
+would have cost ~200 correctness-critical lines to save 936 bytes.  The
+pivot log named the missing piece in passing -- the split ported "one
+compressed blob per N pages" (piece 1) without the uncompressed
+write-absorbing buffer that makes it cheap (piece 2), which tmpfs gets
+free from its page cache.  This session designs piece 2, modeled on the
+NAND FTL's open-block list, and in doing so revives the split.
+
+Kernel commits: none (design session).
+Rig commits: none.
+
+## What We Did
+
+1. **Re-read the two write paths to ground the asymmetry.**  tmpfs
+   writes land in the page cache uncompressed (`shmem.c`, after
+   `folio_unlock`); compression runs at reclaim or on the aging pass.
+   cellzram (`cellzram.c`) is a block device with no page cache, so
+   every 4K bio write hits the compressed representation directly.
+   That is the whole efficiency gap: tmpfs has an uncompressed buffer
+   absorbing writes, cellzram does not.
+
+2. **Confirmed the storage/grouping machinery the buffer needs already
+   exists.**  The buffer is the only new thing:
+   - `shmem_comp_compress(pool, src, slen, dst, &len)` takes `slen` as a
+     merge multiple, so it compresses a whole unit in one call.
+   - `shmem_comp_store(pool, data, len)` on a **cell** pool stores
+     `len > PAGE_SIZE` as ONE bump region and one handle.  No
+     `store_merged` (that is the zsmalloc-only chunked path).
+   - `shmem_comp_entry_alloc(..., nr_pages=N, NULL, 0, NULL)` already
+     represents N pages as one entry -- exactly how a tmpfs merge group
+     is stored today.
+   - `shmem_comp_entry_sector_set/clear()` (the parked step-4a
+     accessors) flip a discard bit on a closed unit with no recompress.
+   - `shmem_comp_load_entry` + `shmem_comp_decompress` read a closed
+     unit back.
+
+3. **Modeled the buffer on the NAND FTL open-block list.**  A zcell
+   (compression unit) is "open" while an uncompressed buffer of
+   `physical` bytes stages its writes; closing compresses the buffer
+   into one blob and stores it in a cell region.  Writes to an open
+   unit are memcpy-fast; a write to a closed unit opens it (one
+   decompress) instead of paying decompress-recompress per write.
+
+4. **Locked the three policy forks** with the user before writing the
+   design down: **sync close** (for now), **open-count as a module
+   param, default chosen later by the bench**, and **buffer first, the
+   compressible workload measures it**.
+
+## The Design (this log is the spec)
+
+### The FTL mapping
+
+| NAND FTL concept | cellzram gather buffer |
+|---|---|
+| block | zcell = compression unit = `physical`, N logical blocks (`cellzram_unit_of`) |
+| page program | logical 4K write |
+| open block | open-cell buffer: `physical` uncompressed bytes + N-bit valid map |
+| open-block list (bounded) | open-unit set, LRU, bounded by `open_max` |
+| close / seal block | compress buffer -> one blob -> `cell_store` -> entry + bitmap |
+| read an open page | copy from buffer (no decompress; faster than today) |
+| partial-page program (RMW) | eliminated -- the buffer absorbs it |
+
+The split's step-4 RMW core is **replaced**, not built.  Opening a
+closed unit for a partial write costs one decompress (the "read" of
+RMW, paid once per open/close cycle), not a decompress+recompress per
+write.
+
+### Data structures
+
+```c
+/* One open compression unit: an uncompressed staging buffer. */
+struct cz_open_unit {
+	unsigned long		unit_nr;	/* block-table key */
+	void			*buf;		/* `physical` bytes, uncompressed */
+	unsigned long		*valid;		/* ratio bits: live logical blocks */
+	struct list_head	lru;		/* MRU at head, victim at tail */
+	refcount_t		refs;		/* read pins; close drains these */
+	bool			closing;	/* set by close; new readers retry */
+	struct rcu_head		rcu;
+};
+```
+
+The device holds only eviction bookkeeping -- **no second lookup
+structure**:
+
+```c
+struct cellzram {
+	/* ... existing fields ... */
+	struct list_head	open_lru;	/* staged units, MRU at head */
+	unsigned int		open_count;	/* staged units */
+	unsigned int		open_max;	/* module param open_units */
+	spinlock_t		open_lock;	/* protects open_lru, open_count, refs */
+};
+```
+
+The **block table is the single lookup** (session 31's principle, now
+literal).  A slot is one of four things:
+
+| table slot | meaning |
+|---|---|
+| absent | never written (reads zeros) |
+| `xa_mk_value(0)` | zero sentinel (reads zeros) |
+| `xa_mk_value(id)` | closed unit, blob in a cell region |
+| `xa_mk_pointer(cz_open_unit)` | staged unit (open or closing) |
+
+A `struct cz_open_unit *` stored via `xa_store` is an untagged pointer
+entry, so `xa_is_value()` is false for it and the existing value
+dispatch cleanly separates "closed/sentinel" (value) from "staged"
+(pointer).  Reads, writes, discards, and the `mm_stat` walk all do one
+table load and switch on that.
+
+### The paths
+
+- **write(block)**: `unit = cellzram_unit_of(block)`.  Load the table
+  slot.  Pointer and `!closing` -> copy into `buf` at the in-unit
+  offset, set the valid bit, done (no compression).  Pointer and
+  `closing` -> the unit is mid-close; retry the write against the table
+  (hazard 1 below).  Value or absent -> `open_unit(unit, block, data)`.
+- **open(unit, block, data)**: if `open_count == open_max`, `close(LRU
+  tail)` first.  Alloc a `physical` buffer and **seed it fully**:
+  absent/sentinel -> `memset` zeros; closed blob -> one decompress of
+  the entry; then apply `data` to `block`'s offset and set its valid
+  bit.  **Publish last**: `xa_store(pointer)` atomically replaces the
+  entry id with the buffer pointer (freeing the old entry, whose cell
+  region is reclaimed once any concurrent reader's pin drops).  Only
+  after that store does the unit appear staged, so a reader never
+  observes a half-seeded buffer.  A full-unit write may skip the
+  decompress seed (the write fills every block); a partial write over a
+  closed blob must seed from it.  Then link `open_lru`, `open_count++`.
+- **read(block)**: `ent = xa_load(unit)`.  `xa_is_value(ent)` ->
+  sentinel (zeros) or entry id (pin, decompress, put): today's path.
+  Pointer -> `cz_open_unit`: pin the buffer (`refcount_get` under
+  `open_lock`), copy the block, `refcount_put`.  No decompress, no
+  device-wide lock held across the copy.
+- **discard(block)**: staged -> clear the valid bit in the buffer (no
+  recompress; if no valid bit remains, drop the unit).  Closed ->
+  `shmem_comp_entry_sector_clear` bit-flip; erase the entry when no bit
+  remains.  Sentinel -> nothing.  discard reads the table (pointer
+  first) exactly as read does.
+- **close(unit)**: (1) under `open_lock`: set `closing`, unlink
+  `open_lru`, `open_count--`.  The table **still points at the buffer**
+  -- this is what removes the invisible window.  (2) Drop `open_lock`;
+  `compress(buf, physical)` -> `shmem_comp_store` (one cell region) ->
+  `shmem_comp_entry_alloc(nr_pages=N)` + copy the valid bitmap.
+  Incompressible -> store raw at `physical`.  `cell_store` failure ->
+  **un-close** (clear `closing`, relink the LRU, keep the buffer -- it
+  holds the only copy; never drop it on failure).  (3) `xa_store(entry
+  id)` over the pointer (the atomic handoff), drain reader refs, free
+  the buffer.
+- **shrinker**: force-close every staged unit (they are uncompressed
+  RAM) so the buffer yields under memory pressure.
+
+Lifecycle:
+
+```
+              write to a closed/unwritten unit
+   closed ------------------------------------> staged  (seed, then publish)
+     ^                                            |
+     |  close: compress -> store -> xa_store(id)  |  evict LRU / shrinker
+     +--------------------------------------------+
+```
+
+### The read path and the no-invisible-window invariant
+
+The invariant that makes reads correct and simple:
+
+> **At every instant a unit's table slot points at valid data, or is
+> absent (meaning zeros).  Never "in between."**
+
+This rules out the two failure modes the two-structure draft had:
+
+- **No precedence race.**  With a separate `open` xarray consulted
+  first, a read had to check `open` then `table` and pick a winner; a
+  unit mid-open or mid-close could be momentarily in neither, and the
+  read returned zeros for written data.  One table means one load and
+  one dispatch.
+
+- **No invisible window across close.**  close does not clear the slot
+  before compressing; it flips the unit to `closing` but leaves the
+  pointer, so a read arriving mid-close still finds the buffer, pins
+  it, and copies.  `xa_store(entry id)` is the single atomic handoff;
+  only after it does the decompress path take over.  The refcount drain
+  before `kfree(buf)` finishes any reader that pinned during the
+  handoff -- the same protocol the entry pin already uses against
+  `xa_exchange` on the write path.
+
+- **Reads of a staged unit are faster than today**, not slower: a memcpy
+  from the uncompressed buffer, no crypto.  Only a read of a `closing`
+  unit waits behind the refcount drain, and only for one copy's duration.
+
+### Locking and the correctness-critical core
+
+`open_lock` is a **spinlock held only for the table-pointer / LRU /
+refcount manipulation** -- never across the sleepable compress+store
+(`cell_store` -> `alloc_pages` may sleep; a spinlock across it is
+illegal).  close runs its compress+store **outside** `open_lock`,
+having already marked the unit `closing` so eviction and writes leave it
+alone.  `open_lock` is a leaf with respect to `cp->lock` (dropped before
+`cell_store` takes it); nothing under `cp->lock` touches the staged set.
+
+Three hazards are the correctness-critical core -- exactly the lines the
+split's RMW would have been -- and are where review and concurrent-io
+tests must concentrate:
+
+1. **write vs close.**  A write that loads a `closing` pointer must not
+   mutate the buffer close is compressing (a torn write would land in
+   the blob).  The first landing resolves it by **retry**: re-load the
+   table; once close installs the entry id, open the unit fresh.
+   Deliberately *not* a `complete()` on the unit's own memory -- close
+   frees the `cz_open_unit` right after signalling, and a waiter inside
+   `wait_for_completion()` on freed memory is a use-after-free.  If the
+   bench shows the retry livelocks under a hot unit, the fix is a
+   per-unit completion owned by the table entry, not the buffer.
+
+2. **reset/remove vs close.**  A shrinker- or `gc_now`-initiated close
+   can be mid-`xa_store` while reset walks the table erasing slots.
+   reset already freezes the queue and takes `io_lock`; close must take
+   `io_lock` around its step-3 `xa_store` (or reset must drain `closing`
+   units first) so the install cannot race the erase and leak a cell
+   region.  A new place `io_lock` is required; state it in the close
+   comment when built.
+
+3. **close failure.**  If `cell_store` fails, close must `un-close`
+   (clear `closing`, relink the LRU) rather than free the buffer: the
+   buffer is the only copy of acknowledged writes.  Dropping it loses
+   data; a retry (or the shrinker) re-attempts the close later.
+
+Read pinning is the one familiar part: pin the buffer under `open_lock`,
+copy outside it, put -- the entry-pin protocol pointed at a buffer
+instead of a cell region.
+
+### The central trade (honest)
+
+The buffer trades **random-write amplification for compressible-workload
+ratio gains**.  A hot or sequential unit (untar) amortizes: one
+decompress to open + one compress to close across N writes, and gets a
+better ratio (cross-block context) plus a 16x smaller entry table.  A
+scattered random 4K write to a cold unit pays open(decompress
+physical) + write + evict(compress physical) -- *worse* than ratio-1
+per-block storage.  This is exactly FTL behavior.  It means the
+feature's payoff must be validated against the compressible-non-zero
+workload (series open-question #1), not the churn gate, and that a
+random-write workload is the expected regression to characterize.
+
+### Accounting
+
+Open-buffer RAM is uncompressed staging: `open_count * physical`.  It
+is neither cell storage nor compressed data and must be reported
+separately in `mm_stat` (a new field) so the vs-zram comparison stays
+honest.  `orig_bytes` counts a written-but-open block via the table's
+open-marker, so the walk stays exact.  At close the bytes move from
+"open staging" to "cell phys + compressed"; the walk must not
+double-count across the transition.
+
+### Bisectable build ladder
+
+Each step ends green at default (ratio 1), so a regression bisects to
+the step that introduced it.
+
+| # | step | default behaviour |
+|---|------|-------------------|
+| 1 | `struct cz_open_unit`, `open` xarray, LRU, `open_max` param (default 0 = off), open/close helpers -- all dormant | no-op |
+| 2 | wire write/read/discard through the staged-table pointer entries, behind `ratio > 1 && open_max > 0` | no-op (ratio 1) |
+| 3 | enable ratio > 1 (drop the step-4 rejection in `cellzram_init`); seed-on-open; close compresses the unit as one blob; validity bitmap live for closed-unit discard | no-op at default; new ratio>1 test |
+| 4 | eviction (LRU close when full) + shrinker force-close + `mm_stat` open-staging field | no-op at default |
+| 5 | measure: entry table, compression ratio, throughput vs zram, random-write amplification; pick the `open_max` default | n/a |
+
+Steps 1-2 are dormant scaffolding at ratio 1, like the parked split.
+Step 3 flips the feature on when configured.  Step 5 depends on the
+compressible workload (open-question #1), which the user chose to build
+*after* the buffer and use as its proof harness.
+
+## What We Learned
+
+### Technical
+
+- **The grouping machinery already existed; only the write-absorbing
+  buffer did not.**  Reusing `entry_alloc(nr_pages=N)`, one-region cell
+  store, and the sector-bitmap accessors means the buffer adds no new
+  storage format.  Confirming this by reading the call sites (not
+  assuming) is what made the design a small delta instead of a new
+  subsystem.
+
+- **cells store a multi-page blob as ONE region; zsmalloc needs
+  `store_merged`.**  The cell path never chunked, because a cell region
+  is contiguous and up to 4 MiB.  This is why the buffer's close is a
+  single `shmem_comp_store` and why the entry-table and ratio wins are
+  available to cellzram for free once writes stop hitting the blob.
+
+- **A spinlock cannot span `cell_store`.**  close must detach under
+  `open_lock` and drop it before the sleepable compress+store.  Getting
+  this structure wrong is a "sleep in atomic" bug, so the detach/store
+  split is stated explicitly in the design rather than left to the
+  implementer.
+
+- **The buffer is the block device's missing page cache, and that is a
+  known cost, not a surprise.**  tmpfs amortizes grouping via its page
+  cache; cellzram must build a small bounded one.  The uncompressed
+  staging RAM (`open_count * physical`) is the price, and it must be
+  accounted separately or the vs-zram RAM comparison lies.
+
+### Process
+
+- **Model on a known system (NAND FTL) to inherit its policy vocabulary.**
+  "Open block list, close-on-evict, bounded open count" is a design
+  pattern with known failure modes (random-write amplification), so
+  naming it FTL-style surfaces those modes before they are coded.
+
+- **Design forks belong in a decision handshake, not a wall of text.**
+  Sync-vs-async close, the buffer bound, and build order were settled
+  with the user in three questions before the spec was written, so the
+  spec records decisions instead of open alternatives.
+
+- **The spec is a mission log when the journey is the artifact.**  No
+  code changed; writing it as a dated log keeps the parked-split pivot,
+  the buffer design, and the build ladder in one append-only place the
+  series already reads in order.
+
+## What We Decided
+
+- **The open-cell buffer replaces the split's step-4 RMW core.**  The
+  split's steps 1-4a stay parked and dormant; step 4 (RMW) is not built.
+  The buffer is how ratio>1 becomes efficient, and it revives the split.
+
+- **Sync close for now.**  The evicting write compresses the LRU buffer
+  inline.  FTL-faithful, simple, one compress per N writes amortized.
+  The write-latency spike is accepted; async close is a later measured
+  refinement if the bench shows the spike matters.
+
+- **The open-count is a module param (`open_units`), default chosen by
+  the bench later.**  Modeled on `cell_order`/`cell_headroom_pct`: land
+  the knob, sweep it, pick the default from data.  Default 0 (off)
+  until measured.
+
+- **Buffer first; the compressible-non-zero workload measures it.**  The
+  workload the series has been missing becomes the harness that proves
+  the buffer's ratio/entry-table win.  Risk accepted: building
+  correctness-critical code before confirming the payoff on real data.
+
+- **The block table is the single lookup** -- staged units are pointer
+  entries in it, not a second xarray, so reads/writes/discards/`mm_stat`
+  do one load and there is no precedence race.  The no-invisible-window
+  invariant (a slot always points at valid data, or is absent = zeros)
+  is what keeps reads correct across open and close.
+
+- **A closed unit's discard is a bitmap bit-flip** (the parked step-4a
+  accessors go live); an open unit's discard clears a valid bit in the
+  buffer.  Neither recompresses.
+
+## Rules Added
+
+- **A spinlock never spans a possibly-sleeping store.**  Detach under
+  the lock, drop it, then compress+store.  Applies to any bounded-buffer
+  cache that closes by allocating.
+
+- **Uncompressed staging RAM is accounted separately from cell storage.**
+  Any write-gathering buffer must report its peak (`count * unit`) as
+  its own figure, or the compression-vs-baseline RAM comparison is
+  wrong.
+
+- **Validate a grouping feature against the workload it is meant to
+  win, and characterize the workload it is meant to lose.**  The buffer
+  wins sequential/hot units and loses scattered random writes; measuring
+  only the win reproduces session 33's mistake of building against a
+  synthetic.
+
+## What We'd Do Differently
+
+- Would not have built the split's steps toward an RMW core before
+  asking whether a write-absorbing buffer made RMW unnecessary.  The
+  pivot (and this design) show the buffer was the real missing piece
+  all along; the RMW path was a detour that cost a session to park.
+
+- Would have reached for the FTL analogy at the start of session 33
+  rather than mid-step-4.  Naming the mechanism "open blocks" up front
+  would have produced this design before any code was written.
+
+## Files Changed
+
+None -- design-only session.  No kernel or rig code changed; the gates
+were not re-run.
+
+The build that follows this spec will touch:
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `mm/cellzram.c` | modify | `struct cz_open_unit`, `open` xarray + LRU + `open_lock`, `open_units` param; wire write/read/discard/close; drop the ratio>1 rejection (step 3); eviction + shrinker; `mm_stat` open-staging field |
+| `include/linux/shmem_compress.h` | modify (likely) | open/close helpers if any cross into the pool; otherwise unchanged -- the buffer is device-local |
+| `~/tmpfs-compress-test/tests/test_cellzram.c` | modify | ratio>1 correctness: open/write/read/discard round-trip, close-on-evict, concurrent io during close, zero-block + bitmap discard |
+| `~/tmpfs-compress-test/tests/` (compressible workload) | create | real dataset (text/binaries/logs) measuring compression ratio vs zram -- the buffer's proof harness (series open-question #1) |
+
+## Test Results / Benchmarks
+
+None -- nothing implemented.  The bisectable ladder re-runs the standing
+gates (cellzram, fsdev, churn, randio, torture) at each step and must
+stay green at default.  Step 5 is where the ratio/entry-table and
+random-write-amplification numbers land, and it is gated on the
+compressible workload existing.
+
+## Next Steps
+
+1. **Build step 1**: `cz_open_unit`, `open` xarray, LRU, `open_units`
+   param (default 0), open/close helpers -- dormant, green no-op.
+2. **Steps 2-3**: wire the paths behind `ratio>1 && open_max>0`, then
+   enable ratio>1 with seed-on-open and one-blob close.  Add the
+   ratio>1 round-trip and concurrent-close tests.
+3. **Step 4**: eviction + shrinker force-close + `mm_stat` open-staging
+   accounting.
+4. **Build the compressible-non-zero workload** (open-question #1) and
+   use it as step 5's harness.
+5. **Step 5**: measure entry table, compression ratio, throughput vs
+   zram, and random-write amplification; sweep `open_units` and pick the
+   default.
+
+Open questions to resolve during the build:
+
+- **`open_max` sizing.**  A small fixed count (8-16) is the FTL
+  default; the bench picks it.  Does it need to track `cell_order`
+  (buffer size) or the device's hot-unit working set?
+- **Seed-on-open cost.**  Does the partial-write-open decompress amortize
+  on the compressible workload?  The full-unit-write-skips-seed fast
+  path is in; whether the decompress-on-partial-open dominates random
+  workloads is the amplification to measure.
+- **Does close need to be async after all?**  Only the bench's
+  write-latency column can say; sync is the landing point.
+- **`physical` default.**  The buffer only helps at ratio > 1, so a
+  `physical_block_size` > PAGE_SIZE default becomes worth considering
+  once the buffer proves out -- but the cell_order sweep and this knob
+  interact (buffer RAM = `open_count * physical`) and must be swept
+  together.
+
+---
+
+## The design, refined in-session (appended; supersedes the draft above)
+
+Appended the same day, after the first draft was committed
+(`c335418a6dd4`).  The user kept refining the design and each pass
+simplified it.  **The draft above is left exactly as written** -- it is
+the record of where the design went, and its two superseded ideas (a
+separate `open` xarray, then pointer entries in the table; and sync
+close on the evicting write) are the useful part.  Per the mission-log
+rule that a log is append-only and the journey matters more than the
+destination, nothing above was rewritten.  This section is what gets
+built.
+
+### Refinement A: the staged address is a handle bit, not a table pointer
+
+The committed draft put `xa_mk_pointer(cz_open_unit)` in the block table
+for a staged unit, which mixes pointer and value entries in one xarray
+and moves the dispatch into the table.  Cleaner: keep the table
+value-only (entry ids, as always) and spend an **unused high bit of the
+entry handle**.  `entry->handle` for a cell pool packs `{cellid,
+offset}` via `shmem_comp_pack_loc` and leaves **bits 63..55 free** (the
+header says so).  One bit becomes the staged flag:
+
+- **bit 63 clear** -- a cell region `{cellid, offset}`: closed,
+  compressed.  Today's meaning.
+- **bit 63 set** -- an **open-buffer slot index** (the low bits):
+  staged, uncompressed.
+
+The **entry exists for a unit whether staged or closed** -- it is the
+unit's metadata home throughout (length, `nr_pages`, the parked step-4a
+`valid[]` bitmap).  Only the `handle` flips between the two states.
+`shmem_comp_unpack_loc()` runs only on cell-region handles; dispatch is
+one `is_staged()` test.  The block table, the value-only single lookup,
+and the no-invisible-window invariant all stand unchanged from above --
+only the *encoding* of "staged" moved from a table pointer to a handle
+bit.  The **open buffers are pool-owned** (shmem_compress side, a
+bounded `opens[]` array, lazily allocated like the cell directory),
+because the GC pass lives there and already scans the global entry
+table.
+
+### Refinement B: close is the async GC; the write compresses only when it must
+
+The committed draft closed a unit synchronously on the evicting write.
+The user's model -- exactly tmpfs's -- is **write uncompressed, compress
+on the async GC**:
+
+- **Normal write: stage only, no compression.**  The write copies into
+  the staged buffer and returns.  It never compresses.
+- **The write path compresses ONLY when there is no free open slot.**
+  When `open_count == open_max` and a write needs a new slot, *that*
+  write drains one staged buffer (compresses it) to free a slot -- the
+  direct-reclaim analog.  Normally it does not compress at all; sized
+  right, with the background GC keeping the count low, this is the only
+  compress the write path ever pays.
+- **GC compresses (async).**  On its normal triggers (shrinker,
+  `gc_now`, store-exhaustion), the cell GC gains a **staged drain**:
+  scan the global entry table for staged handles, pin
+  (`atomic_inc_not_zero`), `compress(open buffer)` -> `shmem_comp_store`
+  (one cell region) -> `WRITE_ONCE(ent->handle, pack_loc(...))` (bit 63
+  now clear), free the slot.  This is `shmem_comp_drain_victim`'s exact
+  pin-and-WRITE_ONCE pattern pointed at an open buffer instead of a
+  victim cell -- the mechanism already exists, at
+  `shmem_compress.c:1505`.
+
+This supersedes "sync close for now."  It removes the write-latency
+spike in the common case and makes the compression trigger the memory
+policy that already exists.  The three hazards recorded above (write-vs-
+close, reset-vs-close, close-failure) carry over unchanged; they are
+now attached to the GC staged-drain instead of an inline close.
+
+### Refinement C: there is no read cache
+
+cellzram is **not a second page cache**.  A read is either hot (just
+written, still in a staged buffer -- a memcpy anyway) or cold (closed
+and compressed, unlikely to be re-read soon).  tmpfs decompresses into
+the page cache and *keeps* the folios because a mapped page will be
+re-read; cellzram's blocks are already cached by the filesystem's page
+cache above it (ext4), so caching them again here is redundant.
+
+So a read of a closed unit decompresses into the bio's destination page
+and **retains nothing**.  The only uncompressed residency cellzram ever
+holds is *written* data in a staged buffer, never data that was merely
+read.  A bio spanning several blocks of one unit decompresses it once
+into a scratch buffer and slices the blocks out -- per-bio efficiency,
+retained across nothing.
+
+### Ladder adjustment
+
+Steps 1-2 carry the handle-bit encoding and the pool `opens[]` array
+instead of `cz_open_unit` + a table pointer; step 3's close becomes the
+GC staged-drain; step 4's "eviction" becomes the no-open-slot write
+drain plus the shrinker force-drain.  The bisectable shape is otherwise
+unchanged: every step green at default (ratio 1), dormant until step 3
+flips ratio>1 on.
+
+### Process note
+
+- **A mission log is append-only.**  Superseded designs stay in place;
+  the refinement is appended and says what it supersedes.  Rewriting
+  the file to "clean up" the design would delete the exact dead ends a
+  future reader needs.  This near-miss is the rule restated: correct the
+  record forward, never in place.
+
+---
+
+## Build progress (appended as steps land)
+
+Implementation follows the bisectable ladder above: every step green at
+default (ratio 1), dormant until ratio>1 is configured.  Steps land one
+commit at a time; this section records them.
+
+### Steps 1 + 2: the parameter knob, then staged ratio>1 (landed)
+
+- **Step 1** (`172e7b6564e9`): staged-handle encoding (bit 63 of the entry
+  handle = open-buffer index), the pool `open_max` knob, and the cellzram
+  `open_units` module param (default 0 = off).  Dormant no-op; cellzram
+  gate 106/0.
+- **Step 2a** (`ef3ee5b1ff4c`): pool-side staging primitives --
+  `struct shmem_comp_open` (buffer + a per-slot rwsem mirroring a cell's),
+  `stage_open` (seed a staged entry from a closed blob or zero),
+  `unit_load` (the whole ratio>1 read: validity mask + staged memcpy /
+  closed decompress), and entry teardown freeing a staged slot instead of
+  a cell region.  No caller yet; inert at default.
+- **Step 2b** (`8fb0ab6c748e`, rig `32c2039`): the device runs at ratio>1.
+  A write stages into an uncompressed gather buffer and compresses
+  nothing; reads dispatch staged vs closed; a zero/discard clears a
+  block's validity bit.  `mm_stat` at ratio>1: orig = live blocks * PAGE,
+  phys includes staged buffers.  `cellzram_init` allows ratio>1 only when
+  `open_units>0`.
+
+**Verified.**  Ratio-1 cellzram gate **106/0** (no regression across all
+of step 2).  New ratio>1 staging test (physical=64K -> ratio 16,
+open_units=8) **15/0**: staged round-trip across units, overwrite,
+zero-overwrite and a punched block reading zeros with neighbours intact,
+`mm_stat orig == live*PAGE` (520192 = 127 x 4096) and `phys` showing the
+staged buffers (524288 = 128 pages = 8 units x 16), reset draining to 0.
+
+**Known gap in step 2 (deliberate, next step).**  A write to a new unit
+when the pool has no free open slot returns `BLK_STS_RESOURCE`; the async
+GC drain that compresses a staged buffer into a cell region (freeing the
+slot) is step 3, and the write-path drain-on-full that the design calls
+for ("compress when no open slots") is step 4.  `compr_bytes` is 0 under
+staging until a drain runs, exactly as the model predicts.
+
+### Next: step 3 (the GC staged-drain)
+
+Wire `shmem_comp_cell_gc` to compress staged buffers into cell regions --
+the `drain_victim` pin + `WRITE_ONCE` handle-flip, pointed at an open
+buffer instead of a victim cell.  This is the concurrency-critical step:
+the staged reader's `down_read` + handle-recheck already in `unit_load`
+is what makes it safe, and it is what a concurrent-io test must exercise.
+
+### Steps 3 + 4: the async drain, then drain-on-full (landed)
+
+- **Step 3** (`0a63915d8608`, rig `7f38dfb`): `shmem_comp_cell_gc` now
+  compresses staged open buffers into cell regions before draining sparse
+  cells -- the `drain_victim` pin + `WRITE_ONCE` handle-flip contract,
+  pointed at an open buffer.  Serialised by `gc_lock` (every `cell_gc`
+  caller holds it).  Incompressible units store raw; `unit_load` detects
+  `length == unit_bytes` and extracts without decompressing.
+- **Step 4** (`cf18eaaa5342`, rig `9c90e04`): drain-on-full on the write
+  path.  On pool-full, `cellzram_write_unit` calls
+  `shmem_comp_drain_staged_now()` to free a slot and retries once -- the
+  "compress when no open slots" direct-reclaim analog.  Only if every
+  slot is genuinely pinned does it return `-ENOMEM`.
+
+**A bug found and fixed in step 3.**  `shmem_comp_load_entry()` copies
+`*len` bytes -- the STORED length, not a capacity.  `stage_open`'s seeding
+was passing `unit_bytes` as `*len`, so it copied the compressed blob *plus
+adjacent cell garbage* and the inflate failed (write-after-drain returned
+EIO).  The read path was immune because `unit_load` passes `ent->length`.
+Caught by the split test's write-after-drain check, not by inspection --
+exactly the kind of latent `*len`-vs-capacity confusion the ratio-1 path
+had already learned to avoid by fetching the length from `entry_get`.
+
+**Verified.**  Ratio-1 cellzram gate **106/0** (staging/drain/drain-on-full
+are all inert at `open_units==0`).  Ratio>1 split test (ratio 16,
+open_units 8) now **24/0**: staged round-trip, overwrite, zero/punch
+clear, `gc_now` drain (compr 0 -> 12433, phys 524288 -> 262144), closed
+reads surviving the handle flip, write-after-drain re-stage, and
+drain-on-full (writing 2x open_units with no explicit gc_now).
+
+### Step 5 (measure): the feature is built; the evidence is the next
+session
+
+Steps 1-4 are the complete open-cell buffer: staged writes, GC
+drain-on-full, all green.  What remains is the measurement the design
+gated the whole feature on, and it is a distinct effort:
+
+- **The entry-table win is already visible** in the split test: 128
+  logical blocks across 8 units -> `objects=8` (one entry per 16 blocks),
+  versus 128 entries at ratio 1.  That is the 16x entry-table reduction
+  the split existed for, confirmed at ratio 16.
+- **The compression-ratio and throughput-vs-zram evidence is not**, and
+  cannot be, gathered here: it needs the **compressible-non-zero
+  workload** (series open-question #1 -- a real text/binary/log dataset),
+  run through the M-boot aggregator against zram.  Every prior "cellzram
+  wins" claim rests on zero-heavy or incompressible synthetics; this
+  feature's payoff (better cross-block ratio + smaller entry table) must
+  be proven on real data before any `open_units`/`physical` default
+  moves.  That workload + the sweep is the next session's brief, not a
+  continuation of this build.
+
+So: the code is done and green; the *decision it informs* (does staging
+pay on a realistic compressible workload, and what default) awaits the
+measurement session.

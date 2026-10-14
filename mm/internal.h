@@ -1562,6 +1562,22 @@ void __meminit __init_page_from_nid(unsigned long pfn, int nid);
 unsigned long shrink_slab(gfp_t gfp_mask, int nid, struct mem_cgroup *memcg,
 			  int priority);
 
+int shmem_add_to_page_cache(struct folio *folio,
+			    struct address_space *mapping,
+			    pgoff_t index, void *expected, gfp_t gfp);
+bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped);
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * prototypes live here (with the shmem_add_to_page_cache one above)
+ * so config-off builds see them too, while the EXPORT_SYMBOL_GPL in
+ * mm/shmem.c stays gated on CONFIG_TMPFS_COMPRESSION.
+ */
+struct shmem_inode_info;
+void shmem_delete_from_page_cache(struct folio *folio, void *radswap);
+struct folio *shmem_alloc_folio(gfp_t gfp, int order,
+				struct shmem_inode_info *info,
+				pgoff_t index);
+
 #ifdef CONFIG_SHRINKER_DEBUG
 static inline __printf(2, 0) int shrinker_debugfs_name_alloc(
 			struct shrinker *shrinker, const char *fmt, va_list ap)

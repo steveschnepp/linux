@@ -35,6 +35,10 @@
 #include <linux/export.h>
 #include <linux/shmem_fs.h>
 #include <linux/swap.h>
+#ifdef CONFIG_TMPFS_COMPRESSION
+#include <linux/shmem_compress.h>
+#include <linux/cell_store.h>
+#endif
 #include <linux/uio.h>
 #include <linux/hugetlb.h>
 #include <linux/fs_parser.h>
@@ -123,6 +127,10 @@ struct shmem_options {
 	bool noswap;
 	unsigned short quota_types;
 	struct shmem_quota_limits qlimits;
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Transparent compression options (parsed, see shmem_compress.c) */
+	struct shmem_comp_opts comp_opts;
+#endif
 #if IS_ENABLED(CONFIG_UNICODE)
 	struct unicode_map *encoding;
 	bool strict_encoding;
@@ -132,6 +140,7 @@ struct shmem_options {
 #define SHMEM_SEEN_HUGE 4
 #define SHMEM_SEEN_INUMS 8
 #define SHMEM_SEEN_QUOTA 16
+#define SHMEM_SEEN_COMPRESS 32
 };
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -434,7 +443,7 @@ static void shmem_free_inode(struct super_block *sb, size_t freed_ispace)
  *
  * Return: true if swapped was incremented from 0, for shmem_writeout().
  */
-static bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
+bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
 {
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	bool first_swapped = false;
@@ -466,6 +475,14 @@ static bool shmem_recalc_inode(struct inode *inode, long alloced, long swapped)
 		shmem_inode_unacct_blocks(inode, freed);
 	return first_swapped;
 }
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
+EXPORT_SYMBOL_GPL(shmem_recalc_inode);
+#endif
 
 bool shmem_charge(struct inode *inode, long pages)
 {
@@ -501,7 +518,6 @@ static int shmem_replace_entry(struct address_space *mapping,
 	void *item;
 
 	VM_BUG_ON(!expected);
-	VM_BUG_ON(!replacement);
 	item = xas_load(&xas);
 	if (item != expected)
 		return -ENOENT;
@@ -860,7 +876,7 @@ static void shmem_update_stats(struct folio *folio, int nr_pages)
 /*
  * Somewhat like filemap_add_folio, but error if expected item has gone.
  */
-static int shmem_add_to_page_cache(struct folio *folio,
+int shmem_add_to_page_cache(struct folio *folio,
 				   struct address_space *mapping,
 				   pgoff_t index, void *expected, gfp_t gfp)
 {
@@ -919,10 +935,18 @@ unlock:
 	return 0;
 }
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
+EXPORT_SYMBOL_GPL(shmem_add_to_page_cache);
+#endif
+
 /*
  * Somewhat like filemap_remove_folio, but substitutes swap for @folio.
  */
-static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
+void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 {
 	struct address_space *mapping = folio->mapping;
 	long nr = folio_nr_pages(folio);
@@ -937,6 +961,14 @@ static void shmem_delete_from_page_cache(struct folio *folio, void *radswap)
 	folio_put_refs(folio, nr);
 	BUG_ON(error);
 }
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
+EXPORT_SYMBOL_GPL(shmem_delete_from_page_cache);
+#endif
 
 /*
  * Remove swap entry from page cache, free the swap and its page cache. Returns
@@ -1096,11 +1128,24 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 	if (info->fallocend > start && info->fallocend <= end && !unfalloc)
 		info->fallocend = start;
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Two-table: a compressed page's entry lives in entries[], not in
+	 * i_pages, so the walks below never see it.  Free the range's
+	 * entries here (a both-state folio, if any, is dropped by the
+	 * walks below); each freed entry drops one logical page's swapped
+	 * charge, folded into nr_swaps_freed for the final recalc.
+	 */
+	nr_swaps_freed += shmem_comp_truncate_range(inode, start, end);
+#endif
+
 	folio_batch_init(&fbatch);
 	index = start;
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			bool removed = false;
+
 			folio = fbatch.folios[i];
 
 			if (xa_is_value(folio)) {
@@ -1111,9 +1156,29 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 				continue;
 			}
 
-			if (!unfalloc || !folio_test_uptodate(folio))
-				truncate_inode_folio(mapping, folio);
+			if (!unfalloc || !folio_test_uptodate(folio)) {
+#ifdef CONFIG_TMPFS_COMPRESSION
+				/* full removal of an uncompressed folio */
+				shmem_comp_note_unmap(inode);
+#endif
+				removed = !truncate_inode_folio(mapping, folio);
+			}
 			folio_unlock(folio);
+#ifdef CONFIG_TMPFS_COMPRESSION
+			/*
+			 * entry-race lost-wakeup fix: the folio just left the
+			 * page cache, so no future lock/unlock on it is
+			 * guaranteed.  folio_unlock()'s wake walk above can skip
+			 * an exclusive waiter when the lock bit momentarily reads
+			 * set (a racing trylock), abandoning it forever.  Drain
+			 * the wait queue while PG_locked is clear so the walk
+			 * cannot skip.  This truncate path previously had NO
+			 * drain (only the compress and reader-detached paths did),
+			 * so a reader parked here on a truncated folio stalled.
+			 */
+			if (removed)
+				wake_up_folio_waiters(folio);
+#endif
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);
@@ -1170,6 +1235,8 @@ whole_folios:
 			continue;
 		}
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			bool removed = false;
+
 			folio = fbatch.folios[i];
 
 			if (xa_is_value(folio)) {
@@ -1200,7 +1267,11 @@ whole_folios:
 						folio);
 
 				if (!folio_test_large(folio)) {
-					truncate_inode_folio(mapping, folio);
+#ifdef CONFIG_TMPFS_COMPRESSION
+					/* full removal of an uncompressed folio */
+					shmem_comp_note_unmap(inode);
+#endif
+					removed = !truncate_inode_folio(mapping, folio);
 				} else if (truncate_inode_partial_folio(folio, lstart, lend)) {
 					/*
 					 * If we split a page, reset the loop so
@@ -1218,6 +1289,15 @@ whole_folios:
 				}
 			}
 			folio_unlock(folio);
+#ifdef CONFIG_TMPFS_COMPRESSION
+			/* entry-race lost-wakeup fix (same as the first walk):
+			 * a folio that just left the page cache has no guaranteed
+			 * future lock/unlock, so drain its waiters while PG_locked
+			 * is clear.  This is the second (whole_folios) truncate
+			 * walk -- it also needs the drain. */
+			if (removed)
+				wake_up_folio_waiters(folio);
+#endif
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);
@@ -1357,6 +1437,11 @@ static void shmem_evict_inode(struct inode *inode)
 		inode->i_size = 0;
 		mapping_set_exiting(inode->i_mapping);
 		shmem_truncate_range(inode, 0, (loff_t)-1);
+#ifdef CONFIG_TMPFS_COMPRESSION
+		/* Free the per-inode entries[] table after truncate has
+		 * released any slots.  NULL-safe (most inodes never compress). */
+		shmem_comp_entries_destroy(inode);
+#endif
 		if (!list_empty(&info->shrinklist)) {
 			spin_lock(&sbinfo->shrinklist_lock);
 			if (!list_empty(&info->shrinklist)) {
@@ -1859,7 +1944,7 @@ static unsigned long shmem_suitable_orders(struct inode *inode, struct vm_fault 
 }
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
-static struct folio *shmem_alloc_folio(gfp_t gfp, int order,
+struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 		struct shmem_inode_info *info, pgoff_t index)
 {
 	struct mempolicy *mpol;
@@ -1872,6 +1957,14 @@ static struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 
 	return folio;
 }
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * Exported for the tmpfs compression backend (mm/shmem_compress.c);
+ * gated so no API exists when CONFIG_TMPFS_COMPRESSION=n.
+ */
+EXPORT_SYMBOL_GPL(shmem_alloc_folio);
+#endif
 
 static struct folio *shmem_alloc_and_add_folio(struct vm_fault *vmf,
 		gfp_t gfp, struct inode *inode, pgoff_t index,
@@ -2474,12 +2567,36 @@ repeat:
 		return error;
 	}
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Two-table compressed page: i_pages[index] is empty but
+	 * entries[index] names a compressed entry (compressed, or "both"
+	 * with a reclaimable folio).  Decompress into a folio, keeping the
+	 * entry. -EEXIST/-ENOENT: the folio slot filled or the entry
+	 * vanished (races); retry against the updated tables.
+	 */
+	if (!folio && shmem_comp_entries_present(inode, index)) {
+		error = shmem_decompress_folio(inode, index, gfp, &folio);
+		if (error == -EEXIST || error == -ENOENT)
+			goto repeat;
+
+		*foliop = folio;
+		return error;
+	}
+#endif
+
 	if (folio) {
 		folio_lock(folio);
 
 		/* Has the folio been truncated or swapped out? */
 		if (unlikely(folio->mapping != inode->i_mapping)) {
 			folio_unlock(folio);
+			/* Detached folio: this may be the last lock/unlock on
+			 * it, so drain any lock waiters before dropping the
+			 * ref -- a waiter left behind can never be collected
+			 * (entry-race lost-wakeup fix, with the compress-side
+			 * drain in shmem_comp_compress_one). */
+			wake_up_folio_waiters(folio);
 			folio_put(folio);
 			goto repeat;
 		}
@@ -3070,6 +3187,9 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 	INIT_LIST_HEAD(&info->shrinklist);
 	INIT_LIST_HEAD(&info->swaplist);
 	simple_xattrs_init(&info->xattrs);
+#ifdef CONFIG_TMPFS_COMPRESSION
+	info->comp_entries = NULL;	/* lazy: alloc'd on first compress */
+#endif
 	cache_no_acl(inode);
 	if (sbinfo->noswap)
 		mapping_set_unevictable(inode->i_mapping);
@@ -3298,6 +3418,13 @@ shmem_write_begin(const struct kiocb *iocb, struct address_space *mapping,
 		return -EIO;
 	}
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* A write makes any surviving compressed copy of this page stale;
+	 * free it so the folio becomes the sole copy (specs/02
+	 * write-invalidate).  write_end's recompress stores a fresh one. */
+	shmem_comp_invalidate_write(inode, index);
+#endif
+
 	*foliop = folio;
 	return 0;
 }
@@ -3322,6 +3449,21 @@ shmem_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	}
 	folio_mark_dirty(folio);
 	folio_unlock(folio);
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Compression runs after folio_unlock: shmem_compress_folio()
+	 * takes the lock itself and folio_lock() is not recursive.
+	 * The caller's reference keeps the folio alive.
+	 *
+	 * specs/06: should_compress() evaluates the hot/chill flip
+	 * (RAM usage) on the write path; a chilled write lands
+	 * uncompressed and the maintenance pass ages it later.
+	 */
+	if (shmem_comp_should_compress(inode))
+		shmem_compress_folio(inode, pos >> PAGE_SHIFT, folio);
+#endif
+
 	folio_put(folio);
 
 	return copied;
@@ -4495,6 +4637,15 @@ enum shmem_param {
 	Opt_usrquota_inode_hardlimit,
 	Opt_grpquota_block_hardlimit,
 	Opt_grpquota_inode_hardlimit,
+#ifdef CONFIG_TMPFS_COMPRESSION
+	Opt_nocompress,
+	Opt_compress_algo,
+	Opt_compress_threshold,
+	Opt_compress_watermark,
+	Opt_compress_merge,
+	Opt_cell,
+	Opt_gc_percent,
+#endif
 	Opt_casefold_version,
 	Opt_casefold,
 	Opt_strict_encoding,
@@ -4528,6 +4679,15 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_string("usrquota_inode_hardlimit", Opt_usrquota_inode_hardlimit),
 	fsparam_string("grpquota_block_hardlimit", Opt_grpquota_block_hardlimit),
 	fsparam_string("grpquota_inode_hardlimit", Opt_grpquota_inode_hardlimit),
+#endif
+#ifdef CONFIG_TMPFS_COMPRESSION
+	fsparam_string("compress", Opt_compress_algo),
+	fsparam_flag  ("nocompress", Opt_nocompress),
+	fsparam_string("compress_threshold", Opt_compress_threshold),
+	fsparam_u32   ("merge_pages", Opt_compress_merge),
+	fsparam_string("compress_watermark", Opt_compress_watermark),
+	fsparam_string("cell", Opt_cell),
+	fsparam_string("gc_percent", Opt_gc_percent),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -4734,6 +4894,53 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 				       "Group quota inode hardlimit too large.");
 		ctx->qlimits.grpquota_ihardlimit = size;
 		break;
+#ifdef CONFIG_TMPFS_COMPRESSION
+	case Opt_nocompress:
+		ctx->comp_opts.compress = false;
+		ctx->comp_opts.off_reason = SHMEM_COMP_OFF_NOFLAG;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_compress_algo:
+		if (shmem_comp_opts_set_algo(&ctx->comp_opts,
+					     param->string))
+			return invalfc(fc,
+				"tmpfs: compressor '%s' unavailable",
+				param->string);
+		/* helper consumed the string on success */
+		param->string = NULL;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_compress_threshold:
+		size = memparse(param->string, &rest);
+		if (*rest || size > UINT_MAX)
+			goto bad_value;
+		ctx->comp_opts.threshold_bytes = size;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_compress_watermark:
+		if (shmem_comp_opts_set_watermark(&ctx->comp_opts,
+						   param->string))
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_compress_merge:
+		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_MERGE_MAX)
+			goto bad_value;
+		ctx->comp_opts.merge_pages = result.uint_32;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_cell:
+		if (shmem_comp_opts_set_cell(&ctx->comp_opts, param->string))
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_gc_percent:
+		if (shmem_comp_opts_set_gc_percent(&ctx->comp_opts,
+						   param->string))
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+#endif
 	case Opt_casefold_version:
 		return shmem_parse_opt_casefold(fc, param, false);
 	case Opt_casefold:
@@ -4800,6 +5007,11 @@ static int shmem_reconfigure(struct fs_context *fc)
 
 	raw_spin_lock(&sbinfo->stat_lock);
 	used_isp = sbinfo->max_inodes * BOGO_INODE_SIZE - sbinfo->free_ispace;
+
+	if (ctx->seen & SHMEM_SEEN_COMPRESS) {
+		err = "Cannot retroactively change compression options";
+		goto out;
+	}
 
 	if ((ctx->seen & SHMEM_SEEN_BLOCKS) && ctx->blocks) {
 		if (!sbinfo->max_blocks) {
@@ -4955,6 +5167,10 @@ static int shmem_show_options(struct seq_file *seq, struct dentry *root)
 		seq_printf(seq, ",grpquota_inode_hardlimit=%lld",
 			   sbinfo->qlimits.grpquota_ihardlimit);
 #endif
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* /proc/mounts tells the truth about compression (option v2) */
+	shmem_comp_show_options(seq, sbinfo);
+#endif
 	return 0;
 }
 
@@ -4974,6 +5190,9 @@ static void shmem_put_super(struct super_block *sb)
 #endif
 	free_percpu(sbinfo->ino_batch);
 	percpu_counter_destroy(&sbinfo->used_blocks);
+#ifdef CONFIG_TMPFS_COMPRESSION
+	shmem_comp_put_super(sbinfo);
+#endif /* CONFIG_TMPFS_COMPRESSION */
 	mpol_put(sbinfo->mpol);
 	kfree(sbinfo);
 	sb->s_fs_info = NULL;
@@ -5098,6 +5317,15 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 #endif /* CONFIG_TMPFS_QUOTA */
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Compression state for this mount is owned by mm/shmem_compress.c */
+	error = shmem_comp_fill_sb(sb, sbinfo, &ctx->comp_opts,
+				   (ctx->blocks ?:
+				    shmem_default_max_blocks()) << PAGE_SHIFT);
+	if (error)
+		goto failed;
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 	inode = shmem_get_inode(&nop_mnt_idmap, sb, NULL,
 				S_IFDIR | sbinfo->mode, 0, VM_NORESERVE);
 	if (IS_ERR(inode)) {
@@ -5127,6 +5355,9 @@ static void shmem_free_fc(struct fs_context *fc)
 
 	if (ctx) {
 		mpol_put(ctx->mpol);
+#ifdef CONFIG_TMPFS_COMPRESSION
+		shmem_comp_opts_free(&ctx->comp_opts);
+#endif
 		kfree(ctx);
 	}
 }
@@ -5316,6 +5547,9 @@ int shmem_init_fs_context(struct fs_context *fc)
 	ctx->mode = 0777 | S_ISVTX;
 	ctx->uid = current_fsuid();
 	ctx->gid = current_fsgid();
+#ifdef CONFIG_TMPFS_COMPRESSION
+	shmem_comp_opts_init(&ctx->comp_opts);
+#endif
 
 #if IS_ENABLED(CONFIG_UNICODE)
 	ctx->encoding = NULL;
@@ -5393,8 +5627,16 @@ static int __init tmpfs_sysfs_init(void)
 		return -ENOMEM;
 
 	ret = sysfs_create_group(tmpfs_kobj, &tmpfs_attribute_group);
-	if (ret)
+	if (ret) {
 		kobject_put(tmpfs_kobj);
+		return ret;
+	}
+
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/* Compression is optional: keep tmpfs working without it. */
+	if (shmem_comp_sysfs_register(tmpfs_kobj))
+		pr_warn("tmpfs: failed to create compression sysfs group\n");
+#endif
 
 	return ret;
 }

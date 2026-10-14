@@ -164,6 +164,22 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
 	return xa_mk_value(entry.val);
 }
 
+#ifdef CONFIG_TMPFS_COMPRESSION
+/*
+ * The per-inode entries[] table (the two-table mapping, specs/02)
+ * carries {id, generation} in an xa_value.  A stale id -- freed by a
+ * racing truncate and recycled for a different block -- must be
+ * distinguishable from the new incarnation, so get/release validate the
+ * generation and reject the stale id (-ENOENT), letting the caller
+ * retry against the updated slot.  The generation is masked to 23 bits:
+ * wrap at 2^23 allocations is harmless, since ABA would need the same
+ * id recycled exactly 2^23 allocations later inside a sub-microsecond
+ * load-to-pin window.
+ */
+#define SHMEM_COMP_ENTRY_GEN_BITS	23
+#define SHMEM_COMP_ENTRY_GEN_MASK	((1U << SHMEM_COMP_ENTRY_GEN_BITS) - 1)
+#endif /* CONFIG_TMPFS_COMPRESSION */
+
 #if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
 static inline swp_entry_t make_readable_device_private_entry(pgoff_t offset)
 {

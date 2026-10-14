@@ -1086,6 +1086,7 @@ int __folio_lock_killable(struct folio *folio);
 vm_fault_t __folio_lock_or_retry(struct folio *folio, struct vm_fault *vmf);
 void unlock_page(struct page *page);
 void folio_unlock(struct folio *folio);
+void wake_up_folio_waiters(struct folio *folio);
 
 /**
  * folio_trylock() - Attempt to lock a folio.

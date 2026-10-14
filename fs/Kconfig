@@ -210,6 +210,37 @@ config TMPFS_XATTR
 
 	  If unsure, say N.
 
+config TMPFS_COMPRESSION
+	bool "Transparent compression for tmpfs"
+	depends on TMPFS && CRYPTO && ZSMALLOC
+	select CRYPTO_LZO
+	select CRYPTO_LZ4
+	select CRYPTO_LZO_RLE
+	default n
+	help
+	  Enable transparent page-level compression for tmpfs files.
+	  Compressed pages are stored in zsmalloc pools and transparently
+	  decompressed on access. This allows tmpfs to use less memory
+	  for compressible data without reserving RAM upfront.
+
+	  Compression is configured at mount time or via /sys/fs/tmpfs/
+	  interface. Supported algorithms: lz4 (default), lzo, lzo-rle.
+
+	  If unsure, say N.
+
+config TMPFS_COMPRESSOR_DEFAULT
+	string
+	depends on TMPFS_COMPRESSION
+	default "lz4"
+	help
+	  Default compression algorithm for tmpfs. Available options:
+	    lz4     - Fastest, good compression ratio (recommended)
+	    lzo     - Good balance of speed and ratio
+	    lzo-rle - Better for incompressible data
+
+	  This can be changed at runtime via /sys/fs/tmpfs/compressor or
+	  per-mount via the compress= mount option.
+
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT

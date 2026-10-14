@@ -12,6 +12,9 @@
 #include <linux/userfaultfd_k.h>
 
 struct swap_iocb;
+#ifdef CONFIG_TMPFS_COMPRESSION
+struct shmem_comp_sb;		/* mm/shmem_compress.c */
+#endif
 
 /* inode in-kernel data */
 
@@ -37,6 +40,23 @@ struct shmem_inode_info {
 	struct simple_xattrs	xattrs;		/* list of xattrs */
 	pgoff_t			fallocend;	/* highest fallocate endindex */
 	unsigned int		fsflags;	/* for FS_IOC_[SG]ETFLAGS */
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Per-inode reverse mapping: page index -> compressed entry id,
+	 * the "entries[]" table parallel to the page cache (i_pages) in the
+	 * two-table representation (specs/02).  A page can be compressed
+	 * (entries[N] set, i_pages[N] empty), uncompressed (i_pages[N] set,
+	 * entries[N] empty), or BOTH -- a decompressed folio caching a live
+	 * compressed entry, which is what lets reclaim drop the folio without
+	 * losing data.
+	 *
+	 * Lazily allocated: NULL until the inode first compresses a page, so
+	 * uncompressed inodes pay only this pointer.  Private to
+	 * mm/shmem_compress.c; shmem.c only passes the inode to the
+	 * compress/truncate/evict hooks.
+	 */
+	struct xarray		*comp_entries;
+#endif
 	atomic_t		stop_eviction;	/* hold when working on inode */
 #ifdef CONFIG_TMPFS_QUOTA
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];
@@ -75,6 +95,13 @@ struct shmem_sb_info {
 	struct list_head shrinklist;  /* List of shinkable inodes */
 	unsigned long shrinklist_len; /* Length of shrinklist */
 	struct shmem_quota_limits qlimits; /* Default quota limits */
+#ifdef CONFIG_TMPFS_COMPRESSION
+	/*
+	 * Compression state for this mount; private to mm/shmem_compress.c.
+	 * NULL = uncompressed mount.
+	 */
+	struct shmem_comp_sb *comp;
+#endif
 };
 
 static inline struct shmem_inode_info *SHMEM_I(struct inode *inode)
