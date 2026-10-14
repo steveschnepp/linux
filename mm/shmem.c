@@ -1190,6 +1190,8 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			bool removed = false;
+
 			folio = fbatch.folios[i];
 
 			if (xa_is_value(folio)) {
@@ -1205,9 +1207,24 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 				/* full removal of an uncompressed folio */
 				shmem_comp_note_unmap(inode);
 #endif
-				truncate_inode_folio(mapping, folio);
+				removed = !truncate_inode_folio(mapping, folio);
 			}
 			folio_unlock(folio);
+#ifdef CONFIG_TMPFS_COMPRESSION
+			/*
+			 * entry-race lost-wakeup fix: the folio just left the
+			 * page cache, so no future lock/unlock on it is
+			 * guaranteed.  folio_unlock()'s wake walk above can skip
+			 * an exclusive waiter when the lock bit momentarily reads
+			 * set (a racing trylock), abandoning it forever.  Drain
+			 * the wait queue while PG_locked is clear so the walk
+			 * cannot skip.  This truncate path previously had NO
+			 * drain (only the compress and reader-detached paths did),
+			 * so a reader parked here on a truncated folio stalled.
+			 */
+			if (removed)
+				wake_up_folio_waiters(folio);
+#endif
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);
@@ -1264,6 +1281,8 @@ whole_folios:
 			continue;
 		}
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			bool removed = false;
+
 			folio = fbatch.folios[i];
 
 			if (xa_is_value(folio)) {
@@ -1314,7 +1333,7 @@ whole_folios:
 					/* full removal of an uncompressed folio */
 					shmem_comp_note_unmap(inode);
 #endif
-					truncate_inode_folio(mapping, folio);
+					removed = !truncate_inode_folio(mapping, folio);
 				} else if (truncate_inode_partial_folio(folio, lstart, lend)) {
 					/*
 					 * If we split a page, reset the loop so
@@ -1332,6 +1351,15 @@ whole_folios:
 				}
 			}
 			folio_unlock(folio);
+#ifdef CONFIG_TMPFS_COMPRESSION
+			/* entry-race lost-wakeup fix (same as the first walk):
+			 * a folio that just left the page cache has no guaranteed
+			 * future lock/unlock, so drain its waiters while PG_locked
+			 * is clear.  This is the second (whole_folios) truncate
+			 * walk -- it also needs the drain. */
+			if (removed)
+				wake_up_folio_waiters(folio);
+#endif
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);

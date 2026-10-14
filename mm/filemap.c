@@ -1537,14 +1537,26 @@ void wake_up_folio_waiters(struct folio *folio)
 
 	/*
 	 * The folio is out of its mapping: no future lock/unlock on it is
-	 * guaranteed, so every waiter must be collected NOW.  A single
-	 * walk proved insufficient (the entry-race stall: waiters
-	 * enqueued in the gap around the removal's final walk survived an
-	 * unconditional post-removal wake).  PG_waiters is cleared when
-	 * the hashed queue for this folio empties, so loop until it does.
-	 * Bounded as a safety valve: if the core wait machinery ever
-	 * breaks, warn instead of hanging the removal path.
+	 * guaranteed, so every waiter must be collected NOW.
+	 *
+	 * PG_waiters is only a fast-path HINT that folio_unlock() reads to
+	 * skip the wake walk; the walk itself (folio_wake_bit ->
+	 * __wake_up_locked_key) matches waiters by folio pointer and does not
+	 * consult it.  The entry-race stall showed PG_waiters can read CLEAR
+	 * while an exclusive waiter is still queued, so a loop GUARDED on
+	 * folio_test_waiters() would do zero walks and strand that waiter.
+	 * Hence one UNCONDITIONAL walk first: with PG_locked clear (the caller
+	 * just unlocked) wake_page_function() cannot skip an exclusive waiter
+	 * -- its skip path requires PG_locked to read set -- so this walk
+	 * reaches and wakes any queued waiter however the flag reads.
+	 *
+	 * Then loop while PG_waiters is set to collect a waiter that was woken
+	 * without DONE and re-enqueued via the goto-repeat path (which re-sets
+	 * PG_waiters under the queue lock).  Bounded as a safety valve: if the
+	 * core wait machinery ever breaks, warn instead of hanging the removal
+	 * path.
 	 */
+	folio_wake_bit(folio, PG_locked);
 	for (i = 0; i < 100000 && folio_test_waiters(folio); i++) {
 		folio_wake_bit(folio, PG_locked);
 		if (!(i & 0xfff))
