@@ -46,6 +46,8 @@
 #include <linux/iversion.h>
 #include <linux/unicode.h>
 #include <linux/swap_ops.h>
+#include <linux/timekeeping.h>
+#include <linux/math64.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -2487,6 +2489,138 @@ failed_nolock:
 }
 
 /*
+ * EXPERIMENT (entry-race hunt): bounded spin-then-sleep on the reader
+ * folio lock.
+ *
+ * Replaces the plain folio_lock() at the read/fault lookup site with a
+ * bounded busy-wait (exp_spin_budget_ns, default ~20ms) that falls back
+ * to the real sleeping folio_lock() when the budget expires.  This is
+ * NOT a spinlock: we poll folio_trylock() with preemption still enabled
+ * and hold no lock while spinning, so it cannot deadlock against the
+ * synchronous-crypto compression path -- the lock holder is always free
+ * to run.  The point is to (a) measure the folio-lock hold-time
+ * distribution on the entry-race read path, and (b) see whether a spin
+ * erases the sleep-based lost-wakeup stall.
+ *
+ * Measurement is precise: latency is taken with ktime_get_ns() (the
+ * nanosecond clocksource, independent of HZ) and accumulated into
+ * atomic64 counters, with the max tracked by a CAS loop.  Average =
+ * sum/count.  Reported as a ZBLK line the rig can grep.
+ *
+ * Runtime A/B via /sys/module/shmem/parameters/:
+ *   exp_spin_enable     0 = baseline (pure sleep, still measured),
+ *                       1 = bounded spin first
+ *   exp_spin_budget_ns  spin budget in ns (default 20,000,000 = 20ms)
+ *   exp_stats_interval  printk running stats every N acquisitions (0=off)
+ */
+
+static bool exp_spin_enable;
+module_param(exp_spin_enable, bool, 0644);
+
+static u64 exp_spin_budget_ns = 20000000; /* 20ms */
+module_param(exp_spin_budget_ns, ullong, 0644);
+
+static unsigned int exp_stats_interval = 8192;
+module_param(exp_stats_interval, uint, 0644);
+
+/* acquisition latency (all acquisitions at the instrumented site) */
+static atomic64_t exp_acq_total;
+static atomic64_t exp_sum_ns;
+static atomic64_t exp_max_ns;
+/* spin-resolved acquisitions */
+static atomic64_t exp_spin_wins;
+static atomic64_t exp_spin_sum_ns;
+/* sleep-resolved acquisitions (fell through to folio_lock) */
+static atomic64_t exp_sleep_fb;
+static atomic64_t exp_sleep_sum_ns;
+
+static void exp_max_update(atomic64_t *maxv, u64 ns)
+{
+	u64 cur = atomic64_read(maxv);
+
+	while (ns > cur) {
+		u64 prev = atomic64_cmpxchg(maxv, cur, ns);
+
+		if (prev == cur)
+			break;
+		cur = prev;
+	}
+}
+
+static void exp_stats_printk(void)
+{
+	s64 total = atomic64_read(&exp_acq_total);
+	s64 spinw = atomic64_read(&exp_spin_wins);
+	s64 sleepfb = atomic64_read(&exp_sleep_fb);
+
+	pr_info("ZBLK total=%lld avg_ns=%lld max_ns=%lld "
+		"spin_wins=%lld spin_avg_ns=%lld "
+		"sleep_fb=%lld sleep_avg_ns=%lld spin_en=%d budget_ns=%llu\n",
+		total,
+		total ? div64_s64(atomic64_read(&exp_sum_ns), total) : 0,
+		atomic64_read(&exp_max_ns),
+		spinw,
+		spinw ? div64_s64(atomic64_read(&exp_spin_sum_ns), spinw) : 0,
+		sleepfb,
+		sleepfb ? div64_s64(atomic64_read(&exp_sleep_sum_ns), sleepfb) : 0,
+		exp_spin_enable, exp_spin_budget_ns);
+}
+
+/*
+ * shmem_exp_folio_lock - reader-side folio lock: bounded spin, then sleep.
+ * Returns with the folio locked, exactly like folio_lock().
+ */
+static void shmem_exp_folio_lock(struct folio *folio)
+{
+	u64 t0, portion;
+	bool spun = false;
+
+	t0 = ktime_get_ns();
+
+	if (exp_spin_enable) {
+		u64 deadline = t0 + exp_spin_budget_ns;
+
+		do {
+			if (folio_trylock(folio)) {
+				spun = true;
+				break;
+			}
+			cpu_relax();
+		} while (ktime_get_ns() < deadline);
+	}
+
+	if (spun) {
+		portion = ktime_get_ns() - t0;
+	} else {
+		/* fall back to the real sleeping lock; measure the sleep */
+		u64 s0 = ktime_get_ns();
+
+		folio_lock(folio);
+		portion = ktime_get_ns() - s0;
+	}
+
+	/* total acquisition latency (spin time + any sleep) */
+	atomic64_inc(&exp_acq_total);
+	atomic64_add(ktime_get_ns() - t0, &exp_sum_ns);
+	exp_max_update(&exp_max_ns, ktime_get_ns() - t0);
+
+	if (spun) {
+		atomic64_inc(&exp_spin_wins);
+		atomic64_add(portion, &exp_spin_sum_ns);
+	} else {
+		atomic64_inc(&exp_sleep_fb);
+		atomic64_add(portion, &exp_sleep_sum_ns);
+	}
+
+	if (exp_stats_interval) {
+		s64 n = atomic64_read(&exp_acq_total);
+
+		if ((n % exp_stats_interval) == 0)
+			exp_stats_printk();
+	}
+}
+
+/*
  * shmem_get_folio_gfp - find page in cache, or get from swap, or allocate
  *
  * If we allocate a new one we do not mark it dirty. That's up to the
@@ -2556,7 +2690,7 @@ repeat:
 #endif
 
 	if (folio) {
-		folio_lock(folio);
+		shmem_exp_folio_lock(folio);   /* EXPERIMENT: spin-then-sleep */
 
 		/* Has the folio been truncated or swapped out? */
 		if (unlikely(folio->mapping != inode->i_mapping)) {
