@@ -78,6 +78,7 @@
 #include <linux/kernel.h>
 #include <linux/log2.h>
 #include <linux/zsmalloc.h>
+#include "shmem_comp_zscompat.h"	/* leveled zsmalloc API (shcomp_zs_*) */
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/workqueue.h>
@@ -840,11 +841,11 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 		return 0;
 
 	gfp = GFP_NOWAIT | __GFP_NOWARN;
-	handle = zs_malloc(pool->zs_pool, len, gfp, NUMA_NO_NODE);
+	handle = shcomp_zs_malloc(pool->zs_pool, len, gfp);
 	if (!handle)
 		return 0;
 
-	zs_obj_write(pool->zs_pool, handle, (void *)data, len);
+	shcomp_zs_write(pool->zs_pool, handle, data, len);
 
 	return handle;
 }
@@ -895,7 +896,7 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 	if (!bounce)
 		return -ENOMEM;
 
-	src = zs_obj_read_begin(pool->zs_pool, handle, *len, bounce);
+	src = shcomp_zs_read_begin(pool->zs_pool, handle, *len, bounce);
 	if (!src) {
 		kfree(bounce);
 		return -EINVAL;
@@ -903,7 +904,7 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 
 	memcpy(dst, src, *len);
 
-	zs_obj_read_end(pool->zs_pool, handle, *len, src);
+	shcomp_zs_read_end(pool->zs_pool, handle, *len, src);
 	kfree(bounce);
 
 	return 0;
