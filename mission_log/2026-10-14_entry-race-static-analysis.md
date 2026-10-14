@@ -418,6 +418,106 @@ ceiling.  Lower budget = less CPU in the rare long-hold case, more
 exposure to the real bug.  No free lunch -- the strongest argument yet
 that the only real fix is fixing the WAKE PATH, not spinning around it.
 
+## Fix attempt 1: unconditional drain -- FAILED 6/6 (2026-10-14)
+
+Implemented the decided fix: `wake_up_folio_waiters()` now does ONE
+unconditional `folio_wake_bit(folio, PG_locked)` before the guarded
+loop (the loop's `folio_test_waiters` guard is exactly the flag the
+stall clears, so it did zero walks).  Built (nokasan), synced, ran
+entry-race phase A spin-off 6x: **hang 6/6, identical signature.**
+The `still has waiters` warning NEVER fired.
+
+### Diagnosis (the negative result is the finding)
+
+The unchanged hang + never-firing warning prove the stranded waiter
+NEVER REACHES the drain.  My fix is incomplete, not wrong.  Confirmed
+structural gap:
+
+1. Only TWO drain sites exist: compress (`shmem_compress.c:3863`) and
+   reader-detached (`shmem.c:2703`).
+2. The reader-detached drain is UNREACHABLE for a stalled reader: it
+   runs AFTER `folio_lock` succeeds (mapping-mismatch branch).  A reader
+   parked INSIDE `folio_lock` never reaches it.
+3. **Truncate is a THIRD folio-removal path with NO drain.**  The test
+   writer ftruncate()s in a tight loop; `shmem_undo_range` ->
+   `truncate_inode_folio` -> `filemap_remove_folio` sets mapping=NULL,
+   then `folio_unlock` -- which walks ONLY if PG_waiters reads set
+   (`folio_xor_flags_has_waiters`).  With PG_waiters clear, truncate's
+   unlock skips the wait queue and strands the parked reader forever.
+
+So the stalled folio is removed by TRUNCATE, not compress -- which is
+why making the COMPRESS-side drain unconditional changed nothing.  The
+fix must cover the removal choke point for ALL paths, or specifically
+the truncate path.  (Consistent with the logs' conclusion that static
+analysis cannot close "PG_waiters clear + entry queued" -- but the
+ACTIONABLE fact is which removal path strands it, and that IS now
+identified: truncate.)
+
+### Next fix (attempt 2)
+
+Drain waiters on the truncate path too: in `shmem_undo_range`, after
+the `folio_unlock` that follows a `truncate_inode_folio` (the last
+unlock on a now-detached folio -- the exact dangerous moment), call
+`wake_up_folio_waiters(folio)`.  Both walks (find_lock_entries + the
+second find_get_entries walk).  Correctness first; watch truncate perf
+after.
+
+## Fix attempt 2: drain the TRUNCATE path -- VERIFIED (2026-10-14)
+
+Attempt 1 proved the stranded waiter never reaches the compress/reader
+drains.  The missing removal path was truncate: `shmem_undo_range` ->
+`truncate_inode_folio` -> `filemap_remove_folio` sets mapping=NULL then
+`folio_unlock`, which walks the wait queue ONLY if PG_waiters reads set.
+With PG_waiters clear (the stall state), truncate's unlock skipped the
+queue and stranded the parked reader.  The test writer ftruncate()s in a
+tight loop, so truncate is a hot removal path the earlier drains never
+covered.
+
+**The fix:** in `shmem_undo_range`, after the `folio_unlock` that
+follows a successful `truncate_inode_folio` (return 0 = folio really
+left the cache), call `wake_up_folio_waiters(folio)`.  Added to BOTH
+walks (the find_lock_entries walk and the whole_folios find_get_entries
+walk), guarded by `removed = !truncate_inode_folio(...)` so a partial
+split / already-detached folio does not pay a spurious drain.  Combined
+with attempt 1's unconditional `wake_up_folio_waiters` (so the drain
+walks regardless of PG_waiters), every folio-removal path now drains:
+compress, reader-detached, and truncate.
+
+**Verified (nokasan, the repro oracle, no instrumentation):
+- entry-race phase A loop (the deterministic hang): **10/10 PASS**
+  (was 10/10 hang before the fix).  Spin off = real sleeping path.
+- full 4-phase test (A+B+A2+B2), 3 reps: all 4 phases run, all
+  `PASS quiescent`, zero hang signals, exit 0.
+
+### Side find: the full-suite gate was VACUOUS (test bug, fixed)
+
+The first "full 4-phase" verification printed exit 0 but ZERO phase
+output -- no `[Phase A]`, no `race window`, no `PASS quiescent`.  Root
+cause in the committed `test_entry_race.c` phase selector:
+
+```c
+const char *only = getenv("ER_ONLY");
+if (!only) only = "";               // only is now never NULL
+if (!only || !strcmp(only, "A"))    // !only always false; strcmp("","A")!=0
+```
+
+With ER_ONLY unset, `only` becomes "" (never NULL), so `!only` is false
+and `strcmp("","A")` is nonzero -> **all four phase conditions false ->
+zero phases run**.  The full-suite gate silently did nothing and reported
+success.  (The single-phase runs were valid -- they set ER_ONLY=A.)  Fixed
+to `!only[0] || !strcmp(...)` so empty = run every phase.  Caught only
+because "exit 0 with no phase output" was treated as a red flag, not a
+pass -- the same discipline as "a harness exit code is not a test result"
+and "ZBLK=0 means the site did not fire."
+
+### Files Changed (the fix)
+
+| File | Purpose |
+|------|---------|
+| `mm/filemap.c` | `wake_up_folio_waiters`: one UNCONDITIONAL `folio_wake_bit` before the guarded loop (attempt 1) |
+| `mm/shmem.c` | `shmem_undo_range`: drain waiters after truncate removal, both walks, guarded by `removed` (attempt 2 -- the actual fix) |
+| rig `tests/test_entry_race.c` | FIX: phase selector ran zero phases when ER_ONLY unset (`!only[0]`) |
+
 ## What We'd Do Differently
 
 - Should have done this full read BEFORE writing the drain fix
