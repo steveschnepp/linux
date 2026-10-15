@@ -531,3 +531,44 @@ those two trees.  Then: correctness runs on riscv64/arm32/mips32-be
 - **Log at each meaningful step, even mid-diagnosis.**  The user had
   to remind me twice today; this interim entry is the compliance pass.
   Everything above was knowable 20 minutes ago.
+
+## Session 62b (interim): riscv64 PASSES; arm32 READBACK CORRUPTION; mips no console (2026-10-15)
+
+### Known so far (mid-diagnosis, logged per the rule)
+
+- **riscv64 correct battery: PASS** (first non-x86/arm64 arch to run
+  the feature end-to-end).  Rebuild needed CONFIG_CRYPTO=y back (the
+  olddefconfig repair had left it =m -> undefined crypto_* at link),
+  and the killed-earlier builds had left missing auto.conf -> fixed by
+  olddefconfig re-runs.
+- **arm32: DATA CORRUPTION on the zsmalloc arm** -- all 8 files
+  written through the compressed tmpfs read back with FNV mismatch,
+  and single-page rewrite_verify also mismatches.  Cell-arm mount
+  starts, then the run stalls ~20s (watchdog fired, dumped stacks;
+  the end-of-run "Attempted to kill init exitcode=0" is just
+  reboot(RB_POWER_OFF) returning on qemu virt -- benign, needs an
+  exit(0)+spin fallback in the guest).  This is EXACTLY the bug class
+  the matrix exists to catch: 32-bit-only data corruption in the
+  compress/decompress path that 4 passing configs (x86_64, arm64-4k/
+  16k/64k, riscv64) could not see.  NOT YET ROOT-CAUSED.  Next
+  instrumentations: first-differing-offset + length reporting in the
+  guest verify, then bisect zsmalloc-vs-lz4-vs-our-code (e.g. write
+  with compress=none on the same 32-bit kernel to rule the test out;
+  compare compressed bytes via comp_stats).
+- **mips32-BE: zero console output** -- the config grep for
+  SERIAL_8250/SERIAL_8250_CONSOLE came back EMPTY: malta's serial
+  driver is missing after my config re-application round (the original
+  builder script never explicitly enabled it; malta defconfig must
+  have had it before the repair clobbered something).  Fix: enable
+  CONFIG_SERIAL_8250{,_CONSOLE} (+ EARLY_PRINTK) on mips32-be, rebuild.
+- The 6th-config matrix status NOW: arm64-4k/16k/64k correct+perf
+  PASS, riscv64 correct PASS, arm32 corrupt (open), mips32-be no
+  console (config fix in progress).
+
+### Open questions
+
+1. arm32 corruption: test artifact or feature bug?  Highest-priority
+   -- 32-bit data corruption would block the series exactly like the
+   original pack_loc bug did.
+2. mips serial config.
+3. Guest reboot() fallback so end-of-run panics stop masking results.
