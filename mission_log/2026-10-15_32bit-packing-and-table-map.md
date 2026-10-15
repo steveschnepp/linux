@@ -563,3 +563,57 @@ group-decompress/truncate interleaving question from session 54 (the
 stale comment is fixed, the underlying race question is not
 investigated), and the standing backlog (plateau mechanism, CPU-freq
 confound, workload bed spec 05, RFC assembly, H618 re-measure).
+
+---
+
+## Session 58: arm32 + the BE Axis (mips32/mips64) (2026-10-15)
+
+### What We Did
+
+User installed `arm-linux-gnueabihf-gcc`, then `mips-linux-gnu-gcc` +
+`mips64-linux-gnuabi64-gcc` (Debian trixie; note the packages are
+`gcc-<triplet>` but the binaries are `<triplet>-gcc`).  Extended
+`out/build_arch_gate.sh`: `arm`, `mips`, `mips64` cases, a `DECONFIG=`
+env knob (named defconfig -- the plain `defconfig` is the wrong
+word-width on MIPS64), an `ENDIAN=be` knob, and an endian VERIFY step
+that FAILS the gate if the requested endian did not stick.
+
+| config | toolchain | defconfig | endian | result |
+|---|---|---|---|---|
+| arm32 (32-bit LE) | arm-linux-gnueabihf-gcc | defconfig | LE | 0 err, 0 warn |
+| mips32 | mips-linux-gnu-gcc | malta | **BE** (forced) | 0 err, 0 warn |
+| mips64 (n64) | mips64-linux-gnuabi64-gcc | bigsur | **BE** (native) | 0 err, 0 warn |
+
+### What We Learned
+
+- **A BE toolchain does not make a BE kernel.**  The first mips run
+  passed every object but the new endian-verify step caught
+  `CONFIG_CPU_LITTLE_ENDIAN=y` in BOTH configs: malta and decstation_64
+  are little-endian boards, and the endian choice lives in the kernel
+  config, not the compiler.  Had we trusted "BE compiler + green
+  objects", the BE axis would have silently tested nothing.  The gate
+  now asserts the axis it claims to test -- same class of lesson as
+  grepping the generated .config for TMPFS_COMPRESSION instead of
+  trusting scripts/config (session 45).
+  `bigsur_defconfig` is a natively-BE 64-bit board (no forcing needed);
+  mips32 needed `ENDIAN=be` on malta.
+- **Verifying the test is the test** is now a standing rule: every
+  gate row must print evidence of the axis it covers (64BIT, page
+  size, endian), not just a green object.
+
+### Current State -- the arch matrix is CLOSED on both axes
+
+Width: 32-bit (i386, arm32, mips32) + 64-bit (x86_64, arm64 4K/16K/64K,
+riscv64, mips64).  Endian: LE everywhere + BE (mips32 BE re-tests the
+width class under opposite byte order; mips64 BE covers BE64).
+Everything: 0 errors, 0 warnings.  The cell-format endian-safety
+question and the arm32 second 32-bit sample from session 57 are now
+ANSWERED-BY-GATE (compile-level; runtime BE data-path testing still
+wants a QEMU boot, listed below).
+
+Still open (unchanged): group-decompress/truncate interleaving
+question; BE runtime boot test (QEMU mips malta is LE-only in
+practice; a BE boot would need a BE machine model -- s390x under KVM
+is the practical BE64 runner, toolchain not installed); standing
+backlog (plateau, CPU-freq confound, workload bed, RFC assembly, H618
+re-measure).
