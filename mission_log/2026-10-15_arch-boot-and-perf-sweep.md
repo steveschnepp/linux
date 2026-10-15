@@ -572,3 +572,54 @@ those two trees.  Then: correctness runs on riscv64/arm32/mips32-be
    original pack_loc bug did.
 2. mips serial config.
 3. Guest reboot() fallback so end-of-run panics stop masking results.
+
+## Session 62c (interim): arm32 Corruption Characterized (2026-10-15)
+
+### Known so far (mid-diagnosis)
+
+The instrumented guest (first-differing-offset reporter, streaming
+verify with regenerated expected bytes) ran on arm32:
+
+- **zs-arm readback: len=1048576 CORRECT, firstdiff=0 on all 8
+  files** -- not truncation; the decompressed content is wrong from
+  byte 0.  Single-page rewrite_verify also mismatches.  So the
+  compress->store->load->decompress chain returns wrong data on 32-bit
+  for EVERY page.  A systematic per-page error, not memory garbage
+  (garbage would put firstdiff at random offsets).
+- **cell-arm write phase then spins**: after the cell mount line at
+  0.84s, no further output; the run-1 watchdog dump shows tid 1 with
+  an EMPTY stack (task RUNNING, not blocked = busy spin) and tid 43
+  (the watchdog) reading /proc.  End-of-run "Attempted to kill init
+  exitcode=0x00000000" is NOT the reboot() path -- exitcode 0 means
+  PID 1 EXITED CLEANLY, which should be impossible before
+  GUEST_RESULT.  Still unexplained; candidate: the cell-arm write on
+  arm32 crashes userspace or the process is reaped oddly.  (Note: my
+  new byte-scan verifier is O(filesize * 64KiB) per file -- absurdly
+  slow in principle but the 8 files reported by 0.80s, so the slowness
+  did NOT bite here; still needs replacing with a blockwise compare
+  before the final runs.)
+- **Bisect plan (next runs):**
+  1. arm32, mount cell=64K only (skip zsmalloc): if cell readback is
+     CLEAN -> bug is zsmalloc-path-specific on 32-bit; if corrupt too
+     -> lz4/crypto or our common pack path on 32-bit.
+  2. arm32 with compress=none: rules the test + tmpfs plumbing in/out
+     on 32-bit (expected clean; plainread passed but only 64K).
+  3. smp=2 RCU-stall dump of the cell-arm spin (worked on arm64).
+  4. Suspects for a systematic byte-0-wrong on 32-bit: the (u64)
+     handle cast chain (lossless per analysis, but verify empirically),
+     zs_obj_read_begin bounce path on 32-bit, lz4 asm on arm (defconfig
+     may enable ARM-optimized LZ4 -- CONFIG_LZ4_* asm!), crypto acomp
+     scatterlist 32-bit handling.
+- **riscv64 correct: PASS.**  mips32-be: serial re-enabled
+  (SERIAL_8250{,_CONSOLE}), vmlinux-only rebuild started (mkimage
+  missing, U-Boot ITB not needed for -kernel boot).
+- Guest improvements landed: reboot() fallback (spin, so PID-1 exit
+  panics stop masking results -- though this run predated it), and the
+  firstdiff/len mismatch reporter.
+
+### Open questions (priority order)
+
+1. arm32 zs corruption root cause (cell-vs-zs bisect run pending).
+2. arm32 cell-arm spin + the clean-exit-of-init mystery.
+3. mips32-be console + correctness run (rebuild in progress).
+4. Replace the O(n^2) byte-scan verifier with blockwise diff.
