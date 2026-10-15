@@ -28,9 +28,21 @@
 
 static gfp_t cell_gfp(struct cell_pool *cp)
 {
+	/*
+	 * __GFP_NOHIGHMEM is load-bearing on 32-bit (arm32 + HIGHMEM):
+	 * a cell holds a PERMANENT kernel mapping (c->base =
+	 * page_address()), and page_address() is NULL for highmem
+	 * pages.  GFP_TRANSHUGE is highmem-capable, so without this
+	 * flag a cell page could land in highmem and cell_store would
+	 * memcpy to NULL -- observed as a crash (r0=NULL in mmiocpy)
+	 * on the first store to a cell-backed pool under arm32 TCG.
+	 * On 64-bit the flag is a no-op.
+	 */
 	if (cp->use_thp)
-		return GFP_TRANSHUGE | __GFP_COMP | __GFP_NOWARN;
-	return GFP_KERNEL | __GFP_NOWARN;
+		return (GFP_TRANSHUGE & ~(__GFP_HIGHMEM | __GFP_MOVABLE)) |
+			__GFP_COMP | __GFP_NOWARN;
+	return (GFP_KERNEL & ~(__GFP_HIGHMEM | __GFP_MOVABLE)) |
+		__GFP_NOWARN;
 }
 
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,

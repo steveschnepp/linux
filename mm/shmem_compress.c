@@ -3434,13 +3434,31 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	__folio_set_locked(folio);
 	__folio_set_swapbacked(folio);
 
-	/* Decompress into the folio */
-	dst = kmap_local_folio(folio, 0);
+	/*
+	 * Decompress into a lowmem bounce, then copy into the folio --
+	 * same reason as the compress bounce: the crypto sg must be
+	 * built from direct-mapped memory, never from a kmap_local
+	 * address (32-bit + HIGHMEM: virt_to_page is invalid there).
+	 */
+	dst = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!dst) {
+		folio_unlock(folio);
+		folio_put(folio);
+		shmem_comp_entry_put(ent);
+		kfree(src);
+		return -ENOMEM;
+	}
 	dlen = PAGE_SIZE;
 	ret = shmem_comp_decompress(sbinfo->comp->pool, src, comp_len,
 				    dst, &dlen);
-	kunmap_local(dst);
 	kfree(src);
+	if (!ret) {
+		void *kaddr = kmap_local_folio(folio, 0);
+
+		memcpy(kaddr, dst, PAGE_SIZE);
+		kunmap_local(kaddr);
+	}
+	kfree(dst);
 
 	if (ret) {
 		folio_unlock(folio);
@@ -3827,22 +3845,40 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 		return 0;
 	}
 
-	/* Get source data from folio */
-	src = kmap_local_folio(folio, 0);
-
-	/* Allocate buffer for compressed data */
+	/*
+	 * Bounce the folio through a lowmem kmalloc buffer BEFORE the
+	 * crypto call.  sg_init_one() derives struct page * via
+	 * virt_to_page(), which is INVALID for kmap_local addresses on
+	 * 32-bit + HIGHMEM (fixmap range): arm32 would compress the
+	 * WRONG memory and store the result -- observed as readback
+	 * corruption from byte 0 on every page.  Invisible on 64-bit
+	 * (kmap == direct map) and with small RAM (no highmem pages
+	 * exist).  kmalloc is always direct-mapped, so the sg is
+	 * valid on every arch.
+	 */
 	comp_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!comp_buf) {
-		kunmap_local(src);
 		folio_unlock(folio);
 		return -ENOMEM;
+	}
+	src = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!src) {
+		kfree(comp_buf);
+		folio_unlock(folio);
+		return -ENOMEM;
+	}
+	{
+		void *kaddr = kmap_local_folio(folio, 0);
+
+		memcpy(src, kaddr, PAGE_SIZE);
+		kunmap_local(kaddr);
 	}
 
 	/* Compress the page */
 	comp_len = PAGE_SIZE;
 	ret = shmem_comp_compress(sbinfo->comp->pool, src, PAGE_SIZE,
 				 comp_buf, &comp_len);
-	kunmap_local(src);
+	kfree(src);
 
 	if (ret || comp_len >= PAGE_SIZE) {
 		/* Compression didn't reduce size - skip */
