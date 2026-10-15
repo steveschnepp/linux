@@ -367,3 +367,106 @@ after `interrupt`.
 Continue from the open questions above; revert SWEEPDBG once
 root-caused; then riscv64/arm32/mips32-be correctness, then the
 arm64 4K/16K/64K relative sweep.
+
+---
+
+## Session 61: Root Cause -- Decompress Folios Were Never memcg-Charged (2026-10-15)
+
+### What We Did
+
+The attribution sequence after the gdb backtrace (write path,
+`write_begin -> decompress -> folio_add_lru -> folio_batch_move_lru ->
+folio_lruvec_lock_irqsave` spinning in its memcg validate-retry loop):
+
+1. `cgroup_disable=memory` on the cmdline -> **perf PASS**.  The spin
+   is memcg-related; workaround confirmed, root cause still open.
+2. `test.mode=proc` (read /proc/version into a fresh buffer): PASS ->
+   generic anon-fault path is healthy.
+3. `test.mode=plainread` (plain tmpfs write+read, same buffers,
+   NO compression): PASS -> tmpfs plumbing healthy.
+4. `test.mode=compread` (compressed write, prefaulted read buffer):
+   STILL HUNG, and the smp=2 RCU-stall dump caught it with the trace
+   `write_begin -> decompress_folio -> folio_add_lru -> ... ->
+   folio_lruvec_lock_irqsave+0x114` -- the retry loop at
+   mm/memcontrol.c:1501 (`lruvec_memcg(lruvec) != folio_memcg(folio)`
+   -> unlock -> goto retry, forever).
+5. Source diff against shmem's own path: `shmem_alloc_and_add_folio()`
+   (mm/shmem.c:2083) charges every page-cache folio with
+   `mem_cgroup_charge(folio, fault_mm, gfp)`.  Our decompress paths
+   call the exported `shmem_alloc_folio()` (allocation only) and then
+   insert into the page cache + LRU **with no charge ever**.  An
+   uncharged folio can never satisfy the lruvec validate -> infinite
+   retry -> hard hang, no warning, no lockup-detector output (the
+   retry loop holds the rcu_read_lock and never schedules).
+
+**Fix (applied, verified):** `mem_cgroup_charge(folio, NULL, gfp)`
+immediately after `shmem_alloc_folio()` in BOTH `shmem_decompress_folio`
+(single-page) and `shmem_decompress_group` (each merged slice), NULL mm
+matching the write path; -ENOMEM -> folio_put + entry_put on failure.
+All SWEEPDBG probes reverted (mm/shmem.c retry probe, the two
+shmem_compress.c pr_err probes, the sweepdbg counter).  Result:
+compread PASS with memcg ENABLED; full correct battery 36/36 PASS;
+perf arm64-4k: fill 35.0 compressed / 33.2 cell / 107.7 plain MB/s,
+read 45.1 / 49.9 / 91.5 (TCG, relative only).  Runner's `^GUEST_RESULT`
+greps fixed (timestamp prefix broke the anchor).
+
+### What We Learned
+
+- **The hang hid behind three false theories** (TCG clock broken,
+  decompress retry loop, bad folio batch) because each explained part
+  of the evidence.  The instruments that finally worked, in order:
+  guest clock probe (killed theory 1), SWEEPDBG retry probes (killed
+  theory 2), QEMU monitor PC/LR sampling (located the function),
+  gdb-multiarch manual fp-chain walk (located the caller), smp=2
+  RCU-stall dump (authoritative full trace, showed memcg retry loop),
+  and finally a 4-step attribution ladder (cgroup_disable -> proc ->
+  plain -> compressed) that isolated the feature-specific trigger.
+- **An infinite in-kernel retry loop defeats every in-guest detector**:
+  hung-task needs a sleeping task, softlockup needs the scheduler to
+  observe it (timer-driven prints did fire on smp=2, but the smp=1
+  guest stayed silent).  Host-side observation (gdbstub, stall dumps)
+  is the only reliable witness -- reaffirms the session-59 rule.
+- **The real bug was ours and had been visible since the feature was
+  written**: any decompressed folio added to the LRU without
+  mem_cgroup_charge.  It could never fire on the 6.18 harness kernel
+  (different memcg internals -- folio_lruvec there does not validate
+  under the lock) nor under cgroup_disable=memory.  The arch/boot
+  matrix found a BUG CLASS the compile matrix structurally cannot see:
+  **first execution of the pointer-encoding kernel, and the first
+  boot of ANY kernel of this tree with MEMCG=y + compressed tmpfs.**
+- **memcmp-style attribution ladders beat single experiments**: each
+  step (proc / plain / compressed, with and without memcg) removed one
+  suspect class with a ~30s run.  Four runs isolated "feature-specific,
+  memcg-conditional, read+write-path" from "everything else".
+- mem_cgroup_charge's NULL mm is legal and matches the tmpfs write
+  path (fault_mm is NULL for non-fault callers); charge failure must
+  unwind folio_put + entry_put, not just return.
+
+### What We Decided
+
+- **The fix lives in shmem_compress.c (both decompress paths), not in
+  the exported shmem_alloc_folio()** -- the export stays a pure
+  allocator (allocation policy belongs to the caller), and charging
+  belongs where the folio enters the cache/LRU, mirroring
+  shmem_alloc_and_add_folio's structure.
+- **Workaround `cgroup_disable=memory` rejected for the sweep** --
+  with the fix the real configuration (MEMCG=y) passes, so the sweep
+  runs the honest config.
+- Runner grep anchors relaxed (timestamp-prefixed lines).
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem_compress.c` | memcg-charge decompressed folios (single + group slices); probes reverted |
+| `mm/shmem.c` | SWEEPDBG retry probe reverted to the clean `goto repeat` |
+| `~/tmpfs-compress-test/scripts/run_arch.sh` | grep anchors fixed for timestamped lines |
+| `~/tmpfs-compress-test/tests/arch_init.c` | +test.mode=proc / plainread / compread attribution modes |
+
+### Next
+
+1. Commit the charge fix (+ probe reverts) as its own commit.
+2. Full matrix: arm64-4k/16k/64k perf, correctness on riscv64,
+   arm32, mips32-BE -- kernels for 16k/64k/others need the charge
+   fix rebuilt in (they were built before the fix).
+3. Relative page-size analysis, final log pass.

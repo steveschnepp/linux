@@ -84,6 +84,7 @@
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <crypto/acompress.h>
+#include <linux/memcontrol.h>
 #include <linux/shmem_compress.h>
 #include <linux/shmem_fs.h>
 #include <linux/cell_store.h>
@@ -3001,6 +3002,13 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			ret = -ENOMEM;
 			break;
 		}
+		/* memcg-charge before cache/LRU insertion -- see the
+		 * long comment in shmem_decompress_folio(). */
+		if (mem_cgroup_charge(sib, NULL, gfp)) {
+			folio_put(sib);
+			ret = -ENOMEM;
+			break;
+		}
 		__folio_set_locked(sib);
 		__folio_set_swapbacked(sib);
 
@@ -3402,6 +3410,23 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	 */
 	folio = shmem_alloc_folio(gfp, 0, SHMEM_I(inode), index);
 	if (!folio) {
+		kfree(src);
+		shmem_comp_entry_put(ent);
+		return -ENOMEM;
+	}
+	/*
+	 * Charge the folio to memcg BEFORE it enters the page cache and
+	 * the LRU, exactly as shmem_alloc_and_add_folio() does for the
+	 * write/fault paths (mm/shmem.c).  shmem_alloc_folio() only
+	 * allocates; an uncharged folio added to the LRU spins forever
+	 * in folio_lruvec_lock_irqsave()'s memcg-validate retry loop on
+	 * kernels that re-check lruvec_memcg vs folio_memcg under the
+	 * lock (observed as a hard hang on arm64 TCG with MEMCG=y;
+	 * invisible on the 6.18 harness kernel and with
+	 * cgroup_disable=memory).  NULL mm matches the write path.
+	 */
+	if (mem_cgroup_charge(folio, NULL, gfp)) {
+		folio_put(folio);
 		kfree(src);
 		shmem_comp_entry_put(ent);
 		return -ENOMEM;
