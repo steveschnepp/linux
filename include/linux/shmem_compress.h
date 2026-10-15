@@ -21,11 +21,11 @@ struct seq_file;
  *   any installed algorithm selectable per mount)
  * - Compressed data is stored in zsmalloc pools (grow on demand)
  * - Each page's compressed backing lives in a per-inode entries[] table
- *   (an xarray of xa_value slots carrying {id, gen}); zsmalloc handles
- *   are kernel pointers and cannot be packed into xarray values, so a
- *   global ID table (struct shmem_comp_entry in mm/shmem_compress.c)
- *   maps ID -> {zsmalloc handle, compressed length, group size,
- *   refcounts}
+ *   (an xarray whose slots carry the entry POINTER); the entry
+ *   (struct shmem_comp_entry in mm/shmem_compress.c) holds the
+ *   zsmalloc handle / packed cell location, compressed length, group
+ *   size and refcounts, and is also registered in a global ID table
+ *   for GC and teardown bookkeeping
  * - Decompression happens transparently on page fault/read access
  *
  * Compression Flow:
@@ -35,12 +35,12 @@ struct seq_file;
  *   read()/fault -> entries[index] -> entry_get() -> decompress_folio()
  *
  * Entry lifetime:
- *   Each page cache slot holding the ID owns one entry reference;
- *   readers take an additional reference with shmem_comp_entry_get()
- *   and must drop it with shmem_comp_entry_put() after their last use
- *   of the entry-owned data. The entry -- and its zsmalloc block and
- *   merged-group buffer -- is freed when the last reference of either
- *   kind drops. Entries must not outlive their pool: inode eviction
+ *   Each page cache slot naming the entry owns one durable reference
+ *   (claimed on install, dropped via the slots[] erase); readers take
+ *   an additional pin under rcu_read_lock() and must drop it with
+ *   shmem_comp_entry_put() after their last use of the entry-owned
+ *   data. The entry -- and its zsmalloc block and merged-group buffer
+ *   -- is freed when the last reference of either kind drops. Entries must not outlive their pool: inode eviction
  *   drains every slot before put_super() destroys the pool, and a
  *   reader pin cannot outlive its inode (the open file holds a ref).
  *
@@ -90,8 +90,10 @@ struct kobject;
  *        itself when the last reference drops
  * @rcu: for kfree_rcu() after removal from the ID table
  *
- * Registered in a global ID table; the per-inode entries[] table only
- * stores the small {id, generation} pair.
+ * Registered in a global ID table keyed by @id (GC bookkeeping,
+ * teardown); the per-inode entries[] table stores the entry POINTER
+ * directly -- RCU plus the slot-claim protocol replace the old packed
+ * {id, generation} xa_value, which could not fit a 32-bit xa slot.
  */
 struct shmem_comp_entry {
 	/*
@@ -124,12 +126,6 @@ struct shmem_comp_entry {
 	unsigned int id;
 	unsigned int length;		/* compressed size in bytes */
 	unsigned short nr_pages;	/* pages merged into this block */
-	/*
-	 * Incarnation stamp, packed into the page cache xarray value
-	 * alongside the ID (see swapops.h). Pin and release validate it
-	 * so a stale xarray value cannot charge a recycled ID.
-	 */
-	unsigned int gen;
 	/*
 	 * Two-counter reference scheme:
 	 *   slots  — entries[] slots (the per-inode two-table mapping)
@@ -210,8 +206,8 @@ struct shmem_comp_entry {
  * enough for a u32 cellid (a directory can hold up to UINT_MAX cells,
  * though the kvcalloc fails long before that).  The handle is a full
  * u64 stored in entry.handle -- not a swp_entry -- so all 64 bits are
- * available on every arch (the {id,gen} xarray packing is a separate,
- * tighter encoding).
+ * available on every arch (the per-inode entries[] table stores the
+ * entry POINTER, so it never competes for bits here).
  *
  * When widening or narrowing the fields, re-price THIS encoding, not
  * the struct cell declaration: the u16 cellid wall was never in the
@@ -263,13 +259,6 @@ struct shmem_comp_stats {
 	unsigned long ratio;		/* percentage * 100 */
 	unsigned long compress_fails;
 	unsigned long decompress_fails;
-	/*
-	 * Stale xarray values rejected by generation validation
-	 * (shmem_comp_entry_get_gen/release). Normal under truncate +
-	 * rewrite churn -- the caller retries -- but a counter that
-	 * climbs without bound points at an ID-recycling storm.
-	 */
-	unsigned long stale_value_retries;
 	/* Live RAM footprint (see kerneldoc above) */
 	unsigned long ram_pool_bytes;
 	unsigned long ram_merged_bytes;
@@ -280,9 +269,10 @@ struct shmem_comp_stats {
 
 /*
  * The compressed mapping lives in the per-inode entries[] table (a
- * dedicated xarray of xa_value slots), not in the page cache, so no
- * reserved swap type or page-cache type tag is needed.  See
- * mm/shmem_compress.c for the entry table and its {id, gen} packing.
+ * dedicated xarray whose slots hold entry pointers), not in the page
+ * cache, so no reserved swap type or page-cache type tag is needed.
+ * See mm/shmem_compress.c for the entry table and the pointer/RCU
+ * identity protocol.
  */
 
 /*
@@ -557,10 +547,12 @@ unsigned long shmem_comp_pool_gc_recoveries(struct shmem_comp_pool *pool);
 unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 
 /*
- * Pinned, relocation-safe block load for cell storage.  Retries if
- * GC moves the block mid-read; see implementation for the protocol.
+ * Pinned, relocation-safe block load for cell storage, on an entry
+ * the caller has already pinned.  Retries if GC moves the block
+ * mid-read; see implementation for the protocol.
  */
-int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len);
+int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
+			  unsigned int *len);
 
 /* Debug hook: run one async GC pass on every cell-backed pool. */
 void shmem_comp_cell_gc_all(void);
@@ -705,100 +697,44 @@ void shmem_comp_free(struct shmem_comp_pool *pool, u64 handle);
  * @data: kmalloc'd compressed block for merged groups (owned by the
  *        entry, freed with the entry); NULL for single pages
  *
- * Return: entry ID (>0) on success, 0 on allocation failure
+ * Return: the entry (pinned by its initial refs == slots ==
+ * @nr_pages), or NULL on allocation failure
  *
- * The ID+generation pair is stored once per entries[] slot of the
- * group; refs and slots are both
- * initialised to @nr_pages. Each slot is released with
- * shmem_comp_entry_release(). @gen receives the entry generation the
- * caller must carry in every xarray value it installs and pass to
- * get_gen()/release().
+ * The caller installs the returned pointer once per entries[] slot of
+ * the group (shmem_comp_entries_set(); each install consumes one of
+ * the @nr_pages durable references). Each slot is released with
+ * shmem_comp_entry_release() on the entry claimed from that slot.
  */
-unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
-				    u64 handle, unsigned int length,
-				    unsigned short nr_pages,
-				    u64 *,
-				    unsigned short nchunks,
-				    unsigned int *gen);
+struct shmem_comp_entry *
+shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
+		       unsigned int length, unsigned short nr_pages,
+		       u64 *handles, unsigned short nchunks);
 
 /**
- * shmem_comp_entry_get - Pin an entry and copy its fields out
- * @id: entry ID
- * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
- * @length: output, compressed length in bytes, may be NULL
- * @nr_pages: output, pages merged into this block (1 = single), may be NULL
- * @data: output, entry-owned merged-group buffer, may be NULL
+ * shmem_comp_entry_put - Drop a reader pin taken on an entry
+ * @ent: the pinned entry (NULL is a no-op)
  *
- * Return: true if the entry was pinned
- *
- * Takes a reference on the entry so the caller may use the returned
- * handle/data outside RCU: truncate can erase the caller's page cache
- * slot at any point, and the last slot release frees the entry (and
- * its data) immediately. Every successful get() must be paired with
- * exactly one shmem_comp_entry_put() after the caller's last use.
- * Fails when the entry is already dying (refs == 0); the caller
- * should treat that as "entry vanished" and retry its lookup.
+ * The entry (and its storage) is freed when the last reference of any
+ * kind -- page cache slot or reader pin -- drops.
  */
-bool shmem_comp_entry_get(unsigned int id, u64 *,
-			  unsigned int *length, unsigned int *nr_pages,
-			  u64 **,
-			  unsigned short *nchunks);
-
-/*
- * shmem_comp_entry_get_gen - Generation-validated pin (page cache paths)
- * @id: entry ID from the xarray value
- * @gen: generation from the same xarray value
- * @handle: output, zsmalloc handle (0 for merged groups), may be NULL
- * @length: output, compressed length in bytes, may be NULL
- * @nr_pages: output, pages merged into this block (1 = single), may be NULL
- * @handles: output, merged-group handle array, may be NULL
- * @nchunks: output, merged-group chunk count, may be NULL
- *
- * Return: true if the entry was pinned
- *
- * Same contract as shmem_comp_entry_get(), plus generation
- * validation: fails when the ID now names a different incarnation
- * (the xarray value the caller carried is stale -- truncate freed the
- * entry and a rewrite recycled the ID). Stale rejections are counted
- * in stale_value_retries; the caller treats failure as "entry
- * vanished" and retries its slot lookup. Use this (never the bare
- * get) for anything that reached the ID through a page cache xarray
- * value; bare get() stays for table-internal users whose entries are
- * pinned by their own table references.
- */
-bool shmem_comp_entry_get_gen(unsigned int id, unsigned int gen,
-			      u64 *,
-			      unsigned int *length,
-			      unsigned int *nr_pages,
-			      u64 **,
-			      unsigned short *nchunks);
+void shmem_comp_entry_put(struct shmem_comp_entry *ent);
 
 /**
- * shmem_comp_entry_put - Drop a reference taken by shmem_comp_entry_get()
- * @id: entry ID
- *
- * The entry (and its zsmalloc block / merged buffer) is freed when the
- * last reference of any kind -- page cache slot or reader pin -- drops.
- */
-void shmem_comp_entry_put(unsigned int id);
-
-/**
- * shmem_comp_entry_release - Drop one page cache slot's reference
- * @id: entry ID from the xarray value
- * @gen: generation from the same xarray value
+ * shmem_comp_entry_release - Drop a claimed page cache slot's reference
+ * @ent: entry claimed from the slot via the entries[] erase
  *
  * Return: true if this was the last slot
  *
- * Each page cache slot holding the ID calls this once when the slot is
- * replaced by a decompressed folio or erased by truncate/eviction. The
- * return value gates the once-per-group accounting in shmem_free_swap();
- * the entry itself is freed only when the last reference of any kind
- * (slot or reader pin) drops -- by whichever of release()/put() gets
- * there first. A stale value (generation mismatch: the entry died and
- * the ID was recycled) is rejected without touching the new
- * incarnation and counted in stale_value_retries.
+ * The caller must own the slot's durable reference -- i.e. it erased
+ * entries[index] and got @ent back (xa_erase returns the old value,
+ * so exactly one thread can). The return value gates the once-per-
+ * group accounting in shmem_free_swap(); the entry itself is freed
+ * when the last reference of any kind (slot or reader pin) drops --
+ * by whichever of release()/put() gets there first. No staleness
+ * check is needed or possible: the pointer names the object, and the
+ * claim proves this thread owned the ref it is dropping.
  */
-bool shmem_comp_entry_release(unsigned int id, unsigned int gen);
+bool shmem_comp_entry_release(struct shmem_comp_entry *ent);
 
 /*
  * Statistics functions.
