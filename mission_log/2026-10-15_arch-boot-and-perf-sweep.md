@@ -725,3 +725,106 @@ arch rebuilds + regression runs are green.)
 
 Rebuild+reverify all other kernels with the fixes (background), mips32
 console + battery, then commit + final analysis.
+
+## Session 64: Final Matrix, Perf Sweep, and Wrap (2026-10-16)
+
+### Correctness matrix -- ALL PASS (5 of 6 bootable)
+
+| config | toolchain | correct battery |
+|---|---|---|
+| arm64-4K | aarch64-linux-gnu | PASS |
+| arm64-16K | aarch64-linux-gnu | PASS |
+| arm64-64K | aarch64-linux-gnu | PASS |
+| arm32 (1.5G, HIGHMEM) | arm-linux-gnueabihf | **PASS** (after the two HIGHMEM fixes) |
+| riscv64 | riscv64-linux-gnu | PASS |
+| mips32-BE | mips-linux-gnu | **boot blocked** (see below); compiles 0/0 |
+
+The correct battery = zsmalloc/cell/merge/plain mounts, write 8 MiB of
+deterministic ~2:1-lz4 data per mount, streaming-FNV readback verify,
+truncate+rewrite verify.  The two HIGHMEM fixes (session 63) took
+arm32 from corrupt/hanging to PASS with no regressions elsewhere.
+
+### Relative perf sweep (arm64, TCG, 1 vCPU, 64 MiB, FIXED kernels)
+
+| phase | 4K | 16K | 64K | (4K rerun) |
+|---|---|---|---|---|
+| fill compressed | 32.5 | 33.2 | 32.0 | 34.3 |
+| read compressed | 42.5 | 43.8 | 44.6 | 46.9 |
+| fill cell | 31.5 | 33.1 | 32.4 | -- |
+| read cell | 47.1 | 48.2 | 46.4 | -- |
+| fill plain | 104.4 | 105.7 | 106.0 | -- |
+| read plain | 91.8 | 91.8 | 88.8 | -- |
+
+MB/s.  **Conclusion: page size is flat within noise in this synthetic
+sweep.**  Run-to-run variance on the same config is ~5% fill / ~10%
+read -- larger than every cross-page-size delta.  What signal exists:
+compressed read trends slightly UP with page size (42.5 -> 44.6,
++5% 4K->64K: fewer, larger decompress calls amortize the per-page
+folio alloc+charge+pin), compressed fill is flat (crypto cost per byte
+dominates and is page-size-insensitive at 4K-64K), the cell backend
+tracks zsmalloc within 5%, and the plain baseline is flat (sanity:
+the emulator is stable, so the compressed arms are comparable).  For
+the series this needs N>=5 reps and real hardware; as a first
+direction-of-effect answer the honest reading is "no dramatic
+page-size effect; compression cost dominates".
+
+Note: the bounce fix (session 63) added one memcpy to the single-page
+compress+decompress paths on ALL arches; the numbers above are from
+the fixed kernels and are ~3% below the pre-fix ones -- the price of
+being correct on 32-bit+highmem, paid uniformly.
+
+### mips32-BE: boot blocked, NOT a feature bug
+
+Evidence: kernel is a valid BE MIPS32 ELF (file: "ELF 32-bit MSB
+executable, MIPS"), config verified (CPU_BIG_ENDIAN=y, SERIAL_8250=y,
+console=y), but ZERO serial output with ttyS0/ttyS1/earlycon, with or
+without initrd, with default or 24Kf CPU.  QEMU monitor shows the CPU
+parked at **0xbfc00380 -- the MIPS cache-error vector** -- the CPU
+never reaches the kernel.  This custom tree (heavy local mods:
+nstree/nscommon/map_anon_folio_pte_nopf etc.) appears to have a
+broken MIPS boot path, or a QEMU-malta handshake regression.  NOT
+pursued further: the BE AXIS is covered at compile level (mips32-BE
+builds 0/0 and is in the matrix), and a BE RUNTIME can be had another
+way (s390x under KVM if the user installs gcc-s390x-linux-gnu; s390x
+is BE64 and KVM-accelerated).  Logged as a machine/port issue, not
+shmem_comp.
+
+### Session total (the whole sweep, sessions 59-64)
+
+- New per-arch test rig: static PID-1 guest (no busybox), 6 bootable
+  kernels, per-arch QEMU runner, attribution modes (proc/plainread/
+  compread/clock), first-diff verifier, TEST_ARMS backend selector,
+  stack-dump watchdog thread.
+- **Three real bugs found**, all invisible to the compile matrix:
+  1. memcg: decompressed folios never charged -> infinite
+     folio_lruvec_lock retry -> hard hang (all arches with MEMCG=y
+     would hit it; only arm64 booted first).
+  2. cell_store: highmem cell pages -> page_address NULL -> memcpy to
+     NULL (arm32).
+  3. crypto sg: sg_init_one on kmap_local addresses -> compress/
+     decompress wrong memory on 32-bit+highmem (arm32).
+- Commits: `d9170a7d1c4f` (memcg charge), `d4dc816b1b77` (HIGHMEM x2),
+  plus mission-log commits.  SWEEPDBG probes all reverted; tree clean.
+
+### Files changed (final)
+
+| File | Purpose |
+|------|---------|
+| `mm/shmem_compress.c` | memcg-charge decompress folios; lowmem crypto bounces (both HIGHMEM fixes) |
+| `mm/cell_store.c` | cell_gfp(): lowmem-only cell pages |
+| `mm/shmem.c` | (probe only, reverted -- no net change) |
+| `~/tmpfs-compress-test/tests/arch_init.c` | the cross-arch guest (new) |
+| `~/tmpfs-compress-test/scripts/{run_arch,pack_initramfs}.sh` | the cross-arch runner (new) |
+| `~/linux/out/build_arch_kernel.sh` + rebuild scripts | bootable-kernel builders with axis verification |
+
+### Next Steps
+
+1. **H618 re-measure** -- the real perf question; this sweep answered
+   "page size is flat within noise under emulation", which predicts
+   the H618 comparison is about zsmalloc-vs-cell and watermark policy,
+   not page size.  Standing backlog items unchanged (plateau, CPU-freq,
+   workload bed, RFC assembly, group-decompress/truncate interleaving).
+2. BE runtime via s390x+KVM if the user wants runtime BE coverage
+   (install gcc-s390x-linux-gnu); mips boot debug only if asked.
+3. The three fixes deserve spec/commit-message cross-links in the
+   RFC assembly pass (specs/02 pointer encoding already updated).
