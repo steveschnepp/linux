@@ -518,3 +518,48 @@ bug is deleted rather than patched.
 
 Step 3: extend the arch matrix -- arm32, arm64 with 16K and 64K pages,
 big-endian build -- then the standing backlog.
+
+---
+
+## Session 57: Step 3 -- Arch Matrix Extension (2026-10-15)
+
+### What We Did
+
+New reusable gate script `out/build_arch_gate.sh <ARCH> <subdir>
+[extra scripts/config flags]` -- defconfig, ZRAM-drags-ZSMALLOC (the
+i386-gate lesson baked in), olddefconfig, grep-verify the feature
+symbol survived, prepare, build the 4 arch-sensitive objects with
+per-object warning counts.  Ran the matrix with the toolchains
+present on the workstation (no installs permitted):
+
+| config | toolchain | result |
+|---|---|---|
+| i386 (32-bit) | host gcc -m32 | 0 errors, 0 warnings (session 55/56) |
+| x86_64 | host gcc | 0 errors, 0 warnings |
+| arm64 4K pages | aarch64-linux-gnu-gcc | 0 errors, 0 warnings |
+| arm64 **16K pages** | aarch64-linux-gnu-gcc | 0 errors, 0 warnings |
+| arm64 **64K pages** | aarch64-linux-gnu-gcc | 0 errors, 0 warnings |
+| riscv64 | riscv64-linux-gnu-gcc | 0 errors, 0 warnings |
+
+**GAP (blocked on toolchain, not on code):** arm32 and big-endian
+(s390x or powerpc64-be) builds cannot run -- no
+`arm-linux-gnueabihf-gcc`, no s390x/powerpc cross compilers installed,
+and installing is forbidden without user approval.  The BE cell-format
+endian-safety question and the arm32 second 32-bit width sample remain
+OPEN until a toolchain is provided.  The i386 32-bit sample already
+covers the width class; BE is the remaining untested axis.
+
+Note: `ARCH=riscv`, not `riscv64` -- the arch dir is arch/riscv (the
+first run failed on `arch/riscv64/Makefile: No such file`; cheap fix,
+but it cost a full defconfig cycle to discover).
+
+### Current State
+
+The 32-bit fix (steps 1+2) is complete and gated on 6 configs.  The
+series builds warning-free on every arch reachable with installed
+toolchains: 32-bit (i386), 64-bit LE (x86_64, arm64 at all three page
+sizes, riscv64).  Outstanding: arm32 + BE gates (toolchain-gated), the
+group-decompress/truncate interleaving question from session 54 (the
+stale comment is fixed, the underlying race question is not
+investigated), and the standing backlog (plateau mechanism, CPU-freq
+confound, workload bed spec 05, RFC assembly, H618 re-measure).
