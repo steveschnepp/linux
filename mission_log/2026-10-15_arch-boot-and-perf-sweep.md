@@ -623,3 +623,105 @@ verify with regenerated expected bytes) ran on arm32:
 2. arm32 cell-arm spin + the clean-exit-of-init mystery.
 3. mips32-be console + correctness run (rebuild in progress).
 4. Replace the O(n^2) byte-scan verifier with blockwise diff.
+
+## Session 63: TWO HIGHMEM BUGS FOUND AND FIXED on arm32 (2026-10-16)
+
+### What We Did
+
+The arm32 failures (zs readback corruption from byte 0; cell-arm first
+write crashing) were root-caused in a multi-step attribution:
+
+1. `firstdiff=0`, correct length on every zs file -> systematic
+   per-page error, not truncation.  Cell arm: kernel oops with
+   `PC=mmiocpy, r0=NULL, LR=0x50`, later a traced
+   `SWEEPDBG store: base=00000000 ...` -> cell_store memcpying to a
+   NULL cell base on the FIRST store.
+2. A `highmem=off` cmdline test appeared to refute the highmem theory
+   -- but the kernel log exposed the flaw in my own test:
+   **"Unknown kernel command line parameters highmem=off"** -- the
+   parameter does not exist in this tree, highmem stayed enabled, and
+   the zone dump proved HighMem existed.  The theory was never tested.
+3. The decisive experiment: same kernel, **-m 512** (RAM below the
+   highmem boundary -> no highmem pages can exist).  BOTH arms PASS.
+   Both arm32 failures are HIGHMEM bugs.  One mechanism, two sites:
+
+**Bug A (cell backend, ours):** `cell_gfp()` returned
+`GFP_TRANSHUGE` (which contains GFP_HIGHUSER_MOVABLE -> __GFP_HIGHMEM)
+or `GFP_KERNEL` for cell pages, then `cell_make_active` stored
+`c->base = page_address(page)`.  page_address() is NULL for highmem
+pages -> cell_store memcpy to NULL -> oops/garbage.  Cells hold a
+PERMANENT kernel mapping by design (bump allocator, readers memcpy
+from c->base for the cell's whole life), so they must be lowmem by
+construction.  Fix: strip `__GFP_HIGHMEM|__GFP_MOVABLE` in
+cell_gfp() (this tree has no __GFP_NOHIGHMEM -- custom gfp rework).
+
+**Bug B (crypto path, ours):** `shmem_comp_compress/decompress` build
+their scatterlists with `sg_init_one(&sg, virt_addr, len)`, which
+derives `struct page *` via virt_to_page().  The single-page data
+path passed **kmap_local_folio() addresses** -- fixmap-range addresses
+on 32-bit+highmem, for which virt_to_page() is INVALID: the crypto
+compressed the WRONG memory and wrote decompressed output to the WRONG
+page.  That is the byte-0 corruption on every page.  Invisible on
+64-bit (kmap == direct map; virt_to_page works) and with small RAM.
+zsmalloc itself is safe (it strips __GFP_HIGHMEM from zspage allocs at
+mm/zsmalloc.c:448/460 and kmaps in zs_obj_read/write_begin/end); the
+bug was only on our folio-side bounce.  Fix: bounce the folio through
+a lowmem kmalloc buffer in both shmem_comp_compress_one (source side)
+and shmem_decompress_folio (destination side); the merged-group paths
+already used kmalloc buffers and were safe.
+
+**Verification:** arm32 at -m 1536 (the failing config): full correct
+battery across ALL arms (zs, cell, merge, plain) **PASS**.
+
+### What We Learned
+
+- **A boot parameter that the kernel does not recognize is silently
+  ignored** -- "Unknown kernel command line parameters" is printed ONCE
+  among hundreds of boot lines.  A negative experiment is only as good
+  as its verification that the experiment actually took effect.  I
+  lost a cycle concluding "highmem refuted" from a test that never
+  ran; the zone dump in the same log contradicted it.  Rule: when a
+  cmdline knob is load-bearing for a diagnosis, grep the log for its
+  echo in the command line AND for the "Unknown parameters" warning.
+- **The best negative control was memory sizing**: -m 512 vs -m 1536
+  toggles whether highmem pages CAN exist, with zero rebuilds.  When
+  a hypothesis maps to a resource threshold, prefer the cheap toggle
+  (RAM size, cpu count, smp) over a config rebuild.
+- **kmap_local + sg_init_one is a 32-bit-highmem trap**: the address
+  is valid to dereference but NOT to hand to anything that does
+  virt_to_page.  The general rule for our code: crypto/DMA APIs take
+  pages or lowmem addresses; kmap addresses stay inside the
+  dereference window (kmap/kunmap pair).  Recorded as a house rule.
+- **page_address() = NULL is the highmem smoke signal** for any code
+  storing a long-term kernel mapping of an allocated page; grep our
+  code for page_address on alloc_pages results (cell_store was the
+  only remaining one; zsmalloc strips the bit itself).
+- The first attribution attempt used a WRONG cmdline knob and nearly
+  produced a false "not our bug" conclusion; the crash-register dump
+  (r0=NULL) and the store-trace probe are what kept the truth
+  reachable.  Direct argument tracing beat another round of theory.
+
+### Rules Added
+
+- **kmap_local addresses never leave the kunmap window**: no
+  virt_to_page/sg_init_one/DMA on them; bounce through kmalloc for
+  any API that maps addresses to pages.
+- **Long-lived page mappings must be lowmem by construction**
+  (__GFP_HIGHMEM stripped): a stored page_address must never be NULL.
+- **Verify a cmdline control took effect** (grep the echoed command
+  line + "Unknown parameters") before trusting a negative result.
+
+### Files Changed
+
+| File | Purpose |
+|------|---------|
+| `mm/cell_store.c` | cell_gfp(): strip __GFP_HIGHMEM/__GFP_MOVABLE (cells need a permanent direct mapping); SWEEPDBG probe removed |
+| `mm/shmem_compress.c` | lowmem kmalloc bounce for the folio side of compress (compress_one) and decompress (decompress_folio) -- sg_init_one must never see kmap_local addresses |
+
+(UNCOMMITTED at time of writing; commit follows once the remaining
+arch rebuilds + regression runs are green.)
+
+### Next
+
+Rebuild+reverify all other kernels with the fixes (background), mips32
+console + battery, then commit + final analysis.
