@@ -119,8 +119,13 @@ operates on it and it cannot be replaced. `entries` is new, lazily allocated
 per inode (only when the inode first compresses a page, so uncompressed files
 pay ~nothing). Both are keyed by the same page index, so `entries[N]` is the
 compressed backing for exactly `i_pages[N]`'s page N. The heavy metadata
-(zsmalloc handle, length, refcounts) still lives in a global ID table in
-`shmem_compress.c`; `entries[N]` holds only the small id.
+(storage handle / packed cell location, length, refcounts) lives in the
+entry itself (`struct shmem_comp_entry` in `shmem_compress.c`);
+`entries[N]` holds the entry POINTER directly.  (This replaced an
+earlier revision that packed a small `{id, gen}` xa_value into the slot
+-- that encoding needed 55 bits and did not fit the 31-bit `xa_mk_value`
+budget on 32-bit; RCU plus a slot-claim protocol make both the packing
+and the generation stamp unnecessary.)
 
 This replaces -- and **removes** -- the earlier design where a compressed page
 was a third slot kind in `i_pages`: a `{id, gen}` pair packed into an `xa_value`
@@ -197,12 +202,14 @@ compressed-only.
 
 ### Decompression path (read / fault)
 
-`shmem_get_folio()` finds `i_pages[N]` empty but `entries[N]=id`, pins the
-entry, decompresses into a fresh folio, and sets `i_pages[N]=folio` **without
+`shmem_get_folio()` finds `i_pages[N]` empty but `entries[N]=ent`, pins the
+entry (pointer load + `inc_not_zero` in one `rcu_read_lock` section),
+decompresses into a fresh folio, and sets `i_pages[N]=folio` **without
 clearing `entries[N]`** -- this is the "both" state. The entry stays alive,
-so reclaim can later drop the folio and a subsequent read re-decompresses. A
-stale id (entry freed by truncate, id recycled) is rejected by a generation
-check on the entry and the lookup is retried.
+so reclaim can later drop the folio and a subsequent read re-decompresses.
+Staleness cannot misdirect a reader: the pin runs inside the RCU section
+that loaded the pointer, so it either succeeds on the original incarnation
+or fails on a dying entry (-> retry).
 
 ### Invalidation on modify
 
@@ -360,7 +367,7 @@ improvement targets. Separate series, after v1 has a shape.
 | 1.9x write / 1.3x read CPU cost is a hard sell vs zram on CPU-bound boxes | Med | Med | The story targets the survival regime (64M-1G) where arm 1 dies; the 2G build boxes are honestly arm 1's home and get no work |
 | A hot compressed page costs folio (4K) + blob (~2K) = ~6K, more than uncompressed alone | Med | Med | The uncompressed folio is reclaimable (the entry survives), so under pressure it drops to compressed-only; the steady state is ~2K/page + the hot set. Priced in the Motivation as the survival trade |
 | The `entries[]` + folio double-charge confuses shmem's `alloced == nrpages + swapped` accounting | Med | High | Compress charges `swapped` (the blob) and the folio charges `nrpages`; reclaim uncharges the folio on drop without losing the entry's charge. Verified in the Phase-2 gate with an accounting assertion |
-| `entries[N]` staleness: a reader that pinned an id while truncate cleared it could act on a recycled id | Low | High | A generation on the entry (validated at pin time) rejects the stale id; simpler than the old value-encoding but not zero |
+| `entries[N]` staleness: a reader holding a stale slot value could act on a recycled entry | Low | High | Pointer identity + RCU: the load-and-pin happens in one rcu_read_lock section, and clearers claim the slot with xa_erase (exactly one owner of the durable ref); no id recycling exists to defend against |
 | Stats-as-gauges misread by reviewers as "compression did not run" | High | Low | Documented in the rst and the sysfs help; live-sampling rule stated at every snapshot |
 | Large-folio / THP tmpfs silently uncompressed | Med | Low | Explicit `folio_order` skip in v1; a documented limitation, not a silent one |
 | Cell tier (arm 3) does not beat zsmalloc on the bench, orphaning the payload | Med | High | Arm 3 is driven through `test_zbench` before any blind cell change (session-33 rule); the verdict is measured, and parking is an accepted outcome (cellzram precedent) |
@@ -368,10 +375,10 @@ improvement targets. Separate series, after v1 has a shape.
 
 ### Open Questions
 
-- **The `entries[]` staleness generation** -- whether a full generation
-  counter is needed or a lighter epoch suffices, given `entries[]` is now a
-  dedicated table (not multiplexed with real swap entries). Pinned down during
-  the Phase-2 implementation.
+- ~~**The `entries[]` staleness generation**~~ -- RESOLVED by the pointer
+  encoding: `entries[]` stores the entry pointer, readers pin under RCU,
+  clearers claim the slot with `xa_erase`. There is no id to recycle and no
+  generation to validate; the question is moot.
 - **Hot-page premium tuning** -- whether to proactively drop clean cached
   folios under low pressure (not just at the reclaim watermark) to keep the
   uncompressed footprint near the hot set. Deferred until the Phase-2 numbers
