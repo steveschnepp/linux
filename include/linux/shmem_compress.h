@@ -96,19 +96,24 @@ struct kobject;
 struct shmem_comp_entry {
 	/*
 	 * Storage location.  For zsmalloc-backed pools this is a
-	 * zs_malloc() handle.  For cell-backed pools it encodes
-	 * {cellid, offset} — the two fields fit in one unsigned long
-	 * because cellid is 16 bits and offset is bounded by the cell
-	 * size (max 4 MiB = 22 bits).  Reusing the handle field avoids
-	 * growing every entry by the size of a second pointer, which
-	 * matters because the entry table is proportional to the number
-	 * of compressed blocks in the system.
+	 * zs_malloc() handle (widened to u64; the kernel API hands out
+	 * unsigned long, which fits into u64 on every arch).  For
+	 * cell-backed pools it encodes {cellid, offset} -- cellid+1 at
+	 * bit 24 (40 bits) and offset in the low 24 bits (max cell is
+	 * 16 MiB, CELL_ORDER_MAX), so the encoding needs all 64 bits on
+	 * EVERY arch.  Fixed-width (u64), never unsigned long: on
+	 * 32-bit unsigned long silently truncates cellid to 8 bits
+	 * (wrong cell, corrupt read, no compiler warning).  Reusing the
+	 * handle field avoids growing every entry by the size of a
+	 * second pointer, which matters because the entry table is
+	 * proportional to the number of compressed blocks in the
+	 * system.
 	 *
 	 * pool->use_cells determines which interpretation applies.  A
 	 * pool never switches backing store after creation, so the
 	 * interpretation is stable for the lifetime of the entry.
 	 */
-	unsigned long handle;
+	u64 handle;
 	/*
 	 * The xarray index this entry occupies in shmem_comp_entries,
 	 * assigned by xa_alloc().  Stable for the entry's life (a new
@@ -158,7 +163,7 @@ struct shmem_comp_entry {
 	 * store merged groups as a single block, so handles/nchunks
 	 * are unused (NULL/0) in that case.
 	 */
-	unsigned long *handles;
+	u64 *handles;
 	unsigned short nchunks;
 	/*
 	 * The pool that owns the storage.  Needed at free time to
@@ -188,7 +193,7 @@ struct shmem_comp_entry {
  * cellid field takes the remaining 40 bits (u32 + the +1 bias).
  */
 #define CELL_LOC_OFFSET_BITS	24
-#define CELL_LOC_OFFSET_MAX	(1UL << CELL_LOC_OFFSET_BITS)
+#define CELL_LOC_OFFSET_MAX	(1ULL << CELL_LOC_OFFSET_BITS)
 
 /*
  * Encode/decode a cell location into the handle field.
@@ -204,21 +209,21 @@ struct shmem_comp_entry {
  * offset is < 2^24); cellid+1 takes the remaining 40 bits, more than
  * enough for a u32 cellid (a directory can hold up to UINT_MAX cells,
  * though the kvcalloc fails long before that).  The handle is a full
- * unsigned long stored in entry.handle -- not a swp_entry -- so all 64
- * bits are available (the {id,gen} xarray packing is a separate,
+ * u64 stored in entry.handle -- not a swp_entry -- so all 64 bits are
+ * available on every arch (the {id,gen} xarray packing is a separate,
  * tighter encoding).
  *
  * When widening or narrowing the fields, re-price THIS encoding, not
  * the struct cell declaration: the u16 cellid wall was never in the
  * type, it was here.
  */
-static inline unsigned long shmem_comp_pack_loc(u32 cellid, u32 offset)
+static inline u64 shmem_comp_pack_loc(u32 cellid, u32 offset)
 {
-	return ((unsigned long)(cellid + 1) << CELL_LOC_OFFSET_BITS) |
+	return (((u64)cellid + 1) << CELL_LOC_OFFSET_BITS) |
 		(offset & (CELL_LOC_OFFSET_MAX - 1));
 }
 
-static inline void shmem_comp_unpack_loc(unsigned long handle,
+static inline void shmem_comp_unpack_loc(u64 handle,
 					 u32 *cellid, u32 *offset)
 {
 	*cellid = (handle >> CELL_LOC_OFFSET_BITS) - 1;
@@ -605,8 +610,8 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
  * Allocates space in zsmalloc pool and copies compressed data there.
  * The handle can be used to retrieve the data later via shmem_comp_load().
  */
-unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
-			       const void *data, unsigned int len);
+u64 shmem_comp_store(struct shmem_comp_pool *pool,
+		     const void *data, unsigned int len);
 
 /**
  * shmem_comp_load - Load compressed data from pool
@@ -620,7 +625,7 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
  * Retrieves compressed data from zsmalloc pool using the handle.
  */
 int shmem_comp_load(struct shmem_comp_pool *pool,
-		    unsigned long handle, void *dst,
+		    u64 handle, void *dst,
 		    unsigned int *len);
 
 /**
@@ -640,7 +645,7 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
  */
 int shmem_comp_store_merged(struct shmem_comp_pool *pool,
 			    const void *data, unsigned int len,
-			    unsigned long **handles_out,
+			    u64 **_out,
 			    unsigned short *nchunks_out);
 
 /**
@@ -656,7 +661,7 @@ int shmem_comp_store_merged(struct shmem_comp_pool *pool,
  * Loads all chunks and concatenates them into @dst.
  */
 int shmem_comp_load_merged(struct shmem_comp_pool *pool,
-			   const unsigned long *handles,
+			   const u64 *handles,
 			   unsigned short nchunks,
 			   void *dst, unsigned int *len);
 
@@ -669,7 +674,7 @@ int shmem_comp_load_merged(struct shmem_comp_pool *pool,
  * Frees all zsmalloc chunks and the handle array itself.
  */
 void shmem_comp_free_merged(struct shmem_comp_pool *pool,
-			    unsigned long *handles,
+			    u64 *,
 			    unsigned short nchunks);
 
 /**
@@ -680,7 +685,7 @@ void shmem_comp_free_merged(struct shmem_comp_pool *pool,
  * Releases the zsmalloc allocation associated with the handle.
  * The handle must not be used after this call.
  */
-void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
+void shmem_comp_free(struct shmem_comp_pool *pool, u64 handle);
 
 /*
  * Compression entry ID table.
@@ -710,9 +715,9 @@ void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle);
  * get_gen()/release().
  */
 unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
-				    unsigned long handle, unsigned int length,
+				    u64 handle, unsigned int length,
 				    unsigned short nr_pages,
-				    unsigned long *handles,
+				    u64 *,
 				    unsigned short nchunks,
 				    unsigned int *gen);
 
@@ -734,9 +739,9 @@ unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
  * Fails when the entry is already dying (refs == 0); the caller
  * should treat that as "entry vanished" and retry its lookup.
  */
-bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
+bool shmem_comp_entry_get(unsigned int id, u64 *,
 			  unsigned int *length, unsigned int *nr_pages,
-			  unsigned long **handles,
+			  u64 **,
 			  unsigned short *nchunks);
 
 /*
@@ -762,10 +767,10 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
  * pinned by their own table references.
  */
 bool shmem_comp_entry_get_gen(unsigned int id, unsigned int gen,
-			      unsigned long *handle,
+			      u64 *,
 			      unsigned int *length,
 			      unsigned int *nr_pages,
-			      unsigned long **handles,
+			      u64 **,
 			      unsigned short *nchunks);
 
 /**

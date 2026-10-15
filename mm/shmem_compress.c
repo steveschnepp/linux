@@ -782,10 +782,10 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
  * exhaustion, so it requires a sleepable caller.  Every cell-path
  * caller meets that today; see the use_cells branch below.
  */
-unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
-			       const void *data, unsigned int len)
+u64 shmem_comp_store(struct shmem_comp_pool *pool,
+		     const void *data, unsigned int len)
 {
-	unsigned long handle;
+	u64 handle;
 	gfp_t gfp;
 
 	if (!pool || !data || len == 0)
@@ -845,7 +845,8 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
 	if (!handle)
 		return 0;
 
-	shcomp_zs_write(pool->zs_pool, handle, data, len);
+	shcomp_zs_write(pool->zs_pool, (unsigned long)handle,
+			data, len);
 
 	return handle;
 }
@@ -863,7 +864,7 @@ unsigned long shmem_comp_store(struct shmem_comp_pool *pool,
  * The data is copied to dst buffer.
  */
 int shmem_comp_load(struct shmem_comp_pool *pool,
-		    unsigned long handle, void *dst,
+		    u64 handle, void *dst,
 		    unsigned int *len)
 {
 	void *bounce, *src;
@@ -896,7 +897,8 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 	if (!bounce)
 		return -ENOMEM;
 
-	src = shcomp_zs_read_begin(pool->zs_pool, handle, *len, bounce);
+	src = shcomp_zs_read_begin(pool->zs_pool, (unsigned long)handle,
+				 *len, bounce);
 	if (!src) {
 		kfree(bounce);
 		return -EINVAL;
@@ -904,7 +906,8 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 
 	memcpy(dst, src, *len);
 
-	shcomp_zs_read_end(pool->zs_pool, handle, *len, src);
+	shcomp_zs_read_end(pool->zs_pool, (unsigned long)handle, *len,
+			  src);
 	kfree(bounce);
 
 	return 0;
@@ -912,12 +915,12 @@ int shmem_comp_load(struct shmem_comp_pool *pool,
 
 int shmem_comp_store_merged(struct shmem_comp_pool *pool,
 			    const void *data, unsigned int len,
-			    unsigned long **handles_out,
+			    u64 **handles_out,
 			    unsigned short *nchunks_out)
 {
 	unsigned short nchunks, i;
 	unsigned int offset;
-	unsigned long *handles;
+	u64 *handles;
 
 	if (!pool || !data || len == 0 || !handles_out || !nchunks_out)
 		return -EINVAL;
@@ -953,7 +956,7 @@ int shmem_comp_store_merged(struct shmem_comp_pool *pool,
 }
 
 int shmem_comp_load_merged(struct shmem_comp_pool *pool,
-			   const unsigned long *handles,
+			   const u64 *handles,
 			   unsigned short nchunks,
 			   void *dst, unsigned int *len)
 {
@@ -981,7 +984,7 @@ int shmem_comp_load_merged(struct shmem_comp_pool *pool,
 }
 
 void shmem_comp_free_merged(struct shmem_comp_pool *pool,
-			    unsigned long *handles,
+			    u64 *handles,
 			    unsigned short nchunks)
 {
 	unsigned short i;
@@ -1002,12 +1005,15 @@ void shmem_comp_free_merged(struct shmem_comp_pool *pool,
  * Releases the zsmalloc allocation associated with the handle.
  * The handle must not be used after this call.
  */
-void shmem_comp_free(struct shmem_comp_pool *pool, unsigned long handle)
+void shmem_comp_free(struct shmem_comp_pool *pool, u64 handle)
 {
 	if (!pool || handle == 0)
 		return;
 
-	zs_free(pool->zs_pool, handle);
+	/* zs_free() is the kernel API: unsigned long.  zsmalloc
+	 * handles originate there and always fit; the cast is a
+	 * lossless round-trip, not a truncation. */
+	zs_free(pool->zs_pool, (unsigned long)handle);
 }
 
 /*
@@ -1135,10 +1141,10 @@ static void shmem_comp_entry_free(unsigned int id)
 
 static bool shmem_comp_entry_get_common(unsigned int id, bool check_gen,
 					unsigned int gen,
-					unsigned long *handle,
+					u64 *handle,
 					unsigned int *length,
 					unsigned int *nr_pages,
-					unsigned long **handles,
+					u64 **handles,
 					unsigned short *nchunks)
 {
 	struct shmem_comp_entry *ent;
@@ -1170,9 +1176,9 @@ static bool shmem_comp_entry_get_common(unsigned int id, bool check_gen,
 	return found;
 }
 
-bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
+bool shmem_comp_entry_get(unsigned int id, u64 *handle,
 			  unsigned int *length, unsigned int *nr_pages,
-			  unsigned long **handles,
+			  u64 **handles,
 			  unsigned short *nchunks)
 {
 	/* Bare-ID pin: table-internal users only.  Anything that
@@ -1183,10 +1189,10 @@ bool shmem_comp_entry_get(unsigned int id, unsigned long *handle,
 }
 
 bool shmem_comp_entry_get_gen(unsigned int id, unsigned int gen,
-			      unsigned long *handle,
+			      u64 *handle,
 			      unsigned int *length,
 			      unsigned int *nr_pages,
-			      unsigned long **handles,
+			      u64 **handles,
 			      unsigned short *nchunks)
 {
 	return shmem_comp_entry_get_common(id, true, gen, handle, length,
@@ -1281,9 +1287,9 @@ bool shmem_comp_entry_release(unsigned int id, unsigned int gen)
 }
 
 unsigned int shmem_comp_entry_alloc(struct shmem_comp_pool *pool,
-				    unsigned long handle, unsigned int length,
+				    u64 handle, unsigned int length,
 				    unsigned short nr_pages,
-				    unsigned long *handles,
+				    u64 *handles,
 				    unsigned short nchunks,
 				    unsigned int *gen)
 {
@@ -1420,7 +1426,7 @@ static unsigned int shmem_comp_drain_victim_scan(struct shmem_comp_pool *pool,
 	struct shmem_comp_entry *ent;
 
 	xa_for_each(&shmem_comp_entries, id, ent) {
-		unsigned long h;
+		u64 h;
 		u32 cellid, offset;
 		unsigned int len;
 		u32 nc, no;
@@ -1484,7 +1490,7 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 	 */
 	for (;;) {
 		struct shmem_comp_entry *ent = NULL, *iter;
-		unsigned long h;
+		u64 h;
 		u32 cellid, offset;
 		unsigned int len;
 		u32 nc, no;
@@ -1733,7 +1739,7 @@ int shmem_comp_load_entry(unsigned int id, void *dst, unsigned int *len)
 		goto out;
 
 	while (budget--) {
-		unsigned long h = READ_ONCE(ent->handle);
+		u64 h = READ_ONCE(ent->handle);
 		u32 cellid;
 		u32 offset;
 		struct cell *c;
@@ -2966,7 +2972,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
 	pgoff_t head = index - (index % nr_pages);
-	unsigned long *handles = NULL;
+	u64 *handles = NULL;
 	unsigned short nchunks = 0;
 	void *cbuf, *dbuf, *dst;
 	unsigned int dlen;
@@ -3227,7 +3233,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 	 * has no such limit (cells are up to 4 MiB).
 	 */
 	if (shmem_comp_pool_uses_cells(sbinfo->comp->pool)) {
-		unsigned long handle;
+		u64 handle;
 
 		handle = shmem_comp_store(sbinfo->comp->pool,
 					   cbuf, comp_len);
@@ -3248,7 +3254,7 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 			goto cleanup;
 		}
 	} else {
-		unsigned long *handles = NULL;
+		u64 *handles = NULL;
 		unsigned short nchunks = 0;
 
 		ret = shmem_comp_store_merged(sbinfo->comp->pool,
@@ -3403,7 +3409,7 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	struct shmem_sb_info *sbinfo = shmem_comp_get_sb(inode->i_sb);
 	struct address_space *mapping = inode->i_mapping;
 	struct folio *folio;
-	unsigned long handle;
+	u64 handle;
 	unsigned int comp_len;
 	unsigned int id;
 	unsigned int gen;
@@ -3826,7 +3832,7 @@ static int shmem_comp_compress_one(struct inode *inode, pgoff_t index,
 	unsigned int comp_len;
 	unsigned int id;
 	unsigned int gen;
-	unsigned long handle;
+	u64 handle;
 	int ret;
 
 	if (!sbinfo->comp)
