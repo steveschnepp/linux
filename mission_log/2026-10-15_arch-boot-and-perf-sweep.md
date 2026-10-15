@@ -286,3 +286,84 @@ have been logged as they were disproved, not batched.
 4. The relative perf sweep arm64 4K/16K/64K once (2) is clean.
 5. Standing backlog unchanged (plateau, CPU-freq, workload bed, RFC
    assembly, H618 re-measure, group-decompress/truncate interleaving).
+
+---
+
+## Session 60: gdb Backtrace of the Arm64 Spin (2026-10-15)
+
+### What We Did (so far)
+
+gdb-multiarch attached to the QEMU gdbstub (`-s`, guest booted with
+`nokaslr` so System.map addresses match).  The unwinder initially
+reported `folio_batch_move_lru` 30x at identical addresses -- a FALSE
+recursion (one bad frame record poisons the chain).  Walking the
+frame-record chain manually (`x/gx $fp` hop by hop, resolving each
+saved LR against System.map) produced the real stack:
+
+```
+_raw_spin_lock_irqsave
+folio_lruvec_lock_irqsave+0x8c
+folio_batch_move_lru+0xec          (LR-bounded; the 30x repeat is unwind noise)
+__folio_batch_add_and_move+0x7c
+folio_add_lru+0x28
+shmem_decompress_folio+0x1c8
+shmem_get_folio_gfp+0x6e0
+shmem_write_begin+0x78             <-- the WRITE path, not the read path!
+generic_perform_write+0xb4
+```
+
+**The decompress is triggered by the WRITE path** (`write_begin`
+finding `entries[index]` set and decompressing into the page cache),
+not by the readback I originally suspected.  Correct-mode writes DO
+complete, so the trigger is narrower than "any compressed write".
+
+One register snapshot read `x21` (=fbatch in folio_batch_move_lru,
+callee-saved, stable across the loop) as `0xffff8000828d0db0` =
+exactly `<node_data>` -- a bogus batch pointer whose first "count"
+byte would be 0xc0 (192).  If real, the drain iterates garbage
+"folios" and `folio_lruvec_lock_irqsave()` on a wild lruvec pointer
+spins on a lock address that never clears.  NOT YET CONFIRMED (one
+snapshot; needs a frame-slot read, not a live register).
+
+A breakpoint on `shmem_decompress_folio` fired exactly ONCE across
+the whole hang -- consistent with the vCPU being stuck INSIDE that
+one call (folio_add_lru drain), not looping above it.  Batch-mode
+gdb `continue` racing the stop made entry-argument capture flaky;
+next attempt should use a commands-block printf or `-ex continue`
+after `interrupt`.
+
+### Open questions (next actions)
+
+1. Confirm the fbatch pointer from the SAVED x21 slot in the
+   folio_batch_move_lru frame (not the live register), and read
+   fbatch->count.
+2. Read folio_add_lru / __folio_batch_add_and_move in THIS tree --
+   what fbatch does folio_add_lru pass, and what could corrupt it.
+3. Read shmem_write_end's compress index (`pos >> PAGE_SHIFT`): if
+   pos has already advanced past the written range, write_end
+   compresses the NEXT page, whose write_begin then decompresses it
+   -- the write path ping-ponging through our two-table mapping.
+   This is the leading hypothesis for a REAL bug in our feature's
+   first-ever runtime.
+
+### What We Learned (this session)
+
+- **gdb `bt` recursion on identical frames is usually unwind noise**,
+  not real recursion.  Manual fp-chain walking (x/gx on each saved
+  fp, resolve each lr) found the true 9-frame chain where bt gave a
+  fake 30-frame one.
+- **The LR of each frame is the ground truth**: LR
+  `folio_lruvec_lock_irqsave+0x8c` inside the lock wrapper identified
+  the caller before any frame was walked.
+- **A one-shot register snapshot can lie** (x21 read after minutes of
+  spinning may not be the loop-stable value you think; callee-saved
+  helps but only a frame-slot read at a known fp offset is proof).
+- **Where you think the hang is (readback) and where it is (write
+  path) can differ entirely**; the original correct-mode/write-mode
+  split evidence was the clue I nearly discarded.
+
+### Next
+
+Continue from the open questions above; revert SWEEPDBG once
+root-caused; then riscv64/arm32/mips32-be correctness, then the
+arm64 4K/16K/64K relative sweep.
