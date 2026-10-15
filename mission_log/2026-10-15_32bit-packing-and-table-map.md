@@ -287,3 +287,147 @@ independent of the table-2 encoding.
 5. Standing backlog: plateau mechanism (lockstat), CPU-freq confound,
    workload bed (spec 05, sustained churn), RFC assembly (two-table),
    H618 re-measure of every x86 number.
+
+---
+
+## Session 54: Full Source Read and the Read-Side RCU Audit (2026-10-15)
+
+### What We Did
+
+Read the whole subsystem source in the fresh session, as planned:
+`mm/shmem_compress.c` (4264 lines, in full), `include/linux/shmem_compress.h`
+(832 lines, in full), plus the compression call sites in `mm/shmem.c`
+(get_folio_gfp :2576, write_begin :3404, write_end :3442,
+undo_range :1183/:1506), `include/linux/shmem_fs.h` (`comp_entries`
+:70) and the GEN_BITS block in `include/linux/swapops.h` :139-150.
+
+Then ran the next-steps item 1: **the read-side RCU audit** that gates
+option (b). Full consumer inventory of table-2 values:
+
+| Consumer | Pattern | Stashes {id,gen} across a sleep? |
+|---|---|---|
+| `shmem_decompress_folio` :3296 | lookup -> `get_gen` pin (adjacent) | No; pin carried across sleeps, which is a ref, not a stashed id |
+| `shmem_decompress_group` :2964 | receives {id,gen}, pins immediately | No |
+| `shmem_comp_entry_drop` :3712 | `get_gen` + `release`, revalidates | No |
+| `shmem_comp_invalidate_index` :3745 | lookup -> xa_store NULL -> drop | id/gen copied out; slot ref keeps entry alive find->drop |
+| `shmem_comp_truncate_range` :3776 | xa_find -> unpack -> drop | Same: slot's durable ref covers the window |
+| `shmem_comp_load_entry` :1660 | re-resolves by id under RCU, pins internally | Takes id, but pins before any sleep |
+| GC drain :1400/:1521 | pins BY POINTER already (`inc_not_zero` on iter) | N/A -- the (b)-shaped pattern, in production today |
+
+**Audit verdict: (b) is viable.** No caller stashes {id, gen} across a
+sleep without holding a pin. Every load+pin pair is adjacent (both
+inside one `rcu_read_lock` section), and the truncator's find->drop
+window is covered by the slot's own durable reference, not by the gen.
+The one re-resolution by id after RCU unlock (`load_entry`) pins
+internally before sleeping. The GC drain already does exactly the
+pointer-pin discipline (b) would require -- `shmem_comp_entry_put_ptr()`
+exists and is in production.
+
+Also noted while reading (follow-up, not a 32-bit blocker): the
+`shmem_decompress_group` comment :2936 claims slice-install races are
+resolved by `shmem_add_to_page_cache()` "only installing if the slot
+still holds the replicated ID+generation" -- but the calls pass
+`shadow=NULL` and that function never looks at `info->comp_entries`.
+The comment describes a check that does not exist in the code; worth a
+separate look at the truncate-vs-group-decompress race, independent of
+the encoding decision.
+
+### What We Learned (this session)
+
+- **Why the gen is packed WITH the id (the ptr/gen question, asked and
+  answered):** an id is a recyclable *name*, not an identity. Resolving
+  it is a fresh `xa_load(&shmem_comp_entries, id)` in a NEW RCU section,
+  where the entry may be gone and a new one installed at the same id --
+  `ent->gen != gen` is the only thing that catches that. The gen must
+  travel in the same xa slot as the id because it is only meaningful
+  when read atomically with the id; if it were read from the entry
+  itself it would be a self-comparison (the retracted option, step 4).
+- **A pointer is an identity; RCU is its incarnation check.** Under (b)
+  the reader loads the pointer and takes `inc_not_zero` inside one
+  `rcu_read_lock` section. `kfree_rcu` cannot reclaim the address until
+  after a grace period, which the reader's own RCU section blocks, so
+  at pin time the object is provably the original (dying -> pin fails
+  -> retry; alive -> correct object). No ABA, no gen needed. The gen is
+  a software emulation of exactly this RCU guarantee, required only
+  because the id scheme decouples the slot read from the resolution.
+- **The pointer-pin discipline is already in production** (GC drain +
+  `put_ptr`), so (b) is a generalization of existing code, not a new
+  invention.
+- **`handle` is `unsigned long` in the struct** (`shmem_compress.h:101`),
+  so pack_loc's 40-bit cellid at bit 24 truncates to 8 bits on 32-bit
+  at BOTH ends (the field itself, not just the shift). The fix must
+  widen the FIELD (u64, per the house rule), not just the expression.
+
+### What We Decided (this session)
+
+- **Option (b) is no longer gated on an unknown** -- the audit is done
+  and it passes. Recommendation stands: (b) as the real fix, (c)
+  `depends on 64BIT` only as an interim unblocker if the series must
+  move before (b) lands.
+- **`handle` fix is u64**, independent of (b): change the struct field
+  to `u64` and pack/unpack over `u64`; re-price the struct for padding
+  on 32-bit (id/length/nr_pages/gen currently align to 4; a u64 field
+  may add tail padding -- measure `ksize` impact, the entry table is
+  RAM-proportional). No code written yet; plan presented to the user.
+
+### Next Steps (updated order)
+
+1. Fix `handle`/pack_loc: `u64` field + pack/unpack, fix the stale
+   struct comment ("fit in one unsigned long"), i386 gate to 0 errors.
+2. Implement (b): entries[] stores `xa_mk_pointer(ent)`; put() and
+   load_entry() take the pointer; gen retired (or kept as a debug-only
+   assert); entries_present() becomes a NULL check; update spec 02.
+3. Re-run the i386 gate after each; then extend the arch matrix
+   (arm32, arm64 16K/64K, BE) per the standing plan.
+4. Separate look at the group-decompress/truncate race the stale
+   comment hints at.
+
+---
+
+## Session 55: Step 1 -- u64 Handle Surface (2026-10-15)
+
+User decision at session start: **go 1-3, commit often for bisectability,
+log every meaningful step, and extend the house rule -- everything in
+OUR code or OUR API is fixed-width or a pointer** (unsigned long only
+where a kernel API forces it, converted at the boundary).
+
+### What We Did
+
+Commit `c43e860fb42c` "shmem_comp: widen the handle surface to u64".
+
+- `struct shmem_comp_entry.handle`: `unsigned long` -> `u64`. The FIELD
+  itself truncated on 32-bit, not just the shift expression -- fixing
+  pack_loc alone would have left the bug live.
+- `CELL_LOC_OFFSET_MAX`: `1UL` -> `1ULL` (the mask must be 64-bit too).
+- Whole handle API surface -> `u64` end-to-end: `shmem_comp_store`/
+  `load`/`free`, `store_merged`/`load_merged`/`free_merged` (handle
+  arrays), `entry_alloc`/`entry_get`/`entry_get_gen` params, the GC
+  drain locals, and the decompress-path locals.
+- `unsigned long` survives ONLY at kernel-API boundaries with explicit
+  lossless casts + comment: `zs_free`, `shcomp_zs_write/read_begin/
+  read_end`, `xa_for_each` index, shrinker count/scan returns.
+- Also fixed stale struct comment (said "cellid 16 bits, offset 22
+  bits"; real layout is cellid+1 at bit 24, offset 24 bits).
+
+### Gates
+
+- i386 (`out/kbuild-i386`): only the 2 KNOWN table-2 pack/unpack errors
+  remain (bug #1) -- expected, they are step 2. Handle/pack_loc errors: 0.
+- x86_64 (`out/kbuild-x86_64`, new out-of-tree dir, ZRAM-dragged
+  ZSMALLOC per the i386-gate lesson): 0 errors, 0 warnings.
+
+### Process Note
+
+- The edit-tool exact-match loop against UTF-8 em-dashes in comments
+  failed twice (atomic, no partial writes); switched to python
+  assert-then-write scripts, which also double as content verification.
+- First header pass silently MISSED two prototype lines (return type of
+  shmem_comp_store, a continuation line of load_merged) because the
+  line filter keyed on "handle" in the line; the conflicting-types
+  compile error caught both immediately.  Lesson: verify by grep for
+  the old type AFTER a mechanical rename, not just by diffing.
+
+### Next
+
+Step 2: option (b) -- entries[] stores xa_mk_pointer(ent), retire the
+{id, gen} packing and the gen counter; i386 must reach 0 errors.
