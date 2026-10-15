@@ -431,3 +431,90 @@ Commit `c43e860fb42c` "shmem_comp: widen the handle surface to u64".
 
 Step 2: option (b) -- entries[] stores xa_mk_pointer(ent), retire the
 {id, gen} packing and the gen counter; i386 must reach 0 errors.
+
+---
+
+## Session 56: Step 2 -- Pointer Encoding, Gen Retired (2026-10-15)
+
+### What We Did
+
+Commit `6ac41848119e` "shmem_comp: entries[] stores entry pointers;
+retire the {id, gen} packing" (+ spec-02 update commit).  Option (b),
+executed:
+
+- **entries[] slots hold the `struct shmem_comp_entry *` directly.**
+  `shmem_comp_pack/unpack` (the 55-bit xa_mk_value encoding, bug #1)
+  deleted; the swapops.h `SHMEM_COMP_ENTRY_GEN_BITS/MASK` block
+  deleted; the swapops.h include in shmem_compress.c deleted.
+- **Read:** `shmem_comp_entries_get()` -- pointer load +
+  `atomic_inc_not_zero` inside ONE `rcu_read_lock` section.  kfree_rcu
+  defers reuse past a grace period, so the pin succeeds on the original
+  or fails on a dying entry.  No ABA, no gen.
+- **Clear:** `shmem_comp_entries_claim()` = `xa_erase` (returns old
+  value under the xarray lock) -- exactly one thread owns the slot's
+  durable ref; `entry_release()` drops it unvalidated.  This closes a
+  latent double-drop window: the old gen check rejected recycled ids
+  but could NOT stop two live readers of the same {id, gen} both
+  dropping the same slot ref (truncate vs write-invalidate were only
+  safe by lock discipline, not by the encoding).
+- **API reshape:** `entry_alloc` returns the entry (no id/gen
+  out-params); `entry_put` pointer-based (GC drain's `put_ptr` folded
+  in); `load_entry` takes a caller-pinned entry (no id
+  re-resolution); `decompress_group` takes the caller's pin;
+  `entry_get_gen`, `entry_get` (callerless after the switch) and the
+  `stale_value_retries` stat removed.
+- **Spec 02** updated (intro, decompress path, risk row, open question
+  resolved).
+- Fixed the stale `decompress_group` comment (claimed
+  `add_to_page_cache` validates replicated ID+gen on install; that
+  check never existed).
+
+### Gates
+
+x86_64 AND i386: `shmem_compress.o`, `cell_store.o`, `shmem.o`,
+`filemap.o` -- **0 errors, 0 warnings on both**.  The i386 gate is
+CLOSED: both the loud bug (#1, pack/unpack shifts) and the silent one
+(#2, pack_loc) are gone, and the whole {id,gen} class of 32-bit width
+bug is deleted rather than patched.
+
+### What We Learned (this session)
+
+- **A slice-based rewrite script must anchor on DEFINITIONS, not
+  signatures.**  First attempt at the release-path rewrite used
+  `s.index("static unsigned int shmem_comp_invalidate_index(struct
+  inode *inode, ...")` which matched the FORWARD DECLARATION at line
+  ~106 instead of the definition at ~3745, deleting 3632 of 4264 lines
+  (caught immediately by `wc -l`; restored from HEAD via `git show` --
+  the committed u64 work was safe, only the in-flight stage-4 edits
+  were lost and they were re-scripted).  Rule: anchor multi-line
+  slices on a following `{` or a unique doc comment, and ALWAYS
+  `wc -l` / compile after a bulk script edit before moving on.
+- **Assert-then-write python scripts double as verification** -- every
+  replacement asserts count==1, so an ambiguous pattern fails loudly
+  before anything is written.  This caught 3 miscounts (put occurrences)
+  in-flight.
+- **The claim-based clear is strictly stronger than the gen check.**
+  Designing the pointer scheme exposed that the old release-side gen
+  check was load-bearing for a race the encoding could not actually
+  close (two concurrent clearers of one slot); the xa_erase claim
+  closes it by construction.  The encoding switch fixed a concurrency
+  hole, not just a width bug.
+- **Comment archaeology pays**: the `decompress_group` comment
+  described a validate-on-install check that never existed in
+  `shmem_add_to_page_cache` (it receives `shadow=NULL` and never sees
+  `info->comp_entries`).  The real defenses (-EEXIST retry, pin
+  failure -> -ENOENT) are now documented where they live.
+
+### What We'd Do Differently
+
+- Would have written the whole rewrite as ONE python pass with
+  count-asserted anchors (which is what pass 1-3 eventually became)
+  instead of four incremental ones; each incremental pass was a chance
+  to match a forward declaration.  The forward-decl/definition
+  ambiguity is a known hazard of editing C with text tools -- grep -n
+  the anchor FIRST, every time.
+
+### Next
+
+Step 3: extend the arch matrix -- arm32, arm64 with 16K and 64K pages,
+big-endian build -- then the standing backlog.
