@@ -145,6 +145,13 @@ void cell_pool_destroy(struct cell_pool *cp)
 	kfree(cp);
 }
 
+unsigned long cell_get_total_pages(struct cell_pool *cp)
+{
+	if (!cp)
+		return 0;
+	return (unsigned long)atomic_long_read(&cp->pages_used);
+}
+
 /*
  * Allocate one cell of cell_order pages and install it as the active
  * allocation target.  Must be called with cp->lock held.

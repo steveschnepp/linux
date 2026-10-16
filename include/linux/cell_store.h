@@ -216,6 +216,17 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 				   unsigned int gc_percent);
 void cell_pool_destroy(struct cell_pool *cp);
 
+/**
+ * cell_get_total_pages - Report the pool's physical footprint
+ * @cp: pool, or NULL
+ *
+ * Returns the number of pages the pool currently holds from the buddy
+ * allocator: (1 << cell_order) per live cell, summed.  Mirrors
+ * zs_get_total_pages() so the two storage backends report footprint
+ * through a symmetric call.  Zero for a NULL or empty pool.
+ */
+unsigned long cell_get_total_pages(struct cell_pool *cp);
+
 /*
  * Store @len bytes at the next free offset in the active cell.
  * Returns 0 and writes {cellid, offset} on success.

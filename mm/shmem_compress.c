@@ -1807,7 +1807,7 @@ void shmem_comp_get_stats(struct shmem_comp_stats *stats)
 	spin_lock(&shmem_comp_pools_lock);
 	list_for_each_entry(pool, &shmem_comp_pools, list) {
 		if (pool->use_cells)
-			pool_pages += atomic_long_read(&pool->cells->pages_used);
+			pool_pages += cell_get_total_pages(pool->cells);
 		else if (pool->zs_pool)
 			pool_pages += zs_get_total_pages(pool->zs_pool);
 	}
