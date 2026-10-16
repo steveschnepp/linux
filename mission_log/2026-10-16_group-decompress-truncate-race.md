@@ -377,3 +377,41 @@ bytes) -- the group path resurrects whole groups, exactly as analyzed.
 | rig `scripts/build_arch_kernel.sh` | +x86_64 case, SRC= override (worktree builds), extra-flag application (was a silent no-op), zstd/lzo + hung-task/softlockup for suite compat |
 | rig `scripts/build_x86_kernel.sh` | EFI disable (harmless; script superseded -- its kernels never booted) |
 | `/home/snide/linux-prefixe` (git worktree) | pristine-source build worktree at the fix commit (pre-fix commit history available) |
+
+### Performance A/B of the fix (2026-10-16, appended per the log-every-
+measurement rule)
+
+Same-host KVM A/B on the two non-KASAN kernels (pre-fix
+`cc098c4cd639` vs fixed `abf3b8835c29`), interleaved, 2 reps,
+test_fill 1024 MiB readback=1, arms 2 (zsmalloc) / 3 (cell 64K),
+single-page (merge unset) and group (merge_pages=8, new test.fillmerge=
+knob).  MB/s, pre-fix/fixed:
+
+| arm | merge | write pre/fixed | read pre/fixed |
+|---|---|---|---|
+| 2 | none | 671 / 664 (-1.1%) | 1371 / 1535 (+12.0%) |
+| 2 | 8 | 1352 / 1369 (+1.2%) | 2164 / 2141 (-1.0%) |
+| 3 | none | 652 / 665 (+2.0%) | 1728 / 1748 (+1.1%) |
+| 3 | 8 | 1403 / 1399 (-0.3%) | 2188 / 2156 (-1.4%) |
+
+**Verdict: no measurable impact; every delta is inside the noise
+band.**  The write path (untouched by the fix) scatters -1.1%..+2.0%
+with the sign flipping per config -- that is the noise floor.  The
++12% single-page read is an outlier driven by one 991 MB/s pre-fix
+run vs 1750 on its rep (the readback runs with ~9-13 MB free RAM, so
+reclaim dominates; same-config spread reaches +/-30%).  The only
+consistent-looking signal is the group read at -1.0%/-1.4%, against a
+same-kernel rep spread of up to +/-4% -- unresolved from zero at N=2.
+Supporting evidence: the trunc-resurrect reproducer's own iteration
+counts (a constant decompress-heavy loop, ~4350-4400/6s in every
+phase of both kernels) are identical within 0.5%.
+
+Theoretical added cost, consistent with the noise: single-page
+decompress gains one rcu slot-read (~20-50 ns on a ~2-5 us path);
+group decompress gains one kcalloc(nr_pages*8B) (~100 ns), N slot
+reads in the finalize pass, and sibling locks held a few us longer
+(only observable to a concurrent locker of a sibling).  The race-hit
+path pays a full decompress redo -- correctness-required, and rare
+(only when racing a truncate/punch).  If a rigorous sub-1% bound is
+needed: bench-skill protocol (N>=30 interleaved reps) and/or the H618
+re-measure, which should carry this fix in tree.
