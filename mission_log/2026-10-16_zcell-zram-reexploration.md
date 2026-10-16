@@ -295,3 +295,161 @@ footprint through symmetric calls now.  i386 gate: 0 errors, 0 warnings
    swap stream.
 5. Standing backlog unchanged: H618 re-measure, RFC assembly,
    plateau/CPU-freq, workload bed (spec 05), BE runtime boot.
+
+---
+
+## Session 68: Swap Form, Private Pools, and the mTHP Page-Group Insight (2026-10-16)
+
+(This append is session 68; same file/topic as session 67's reexploration.)
+
+### What We Did
+
+Session 67 reopened zcell-as-zram as a design track and landed
+`cell_get_total_pages()`.  This session converged the actual device
+design; the centerpiece is a new insight that dissolves the
+grouping/staging problem that killed the old cellzram.
+
+**1. Form: a thin cell-backed swap gendisk (not a zswap cache).**  The
+fleet's pain is zram-swap (a gendisk that IS swap); zswap is a cache in
+front of a backing disk swap, and the 64M boxes have no disk.  So: a
+gendisk, mkswap/swapon, matching zram.
+
+**2. The "big file in ztmpfs" reframing (user's).**  The swap storage is
+conceptually a big region of shmem_comp-managed compressed blocks,
+keyed by SWAP OFFSET instead of file page-index and NOT installed into
+page-cache folios -- but everything that manages the compressed-storage
+lifecycle is reused from the engine:
+- `shmem_comp_pool` (private per device), compression contexts, cell/zs backend
+- `shmem_comp_compress`/`decompress` (sync compression, HIGHMEM-safe)
+- `shmem_comp_store`/`load`/`free` -- ALREADY folio-free and
+  handle-keyed (pool + handle, no inode/entry/folio); the tmpfs
+  two-table mapping + folio install are a SEPARATE layer on top that a
+  swap consumer SKIPS
+- the 1 Hz aging/GC (`cell_gc_all`) -- exactly the mechanism that
+  reclaims fragmented cells from free-on-swapin
+- the watermark (spec-06), the shrinker, the stats
+New (thin glue only): a `swpentry -> handle` xarray (replaces the
+two-table mapping) + the swap-integration surface.
+
+**3. Pool model correction + sharing deferred.**  I misspoke that
+mounts might share a "global pool."  The code is unambiguous: `fill_sb`
+(:2275) ALWAYS calls `shmem_comp_pool_create()`, which kzallocs a
+FRESH pool (refcount=1, its own `cell_pool`) onto a global LIST (:216)
+that is bookkeeping only (stats / GC-all walk it).  No dedup, no join.
+So each mount -> private pool (per-mount compress=/cell=/gc_percent
+honored); each gendisk -> private pool.  The refcount "sharing"
+machinery exists but is not exercised.  USER DECISION: sharing
+deferred -- a shared pool couples every consumer's watermark/GC/tuning
+into one state machine, a debugging tar pit; private pools until
+single-pool behavior is well-characterized.
+
+**4. Honesty surfacing: the old cellzram WAS this thin device.**  Its
+default (`open_units=0`, ratio 1) `cellzram_write_block` does exactly
+`shmem_comp_compress -> shmem_comp_store -> shmem_comp_entry_alloc ->
+xa_store` (block table), on a private `shmem_comp_pool`.  So
+rebuilding the thin device at ratio 1 re-runs a MEASURED, LOST config:
+0.86x zram throughput on churn, 101.8% of-orig RAM (session 35).
+Engine maturity since (pointer encoding, HIGHMEM, memcg, u64 handle)
+is CORRECTNESS, not that throughput.  So ratio-1 is a known ~tie-or-lose
+baseline, not the goal.
+
+**5. THE INSIGHT: mTHP gives page groups for free, dissolving staging.**
+The whole reason the old cellzram lost was grouping: cells beat
+zsmalloc only when grouped (the -8.6% came from 16-page merge), but a
+block device has no page cache, so it MANUFACTURED groups by staging
+(the open-cell buffer), costing 2.7x on overwrite.  The new
+realization, confirmed in `mm/page_io.c`:
+- `__swap_writepage(ctx, folio)` is FOLIO-based and does
+  `swap_add_folio(ctx, folio, WRITE)` -- the WHOLE folio as one unit;
+  `count_mthp_stat` tracks `folio_order`.
+- With `CONFIG_THP_SWAP`, a large anon folio (order N = 2^N contiguous
+  pages) reserves 2^N contiguous swap slots and is written as ONE unit
+  (`swapfile.c:1750` hard-rejects multi-page slot alloc without it).
+- Base pages: no grouping (one page per bio).  mTHP (multi-size THP,
+  small orders 16K-64K): anon memory comes back as large folios,
+  swap-out hands the device an N-page folio, and it compresses the
+  WHOLE FOLIO as one compression unit -- cross-page redundancy = the
+  -8.6% win -- with NO device-side staging.
+This dissolves the 2.7x: the groups are pre-assembled by the MM, not
+buffered by the device.  The engine already speaks multi-page units:
+`shmem_comp_compress(slen = merge_pages multiple)` +
+`shmem_comp_store_merged` (len > PAGE_SIZE chunks).  So the device gets
+EVEN THINNER: no staging logic at all -- `submit_bio` -> compress the
+folio as one unit -> `store_merged` -> record `swpentry -> handle`.
+Grouping = mTHP, compression = engine, storage = cells, GC = engine
+1 Hz aging.
+
+**6. arm32 page size (user question, verified).**  arm32 is 4K base
+pages, FIXED (`out/kbuild-arm32/.config`: `CONFIG_PAGE_SIZE_4KB=y`,
+`CONFIG_PAGE_SIZE_LESS_THAN_64KB=y` -- ARM32 has no 16K/64K base-page
+option).  aarch64 SELECTS 4K/16K/64K (`CONFIG_ARM64_{4K,16K,64K}_PAGES`);
+our matrix runs all three.  Consequence for mTHP: the 64K-PAGE aarch64
+kernel is the ideal testbed -- a base PAGE IS 64K, so EVERY anon folio
+is >= 64K and one cell (order 4 = 64K) holds ~one page; grouping is
+trivial and there is no sub-cell-staging question at all.  arm32 (4K)
+and aarch64-4K are the worst case for the cell floor and want mTHP
+orders that make folios >= a cell.
+
+### What We Learned (session 68)
+
+### Technical
+
+- **Swap is folio-based, not page-based, at the write path**:
+  `__swap_writepage` takes a folio and `swap_add_folio` submits it
+  whole.  Multi-size THP (mTHP) means a swap "page group" is just a
+  large anon folio -- the grouping lever lives in the MM's anon folio
+  allocation, NOT in the swap device.
+- **`CONFIG_THP_SWAP` gates multi-page swap-slot allocation**
+  (`swapfile.c:1750`).  `SWAPFILE_CLUSTER` = `HPAGE_PMD_NR` (512) with
+  THP_SWAP, else 256.
+- **The engine's store/load/free are already folio-free and
+  handle-keyed** -- a swap consumer skips the entire tmpfs two-table
+  mapping + folio-install layer.  "Reuse the engine, skip the folios"
+  is exactly right at the API level.
+- **Each mount/pool is private; the global pool list is bookkeeping.**
+  No dedup in `pool_create`; refcount sharing exists but is unexercised.
+- **The old cellzram-at-default IS the thin device** -- its 0.86x/101.8%
+  is the ratio-1 baseline to reproduce, not to re-derive as a discovery.
+- **arm32 = 4K fixed base pages; aarch64 = 4K/16K/64K selectable.**  A
+  64K-page kernel makes every folio >= a 64K cell, collapsing the
+  grouping question.
+
+### Process
+
+- **"Commit often for bisect" (user, standing):** the device will be
+  built in small green commits (skeleton+wiring, private pool +
+  disksize, submit_bio+compress+store, swapin-free+GC, mTHP grouping,
+  sysfs, measurement), each compiling and gate-checked.
+- **Verify a design against the deleted prior art before building.**
+  Retrieving cellzram.c from git history (`git show 49b5571006b4^`)
+  exposed that the "new thin device" was already built and measured --
+  which reframed the build around the mTHP grouping differentiator
+  instead of a re-derivation.
+
+### What We Decided (session 68)
+
+- **Form: thin cell-backed swap gendisk** (not a zswap cache).
+- **Reuse the whole shmem_comp engine, private pool per device**; only
+  new code = `swpentry -> handle` map + swap glue + per-folio
+  compression via the merge path.
+- **Pool sharing deferred** (debugging/tuning coupling).
+- **Grouping via mTHP (small orders 16K-64K), NOT device staging.**
+  This is the differentiator: if zram compresses per-page (it is
+  page-granular), our per-folio compression achieves a ratio zram
+  structurally cannot, and mTHP unlocks it only for us.
+- **Build with mTHP**; the 64K-page aarch64 kernel is the primary mTHP
+  testbed.
+
+### Next Steps (session 68, superseding session 67's bench plan)
+
+1. Verify the differentiator: does zram compress per-page or per-folio
+   in `zram_bvec_write` under mTHP?  (one look; decides whether
+   per-folio grouping is a real ratio win over zram)
+2. Check the mTHP config surface on a 64M guest + on the 64K-page
+   aarch64 kernel (which mTHP orders actually produce large anon folios
+   under the fleet workload).
+3. Build the thin device staged, committing each green step (see
+   Process).
+4. Measure vs zram with mTHP enabled on the fleet-shaped workload; the
+   win is per-folio compression ratio + cells' zero-metadata storage,
+   the cost is mTHP reliability on fragmented 64M.
