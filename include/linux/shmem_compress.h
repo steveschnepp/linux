@@ -711,6 +711,19 @@ shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 		       u64 *handles, unsigned short nchunks);
 
 /**
+ * shmem_comp_entry_get - pin a live entry by pointer
+ * @ent: entry pointer obtained under rcu_read_lock from an RCU-protected
+ *       table (the caller's own, e.g. a block/swap frontend's table)
+ *
+ * Return: true if pinned (caller owns a ref; drop with entry_put()),
+ *         false if the entry is dying (treat as vanished; retry).
+ *
+ * Must be called inside the caller's rcu_read_lock section; see the
+ * implementation for the lifetime argument.
+ */
+bool shmem_comp_entry_get(struct shmem_comp_entry *ent);
+
+/**
  * shmem_comp_entry_put - Drop a reader pin taken on an entry
  * @ent: the pinned entry (NULL is a no-op)
  *

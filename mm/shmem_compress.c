@@ -1221,6 +1221,30 @@ static bool shmem_comp_entries_names(struct inode *inode, pgoff_t index,
 	return named;
 }
 
+/*
+ * shmem_comp_entry_get - pin a live entry by pointer
+ * @ent: an entry pointer the caller obtained under rcu_read_lock from an
+ *       RCU-protected table (its own block table, or the per-inode
+ *       entries[]).
+ *
+ * Return: true if the caller now owns a pin (drop with entry_put()),
+ *         false if the entry is already dying (treat as vanished; the
+ *         caller retries against the updated table).
+ *
+ * The pin is atomic_inc_not_zero() and must run inside the caller's
+ * rcu_read_lock section: kfree_rcu cannot reclaim the address until
+ * after a grace period the caller's own RCU section blocks, so at pin
+ * time the object is provably the original (dying -> pin fails; alive
+ * -> correct object).  This is the same discipline as
+ * shmem_comp_entries_get(), factored out so a non-inode consumer (a
+ * block/swap frontend with its own entry->handle table) can pin by
+ * pointer.
+ */
+bool shmem_comp_entry_get(struct shmem_comp_entry *ent)
+{
+	return ent && atomic_inc_not_zero(&ent->refs);
+}
+
 void shmem_comp_entry_put(struct shmem_comp_entry *ent)
 {
 	if (!ent)
