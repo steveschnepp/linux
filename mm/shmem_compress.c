@@ -1193,6 +1193,34 @@ shmem_comp_entries_get(struct inode *inode, pgoff_t index, u64 *handle,
 	return ent;
 }
 
+/*
+ * shmem_comp_entries_names - does entries[index] still name @ent?
+ * @ent: an entry the caller holds a pin on
+ *
+ * The install-side revalidation for decompress: the pin from
+ * entries_get guarantees the ENTRY's lifetime, but says nothing about
+ * the SLOT -- a truncate/punch may have claimed (xa_erased) it while
+ * the caller decompressed.  Installing into the i_pages slot that
+ * truncate left empty would resurrect a folio past i_size or inside a
+ * hole, where tmpfs must serve zeros.  The pointer comparison happens
+ * inside one rcu_read_lock section; the caller's own pin keeps the
+ * object (and its address) alive, so no ABA is possible.
+ */
+static bool shmem_comp_entries_names(struct inode *inode, pgoff_t index,
+				     struct shmem_comp_entry *ent)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct xarray *xa = READ_ONCE(info->comp_entries);
+	bool named;
+
+	if (!xa)
+		return false;
+	rcu_read_lock();
+	named = xa_load(xa, index) == ent;
+	rcu_read_unlock();
+	return named;
+}
+
 void shmem_comp_entry_put(struct shmem_comp_entry *ent)
 {
 	if (!ent)
@@ -2891,8 +2919,10 @@ static struct folio *shmem_comp_get_folio_noalloc(struct inode *inode,
  * resolved by shmem_add_to_page_cache() validating the replicated
  * ID+generation -- that check never existed (add_to_page_cache does
  * not look at info->comp_entries).  The real races are resolved by
- * the -EEXIST retry in shmem.c (folio filled the slot) and by the
- * entries_get pin below (entry vanished -> -ENOENT, retry).
+ * the -EEXIST retry in shmem.c (folio filled the slot), by the
+ * entries_get pin below (entry vanished -> -ENOENT, retry), and --
+ * for the truncate/punch race the old comment gestured at -- by the
+ * post-install slot revalidation in the finalize pass below.
  */
 static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 				   struct shmem_comp_entry *ent,
@@ -2906,6 +2936,7 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	u64 *handles = NULL;
 	unsigned short nchunks = 0;
 	void *cbuf, *dbuf, *dst;
+	struct folio **sibs = NULL;
 	unsigned int dlen;
 	unsigned short slice;
 	int ret = 0;
@@ -2962,8 +2993,14 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 	}
 
 	dbuf = kmalloc((size_t)nr_pages * PAGE_SIZE, GFP_KERNEL);
-	if (!dbuf) {
+	/* sibs tracks the installed slices so the finalize pass can
+	 * validate/unlock them; heap because nr_pages reaches
+	 * SHMEM_COMP_MERGE_MAX (1024). */
+	sibs = kcalloc(nr_pages, sizeof(*sibs), GFP_KERNEL);
+	if (!dbuf || !sibs) {
 		kfree(cbuf);
+		kfree(dbuf);
+		kfree(sibs);
 		shmem_comp_entry_put(ent);
 		return -ENOMEM;
 	}
@@ -3022,10 +3059,11 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 			folio_unlock(sib);
 			folio_put(sib);
 			if (sidx == index) {
-				/* requested slice lost the race: retry */
-				shmem_comp_entry_put(ent);
-				kfree(dbuf);
-				return ret;
+				/* requested slice lost the race: retry.
+				 * Break (not return) so the finalize pass
+				 * below still unlocks the slices already
+				 * installed. */
+				break;
 			}
 			continue;
 		}
@@ -3035,28 +3073,72 @@ static int shmem_decompress_group(struct inode *inode, pgoff_t index,
 		__folio_clear_swapbacked(sib);
 		folio_add_lru(sib);
 
-		/* Both state: entries[sidx] still names the group entry, so
-		 * no per-slice release and the entry's swapped charge is
+		/* Both state (validated in the finalize pass below):
+		 * entries[sidx] still names the group entry, so no
+		 * per-slice release and the entry's swapped charge is
 		 * retained.  Reclaim drops the folio later, keeping the
-		 * entry.  Not marked referenced -- a reclaimable cache, see
-		 * shmem_decompress_folio(). */
+		 * entry.  Not marked referenced -- a reclaimable cache,
+		 * see shmem_decompress_folio(). */
 
+		/* Slices stay LOCKED until the whole group is validated
+		 * below; sibs[] tracks the installed ones. */
+		sibs[slice] = sib;
+		ret = 0;
+	}
+
+	/*
+	 * Finalize: validate every installed slice against the slot it
+	 * came from (the post-install revalidation, explained in
+	 * shmem_decompress_folio()).  A truncate/punch that cleared
+	 * entries[sidx] while we decompressed leaves the i_pages slot
+	 * EMPTY, so the install above succeeded and would resurrect a
+	 * folio past i_size or inside a hole, where tmpfs must serve
+	 * zeros.  shmem_undo_range clears slots before its i_pages
+	 * walks, so "slot still names ent here" implies truncate's own
+	 * walk runs after our install and removes the folio itself --
+	 * either way no folio survives the truncate.  Holding every
+	 * slice locked until here also blocks a racing write_begin (a
+	 * cleared slot can only mean truncate, never the write-
+	 * invalidate, so removing is safe) and blocks reclaim from
+	 * detaching a sibling before its check.
+	 */
+	for (slice = 0; slice < nr_pages; slice++) {
+		struct folio *sib = sibs[slice];
+		pgoff_t sidx = head + slice;
+
+		if (!sib)
+			continue;
+		if (!shmem_comp_entries_names(inode, sidx, ent)) {
+			/* The folio just left the page cache: drain lock
+			 * waiters the PG_waiters fast path can skip
+			 * (entry-race lost-wakeup fix -- no future
+			 * lock/unlock is guaranteed). */
+			shmem_delete_from_page_cache(sib, NULL);
+			folio_unlock(sib);
+			wake_up_folio_waiters(sib);
+			folio_put(sib);
+			if (sidx == index)
+				ret = -ENOENT;	/* retry against the updated
+						 * tables */
+			continue;
+		}
 		if (sidx == index) {
 			*foliop = sib;	/* locked, ref for caller */
 		} else {
 			folio_unlock(sib);
 			folio_put(sib);
 		}
-		ret = 0;
 	}
 
-	/* The group entry survives (entries[] still names it); the
-	 * compressed gauge is NOT decremented here -- it drops when the
-	 * entry is freed on truncate/evict.  Drop the group pin. */
+	/* The group entry survives (entries[] still names the surviving
+	 * slots' entry); the compressed gauge is NOT decremented here --
+	 * it drops when the entry is freed on truncate/evict.  Drop the
+	 * group pin. */
 	shmem_comp_entry_put(ent);
 
 	kfree(cbuf);
 	kfree(dbuf);
+	kfree(sibs);
 	return *foliop ? 0 : ret;
 }
 
@@ -3328,10 +3410,14 @@ static int shmem_compress_group(struct inode *inode, pgoff_t last)
  * re-decompresses.  The folio is returned locked and with a reference,
  * matching the shmem_get_folio() contract.
  *
- * A racing truncate that clears entries[index] frees the entry; the
- * generation-validated pin rejects the recycled id with -ENOENT and the
- * caller retries against the updated table.  A folio that loses the
- * install race gets -EEXIST and the caller retries.
+ * A racing truncate/punch that clears entries[index] frees the entry,
+ * but a pin taken before the clear keeps it alive -- so the install
+ * below is followed by a slot revalidation: a truncate leaves the
+ * i_pages slot EMPTY, which an expected=NULL install would happily
+ * refill with a resurrected folio.  A failed revalidation undoes the
+ * install and returns -ENOENT; the caller retries against the updated
+ * tables.  A folio that loses the install race gets -EEXIST and the
+ * caller retries.
  */
 int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 			   gfp_t gfp, struct folio **foliop)
@@ -3494,6 +3580,37 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
 	}
 
 	/*
+	 * Post-install slot revalidation -- the two-table analogue of
+	 * upstream's expected-swap install (shmem_swapin_folio passes
+	 * the swap entry it read, so a truncate that removed it fails
+	 * the install; our compressed entry lives in a different
+	 * xarray, so the slot claim has to be re-checked here).  A
+	 * truncate/punch that cleared entries[index] while we
+	 * decompressed leaves the i_pages slot EMPTY, so the install
+	 * above succeeds and would resurrect a folio past i_size or
+	 * inside a hole.  The pin keeps the ENTRY alive but says
+	 * nothing about the SLOT; if the slot no longer names our entry,
+	 * undo the install.  The folio is still locked, so no writer
+	 * could have claimed it (a racing write_begin blocks on
+	 * folio_lock) -- a cleared slot can only mean truncate/punch,
+	 * and shmem_undo_range clears slots before its i_pages walks,
+	 * so this check closes the window completely: either the slot
+	 * still names ent (and truncate's later walk removes the folio
+	 * itself), or we remove it now.
+	 */
+	if (!shmem_comp_entries_names(inode, index, ent)) {
+		shmem_delete_from_page_cache(folio, NULL);
+		folio_unlock(folio);
+		/* The folio just left the page cache: drain lock waiters
+		 * the PG_waiters fast path can skip (entry-race lost-
+		 * wakeup fix -- no future lock/unlock is guaranteed). */
+		wake_up_folio_waiters(folio);
+		folio_put(folio);
+		shmem_comp_entry_put(ent);
+		return -ENOENT;
+	}
+
+	/*
 	 * Both-state accounting: the folio adds nrpages while the entry
 	 * keeps its swapped charge, so alloced (the size= budget) is
 	 * unchanged -- the folio is a reclaimable cache of the one logical
@@ -3540,17 +3657,6 @@ int shmem_decompress_folio(struct inode *inode, pgoff_t index,
  * - The data doesn't compress well (incompressible)
  * - The compression pool is not available
  * - Memory allocation fails
- */
-
-/*
- * The per-inode entries[] table (the two-table mapping, specs/02).  Each
- * present slot packs {id, gen} of the compressed entry backing that page
- * index, stored as a plain xa_value.  No swap-type tag: entries[] is a
- * dedicated table that never holds folios or real swap entries, so the
- * value needs no type discrimination.  The slot owns the entry's durable
- * reference (counted by the entry's `slots` counter); the packed
- * generation rejects a stale id once the entry is freed and the id
- * recycled.
  */
 
 /*
