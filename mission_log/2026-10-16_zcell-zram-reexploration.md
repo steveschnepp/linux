@@ -723,3 +723,76 @@ there); it needs the grouped/larger objects the mTHP path would create.
    get).
 3. Re-run swapbench with mTHP on: does the per-folio compression ratio
    beat zram's per-page enough to offset the ~18% throughput deficit?
+
+---
+
+## Session 72: The Ratio-1 Optimizations -- Small Win, Corrected Diagnosis (2026-10-17)
+
+(Session 72; same file.  Follows the session-71 baseline.)
+
+### What We Did
+
+Implemented the two ratio-independent optimizations diagnosed in session
+71, measured them, and found the diagnosis was wrong about MAGNITUDE.
+
+**Commit `0e946ee06132`** (engine + device):
+1. `shmem_comp_read_entry()` -- decompress DIRECTLY from the cell under
+   its rwsem (no bounce).  Removed the kmalloc + copy-out + kfree per
+   compressed read.  Device read path uses it.
+2. `shmem_comp_entry_alloc_local()` -- register a device entry WITHOUT
+   the global `shmem_comp_entries` xa_alloc (id=0 sentinel; entry_free
+   guards the erase on id != 0).  GC finds device entries via the
+   reverse index.  Device write path uses it.
+
+**Measured (swapbench, i386/KVM, 3 reps, same data):**
+
+| metric | baseline zcell | optimized zcell | zram ref |
+|---|---|---|---|
+| swap-in MB/s | ~500 | ~532 (+6%) | ~635 |
+| swap-out time | 52.5 ms | 51.5 ms (~2%) | 44.5 ms |
+| zcell vs zram | 0.82x | 0.84x | 1.0x |
+
+Real, but MODEST -- the two "dominant suspects" were only ~1-2 ms each.
+
+### The corrected diagnosis: the gap is DIFFUSE, not one hotspot
+
+Traced the shmem_comp wrappers: `shmem_comp_compress` AND
+`shmem_comp_decompress` do, on EVERY call: `mutex_lock(&pcpu->lock)` +
+**two `ktime_get()` clock reads** (always-on per-call stats timing) +
+sg setup + `crypto_wait_req`.  That is ~4 clock reads + 2 mutex pairs
+PER SWAP BLOCK round-trip, on the hot path, for every shmem_comp user
+(tmpfs included).  Add the entry-refcount + rwsem residue, and the ~16%
+gap vs zram's lean `zcomp` (get_cpu + sg + crypto, no mutex, no timing)
+is **death by a thousand small per-block costs, not one hotspot**.
+
+The always-on `ktime_get()` timing is pure hot-path instrumentation
+accumulated into comp_stats -- a candidate easy trim (gate or drop it),
+but a shared-engine change and only worth ~1-2 ms.
+
+### What We Learned (session 72)
+- **A code-traced "dominant cost" can be wrong about magnitude.**  The
+  global xa_alloc and the bounce were real but small; the gap is the
+  accumulated generality overhead (per-CPU mutex, always-on timing,
+  entry refcount, rwsem) vs zram's purpose-built path.
+- **Diffuse per-block overhead is exactly what GROUPING amortizes** --
+  and cannot be killed by any single ratio-1 micro-opt.  This
+  VALIDATES the mTHP bet: one op per N pages amortizes the entire
+  per-block tax (mutex, timing, refcount, rwsem) at once, plus the
+  compression-ratio win.
+- **The per-call ktime_get stats timing is hot-path instrumentation**
+  in the shared engine -- worth gating for all shmem_comp users, but a
+  separate change.
+
+### What We Decided (session 72)
+- **Stop ratio-1 micro-optimization.**  The gap is diffuse; further
+  trims are death-by-cuts with diminishing returns.
+- **Proceed to mTHP grouping** -- it amortizes the whole per-block tax
+  AND wins compression ratio, the two things ratio-1 cannot.
+
+### Next Steps (session 72)
+1. mTHP config surface + the grouping commit (compress a swap folio as
+   one unit via shmem_comp_store_merged).
+2. Re-run swapbench with mTHP on: does the per-folio ratio beat zram's
+   per-page enough to clear the ~0.84x base?
+3. (Optional, separate) gate the per-call ktime_get stats timing in the
+   engine -- helps tmpfs + device everywhere.
