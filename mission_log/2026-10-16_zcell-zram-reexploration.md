@@ -1163,3 +1163,142 @@ arm32 rc=0 in 4m49s (was 12+ min, dead); arm64-4k rc=0 in 8m7s (was
    out/dense_pass/.
 3. Only then: the swapbench A/B vs the preserved entry-table kernel
    (dense vs entry, zram as in-kernel control).
+
+---
+
+## Session 76: The Hang Hunt -- Rig Lies, One Leaked Pin, and Two Rig Hardening Rounds (2026-10-17)
+
+(Intermediate append; the matrix pass's final sweep -- matrix_watermark
+-- was still running at write time.)
+
+### What We Did
+
+**1. The full-matrix pass ran and mostly cleared.**  Guests+initramfs
+8/8; kernels 10/10 after the config slash; arch battery 8/8 PASS
+(36/36 checks each -- i386, i386-pae/PAE-highmem, arm32,
+arm64-4k/16k/64k, riscv64, mips32-be; every result re-verified as
+authentic, not runner-reported); x86_64 KASAN default suite PASS
+(verified "Test exit code: 0"); four of five ztmpfs config sweeps
+PASS; matrix_watermark pending.
+
+**2. The runner was producing FALSE PASSES -- two mechanisms, both
+fixed.**
+- run_qemu.sh captured `$?` after `qemu ... | tee LOG`: that is
+  TEE's exit status.  A host-killed or crashed guest -> tee exits 0
+  -> exit 0 -> PASS.  My manual kill of the wedged zcell-boot QEMU
+  turned a hang into "PASS suite-zcell-boot" in the summary -- caught
+  because the serial log had no GUEST_RESULT at all.  Fixed:
+  EXIT_CODE=${PIPESTATUS[0]}.
+- A panic=1 guest reboots after panic; -no-reboot makes QEMU exit 0
+  on that reboot -- so a panic would ALSO read as PASS.  Fixed: the
+  runner greps "Kernel panic" in the serial log and fails explicitly.
+- Hardening: both runners now boot with panic=1 oops=panic
+  hung_task_panic=1 softlockup_panic=1 -- a wedged guest can never
+  outlive the run, and the full multi-task hung-task report lands in
+  the serial log instead of being killed blind.  All runner edits
+  atomic-mv'd so in-flight steps kept their open inodes.
+- (Self-inflicted, logged: `pkill -f qemu-system-x86_64` matched my
+  OWN shell's command line and killed the tool session; use
+  pgrep -x / PID loops.)
+
+**3. The zcell boot test wedged -- reproducibly, and invisibly to
+every detector.**  Round-trip green, then silence at the reset/swap
+trial, with only "clocksource: Watchdog remote CPU N read timed
+out".  No hung-task (the waiters are SCHED_NORMAL), no softlockup
+(prehemptible cpu_relax spin).  Outer timeout was the only exit.
+
+**4. Diagnostic commit `2fd08efa8b0d`: bounded waits as
+assertions.**  The device's wait loops (read pin-retry, write
+drain-wait, reset pin-drain) now bound at 10s: print
+slot/present/refs/handle and panic -- with panic=1 the guest reboots
+and the serial log NAMES the stuck generation.  Principle recorded:
+when code waits for an invariant, write the wait as an assertion,
+not as an open-ended spin.  (The reset drain was a leak oracle all
+along; it had been written as a silent loop.)
+
+**5. The bug: `b149fcd1a1c8` -- the dense read path leaked a pin.**
+zcell_read_block()'s pinned path returned shmem_comp_loc_read()
+directly and never called zcell_slot_put(): every successful block
+read leaked one refs count.  The round-trip leaked 64; reset dropped
+the durable refs and the drain loop then spun forever on refs==1.
+Reproduced on BOTH the plain and KASAN kernels (not KASAN-specific;
+KASAN only changed where the test stalled).  The regression entered
+with the dense rewrite: the old code was linear (read; put; return);
+the goto-restructure lost the cleanup on the new exit.
+
+**6. Fixed and verified end to end.**  i386 gate 0/0; rebuilt both
+x86_64 kernels; test.zcell on plain AND KASAN: 13/13 PASS both --
+swap writes hit the device, SwapFree exhausted (device-full churn),
+swapped data read back INTACT, cells returned to buddy after swapoff,
+guest exit 0.  i386 swapbench (pre-fix kernel) had already PASSED --
+the leak is invisible without a reset-wait (swapbench never resets),
+which is exactly why the boot test caught it and the bench did not.
+
+### What We Learned (session 76)
+
+### Technical
+
+- **A schedulable spin defeats every kernel hang detector.**  A
+  task looping in cpu_relax() with preemption enabled is neither
+  D-state (hung_task) nor a soft lockup -- it just never finishes.
+  Silent forever.  Bounded waits that panic are the only loud
+  failure mode for that class.
+- **The leak oracle existed and I had written it as a silent loop.**
+  The reset drain asserting refs==0 would have named the leaking
+  slot on the very first boot test.
+- **Why the bench could not see it**: swapbench never resets, so the
+  leaked pins only delayed frees into spare RAM.  A test that waits
+  for an invariant (reset drain) is a different -- and here,
+  decisive -- class of check than a test that measures throughput.
+- **tee-in-a-pipeline eats exit codes.**  Any `cmd | tee log` must
+  read PIPESTATUS, or crashes become successes.
+- The rare trres one-off hang (Phase B merge=8, one occurrence in
+  two runs, tmpfs-only) is NOT this bug -- separate race, still open.
+
+### Process
+
+- **"Performance without correctness is futile" (user) ordered the
+  whole session**: the A/B stayed queued while the matrix and the
+  device test were made honest.  Good thing: the runner itself was
+  fabricating passes.
+- **Verify runner-reported results against the serial logs.**  Every
+  PASS tonight was re-checked for GUEST_RESULT/Test exit code in the
+  actual log; two "PASSes" were false and one hang was hiding.
+- **Foreground over background** (user): background builds/runs
+  caused avoidable bookkeeping (lost processes, a self-inflicted
+  pkill).  The host compiles fast enough that fg is cheap.
+- Code-review lesson (user question, answered in commit): make leaks
+  structurally hard -- callee-consumes-the-pin APIs, resource pairs
+  named and never split by a goto, invariant waits written as
+  assertions.  Review the boring glue as hard as the novel protocol.
+
+### Files Changed (session 76)
+
+| File | Purpose |
+|------|---------|
+| rig `scripts/run_qemu.sh` | PIPESTATUS, panic-discriminator, panic= cmdline (atomic mv x3) |
+| rig `scripts/run_arch.sh` | panic= cmdline (atomic mv) |
+| `mm/zcell.c` (`2fd08ef`) | bounded slot waits -> dump+panic |
+| `mm/zcell.c` (`b149fcd`) | the fix: zcell_slot_put after loc_read; bounded reset drain |
+
+### Test Results (session 76)
+
+- Batteries 8/8 PASS (36/36 each, verified); KASAN default suite PASS
+  (verified); trres + entryrace re-runs PASS (verified); 4/5 sweeps
+  PASS; matrix_watermark pending.
+- test.zcell pre-fix: hang on plain AND KASAN (reproduced, diagnosed).
+- test.zcell POST-FIX: 13/13 PASS on plain and KASAN -- integrity +
+  cells-to-buddy at device-full churn, exit 0 both.
+- i386 swapbench: PASS (pre-fix kernel).
+
+### Next Steps (session 76)
+
+1. matrix_watermark result; then the whole pass rerun at b149fcd?
+   (batteries are tmpfs-only; the fix touches zcell.c alone -- the
+   zcell test + swapbench are its gates, both green.  Optional.)
+2. The swapbench A/B (dense vs entry) is now UNLOCKED; rerun the
+   fixed i386 kernel against the preserved entry baseline.
+3. The rare trres Phase-B race: loop test.trres=1 N times on the
+   KASAN kernel to characterize.
+4. mTHP folio grouping (the differentiator) next on the feature
+   track.
