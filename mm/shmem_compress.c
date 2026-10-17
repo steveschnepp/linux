@@ -644,8 +644,6 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 	struct shmem_comp_pcpu *pcpu;
 	struct scatterlist input, output;
 	unsigned int dlen;
-	ktime_t start, end;
-	s64 duration;
 	int ret;
 
 	if (!pool || !src || !dst || !dst_len || slen == 0)
@@ -655,8 +653,6 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 	dlen = *dst_len;
 
 	mutex_lock(&pcpu->lock);
-
-	start = ktime_get();
 
 	/* Setup scatterlists for crypto operation */
 	sg_init_one(&input, src, slen);
@@ -669,9 +665,6 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 	/* Execute compression (synchronous wait for async op) */
 	ret = crypto_wait_req(crypto_acomp_compress(pcpu->req),
 			      &pcpu->wait);
-
-	end = ktime_get();
-	duration = ktime_to_ns(ktime_sub(end, start));
 
 	if (!ret) {
 		dlen = pcpu->req->dlen;
@@ -714,8 +707,6 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 	struct shmem_comp_pcpu *pcpu;
 	struct scatterlist input, output;
 	unsigned int dlen;
-	ktime_t start, end;
-	s64 duration;
 	int ret;
 
 	if (!pool || !src || !dst || !dst_len || slen == 0)
@@ -725,8 +716,6 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 	dlen = *dst_len;
 
 	mutex_lock(&pcpu->lock);
-
-	start = ktime_get();
 
 	/* Setup scatterlists for crypto operation */
 	sg_init_one(&input, src, slen);
@@ -739,9 +728,6 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 	/* Execute decompression */
 	ret = crypto_wait_req(crypto_acomp_decompress(pcpu->req),
 			      &pcpu->wait);
-
-	end = ktime_get();
-	duration = ktime_to_ns(ktime_sub(end, start));
 
 	if (!ret) {
 		*dst_len = pcpu->req->dlen;
