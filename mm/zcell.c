@@ -127,7 +127,6 @@ static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 			    void *dst, unsigned int len_bytes)
 {
 	struct shmem_comp_entry *ent;
-	unsigned int dlen;
 	int ret;
 
 	/* Pin the entry: xa_load + entry_get inside one RCU section.
@@ -152,31 +151,10 @@ static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 		return 0;
 	}
 
-	/* ent->length is the STORED length, immutable after alloc (only
-	 * the handle moves on GC), so it is safe under the pin. */
-	dlen = ent->length;
-	if (dlen == PAGE_SIZE) {
-		/* raw block: load straight into the destination */
-		unsigned int l = len_bytes;
-
-		ret = shmem_comp_load_entry(ent, dst, &l);
-	} else {
-		void *src = kmalloc(PAGE_SIZE, GFP_NOIO);
-		unsigned int l = dlen;
-
-		if (!src) {
-			shmem_comp_entry_put(ent);
-			return -ENOMEM;
-		}
-		ret = shmem_comp_load_entry(ent, src, &l);
-		if (!ret) {
-			unsigned int out = PAGE_SIZE;
-
-			ret = shmem_comp_decompress(zc->pool, src, dlen,
-						    dst, &out);
-		}
-		kfree(src);
-	}
+	/* Decompress directly from the cell under its rwsem -- no bounce
+	 * buffer (read_entry).  len_bytes == PAGE_SIZE is the bio-path
+	 * contract (a partial bvec is bounced by the caller). */
+	ret = shmem_comp_read_entry(ent, dst, NULL);
 	shmem_comp_entry_put(ent);
 	return ret;
 }
@@ -209,7 +187,7 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 		return -ENOMEM;
 	}
 
-	ent = shmem_comp_entry_alloc(zc->pool, handle, len_bytes, 1, NULL, 0);
+	ent = shmem_comp_entry_alloc_local(zc->pool, handle, len_bytes);
 	if (!ent) {
 		shmem_comp_free(zc->pool, handle);
 		kfree(cbuf);

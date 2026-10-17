@@ -1086,8 +1086,16 @@ static void shmem_comp_entry_free(struct shmem_comp_entry *ent)
 	 * double-teardown detector: an id is in the table for exactly the
 	 * lifetime of its entry, so a failed erase means this entry was
 	 * already torn down. */
-	if (!xa_erase(&shmem_comp_entries, ent->id))
-		return;
+	/* Global-table entries: the erase is the teardown guard (an id is
+	 * in the table for exactly the entry's lifetime; a failed erase =
+	 * already torn down).  Device-local entries (ent->id == 0, via
+	 * entry_alloc_local) are never in the global table, so skip the
+	 * erase; the caller's atomic dec_and_test is the sole double-
+	 * teardown guard for them (only one thread observes refs hit 0). */
+	if (ent->id) {
+		if (!xa_erase(&shmem_comp_entries, ent->id))
+			return;
+	}
 
 	/* Teardown runs only from the refs==0 path (dec_and_test); a
 	 * live entry here means double teardown. Debug kernels panic. */
@@ -1344,6 +1352,47 @@ shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 	 * index; it is stable for the entry's life here (only GC relocates,
 	 * and gc_lock serialises that against this alloc).
 	 */
+	INIT_LIST_HEAD(&ent->cell_node);
+	if (pool->use_cells) {
+		u32 cellid, offset;
+
+		shmem_comp_unpack_loc(handle, &cellid, &offset);
+		spin_lock(&pool->index_lock);
+		list_add_tail(&ent->cell_node, &pool->cell_index[cellid]);
+		spin_unlock(&pool->index_lock);
+	}
+
+	return ent;
+}
+
+struct shmem_comp_entry *
+shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
+			     unsigned int length)
+{
+	struct shmem_comp_entry *ent;
+
+	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
+	if (!ent)
+		return NULL;
+
+	ent->handle = handle;
+	ent->length = length;
+	ent->nr_pages = 1;
+	ent->handles = NULL;
+	ent->nchunks = 0;
+	ent->pool = pool;
+	/* id == 0: not in the global shmem_comp_entries table; entry_free
+	 * skips the xa_erase for these.  The caller's block table names the
+	 * entry by POINTER, and GC finds it via the reverse index below. */
+	ent->id = 0;
+	atomic_set(&ent->refs, 1);
+	atomic_set(&ent->slots, 1);
+
+	atomic_inc(&shmem_comp_ram_entries);
+	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
+
+	/* Reverse index: same as entry_alloc -- GC finds this entry via the
+	 * per-cell list, not the global table. */
 	INIT_LIST_HEAD(&ent->cell_node);
 	if (pool->use_cells) {
 		u32 cellid, offset;
@@ -1762,6 +1811,71 @@ int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
 		memcpy(dst, c->base + offset, *len);
 		up_read(&c->lock);
 		ret = 0;
+		break;
+	}
+
+	return ret;
+}
+
+int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
+			  bool *raw)
+{
+	struct cell_pool *cp;
+	unsigned int budget = 8;
+	int ret = -EIO;
+
+	if (!ent)
+		return -ENOENT;
+	cp = ent->pool->cells;
+	if (!cp)
+		return -EINVAL;
+
+	while (budget--) {
+		u64 h = READ_ONCE(ent->handle);
+		u32 cellid, offset, dlen;
+		struct cell *c;
+		u32 cell_size;
+
+		if (!h)
+			break;
+		shmem_comp_unpack_loc(h, &cellid, &offset);
+		c = &cp->cells[cellid];
+
+		down_read(&c->lock);
+		/* Re-read under the lock: GC relocates the handle while holding
+		 * down_write on this rwsem, so a change means the block moved --
+		 * retry with the fresh location. */
+		if (READ_ONCE(ent->handle) != h) {
+			up_read(&c->lock);
+			continue;
+		}
+		if (!c->pages[0] || !c->base) {
+			up_read(&c->lock);
+			continue;
+		}
+
+		dlen = ent->length;
+		cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
+		if (offset + dlen > cell_size) {
+			up_read(&c->lock);
+			break;
+		}
+
+		if (dlen == PAGE_SIZE) {
+			memcpy(dst, c->base + offset, PAGE_SIZE);
+			if (raw)
+				*raw = true;
+			ret = 0;
+		} else {
+			unsigned int out = PAGE_SIZE;
+
+			ret = shmem_comp_decompress(ent->pool,
+						    c->base + offset, dlen,
+						    dst, &out);
+			if (raw)
+				*raw = false;
+		}
+		up_read(&c->lock);
 		break;
 	}
 

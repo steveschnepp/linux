@@ -554,6 +554,23 @@ unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
 int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
 			  unsigned int *len);
 
+/*
+ * shmem_comp_read_entry - read a block into @dst, decompressing in place
+ * @ent: a pinned entry (the caller holds a ref)
+ * @dst: destination buffer, PAGE_SIZE bytes
+ * @raw: optional out; true if the block was stored raw (uncompressed)
+ *
+ * Reads directly from the cell under its rwsem, decompressing into @dst
+ * WITHOUT a bounce buffer (unlike load_entry, which copies out).  The
+ * rwsem blocks GC relocation for the duration of the copy/decompress, so
+ * the source is stable; cells are always lowmem (cell_gfp strips
+ * __GFP_HIGHMEM), so c->base is a valid direct-map source for the crypto
+ * scatterlist on every arch.  Holders that must not hold a lock across
+ * the decompress should use load_entry + decompress instead.
+ */
+int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
+			  bool *raw);
+
 /* Debug hook: run one async GC pass on every cell-backed pool. */
 void shmem_comp_cell_gc_all(void);
 
@@ -709,6 +726,25 @@ struct shmem_comp_entry *
 shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 		       unsigned int length, unsigned short nr_pages,
 		       u64 *handles, unsigned short nchunks);
+
+/*
+ * shmem_comp_entry_alloc_local - like entry_alloc but NOT in the global table
+ * @pool: pool that owns @handle
+ * @handle: storage handle from shmem_comp_store()
+ * @length: compressed data length in bytes
+ *
+ * For consumers whose own table stores the entry POINTER (a block/swap
+ * frontend): the entry is not registered in the global shmem_comp_entries
+ * id table (ent->id == 0), so there is no per-block global-xarray id
+ * allocation.  GC still finds it via the per-cell reverse index
+ * (cell_index).  The caller addresses the entry by pointer and frees it
+ * with shmem_comp_entry_release()/put() as usual.
+ *
+ * Return: the entry (pinned by its initial refs == slots == 1), or NULL.
+ */
+struct shmem_comp_entry *
+shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
+			     unsigned int length);
 
 /**
  * shmem_comp_entry_get - pin a live entry by pointer
