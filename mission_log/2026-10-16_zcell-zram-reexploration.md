@@ -796,3 +796,78 @@ but a shared-engine change and only worth ~1-2 ms.
    per-page enough to clear the ~0.84x base?
 3. (Optional, separate) gate the per-call ktime_get stats timing in the
    engine -- helps tmpfs + device everywhere.
+
+---
+
+## Session 73: The Two Config-Independent Trims -- Correct, Modest (2026-10-17)
+
+(Session 73; same file.  Follows session 72.)
+
+### What We Did
+
+Implemented the two config-independent trims (no mTHP dependency), then
+rebuilt the i386 kernel and re-ran swapbench to check correctness +
+measure.
+
+- **Trim 1** `f1f219413243`: drop the dead per-call `ktime_get` timing
+  from compress/decompress (2 clock reads/call, 4 per swap block; the
+  `duration` was computed and never used).
+- **Trim 2** `4a0c1f123353`: per-CPU compression buffer +
+  `shmem_comp_compress_store()` -- compress+store in one step under the
+  held per-CPU lock, removing the per-block `kmalloc(PAGE_SIZE)+kfree`
+  for the compression output (zram's zcomp pattern).
+
+### Test Results (i386/KVM, 3 reps, fresh boots)
+
+**Correctness: PASS on every rep** -- `intact=1` (data integrity through
+the full swap round-trip), `GUEST_RESULT: PASS n=0`, no corruption, no
+deadlock.  This validates the `compress_store` lock-ordering (holding
+the per-CPU mutex across `cell_store`'s sleeping `alloc_pages`) at
+runtime, not just by reasoning.
+
+**Perf (median of 3):**
+
+| metric | zcell (trimmed) | zram | zcell vs zram |
+|---|---|---|---|
+| swap-out time | 49.5 ms | 44.0 ms | 1.14x (was 1.18x baseline) |
+| swap-in | 533 MB/s | 628 MB/s | 0.85x (was 0.82x baseline) |
+| RAM overhead | 1.031 | 1.032 | tie (unchanged) |
+
+Swap-in variance was notable: 525 / 533 / 639 MB/s across reps (one rep
+~zram parity; unexplained, 3 reps insufficient to characterize).
+
+### Verdict
+
+**The two trims are correct and help only modestly.**  Cumulative over
+ALL FOUR config-independent trims (bounce, global xa_alloc, ktime,
+per-CPU buffer), zcell moved 1.18x -> 1.14x swap-out and 0.82x ->
+0.85x swap-in -- ~3-4% total.  **zcell does NOT reach parity on the
+default (no-mTHP) config**, confirming session 72's diagnosis: the gap
+is diffuse per-block overhead, not a killable hotspot, and micro-opts
+cannot close it.  Against the bar "at least equal on default config,"
+zcell currently fails.
+
+### What We Learned (session 73)
+- **Runtime validation of the lock-ordering change** (mutex across a
+  sleeping alloc) passed -- no deadlock, no corruption, 3 fresh boots.
+- **Four sensible trims recovered only ~3-4%.**  The remaining ~14-15%
+  is structural (the entry indirection zram avoids by storing the handle
+  inline, plus the engine's general per-block tax).  This is strong
+  evidence the ratio-1 path cannot be micro-opted to parity.
+- **Swap-in shows real run-to-run variance** (525-639) that zram does
+  not (626-633) -- possibly GC/rwsem interaction; needs more reps to
+  characterize.
+
+### What We Decided (session 73)
+- **The config-independent trim avenue is exhausted** (diminishing
+  returns: ~1%/further trim).  Stop here.
+- The **entry-elimination** idea (store the handle directly in the
+  block table, no device GC relocation -- removes the entry indirection
+  zram doesn't have) is the one remaining structural lever for parity;
+  it is a design change, held for the "think creatively" round.
+
+### Next Steps (session 73)
+Held per user: no next-steps planned this session.  Standing state:
+zcell correct, ~0.85x zram swap-in / 1.14x swap-out / RAM-tie on
+default config; entry-elimination is the identified (unimplemented)
+path toward parity.
