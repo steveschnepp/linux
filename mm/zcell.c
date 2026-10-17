@@ -43,6 +43,7 @@
 #include <linux/sysfs.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/math64.h>
 #include <linux/cell_store.h>
 #include <linux/shmem_compress.h>
 
@@ -424,8 +425,10 @@ static ssize_t disksize_store(struct device *dev,
 	 * compresses (incompressible blocks are stored raw at PAGE_SIZE
 	 * each).  Headroom covers COW-before-free churn. */
 	cell_bytes = (u64)PAGE_SIZE << cell_order;
-	nr_cells = DIV_ROUND_UP(size_bytes, cell_bytes);
-	nr_cells += DIV_ROUND_UP(nr_cells * cell_headroom_pct, 100);
+	/* div64_u64: on 32-bit, a runtime u64/u64 DIV_ROUND_UP emits
+	 * __udivdi3, which the kernel does not link (libgcc). */
+	nr_cells = div64_u64(size_bytes + cell_bytes - 1, cell_bytes);
+	nr_cells += div64_u64(nr_cells * (u64)cell_headroom_pct + 99, 100);
 	if (nr_cells > UINT_MAX)
 		nr_cells = UINT_MAX;
 
@@ -506,7 +509,7 @@ static ssize_t mm_stat_show(struct device *dev,
 	return sysfs_emit(buf,
 			  "%llu %llu %llu %llu\n",
 			  orig, compr, mem_used,
-			  orig ? (compr * 10000) / orig : 0);
+			  orig ? div64_u64(compr * 10000, orig) : 0);
 }
 static DEVICE_ATTR_RO(mm_stat);
 
