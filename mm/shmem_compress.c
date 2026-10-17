@@ -1392,30 +1392,6 @@ static bool shmem_comp_entries_names(struct inode *inode, pgoff_t index,
 	return named;
 }
 
-/*
- * shmem_comp_entry_get - pin a live entry by pointer
- * @ent: an entry pointer the caller obtained under rcu_read_lock from an
- *       RCU-protected table (its own block table, or the per-inode
- *       entries[]).
- *
- * Return: true if the caller now owns a pin (drop with entry_put()),
- *         false if the entry is already dying (treat as vanished; the
- *         caller retries against the updated table).
- *
- * The pin is atomic_inc_not_zero() and must run inside the caller's
- * rcu_read_lock section: kfree_rcu cannot reclaim the address until
- * after a grace period the caller's own RCU section blocks, so at pin
- * time the object is provably the original (dying -> pin fails; alive
- * -> correct object).  This is the same discipline as
- * shmem_comp_entries_get(), factored out so a non-inode consumer (a
- * block/swap frontend with its own block table) can pin by
- * pointer.
- */
-bool shmem_comp_entry_get(struct shmem_comp_entry *ent)
-{
-	return ent && atomic_inc_not_zero(&ent->loc.refs);
-}
-
 void shmem_comp_entry_put(struct shmem_comp_entry *ent)
 {
 	if (!ent)
@@ -1515,39 +1491,6 @@ shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 	 * index; it is stable for the entry's life here (only GC relocates,
 	 * and gc_lock serialises that against this alloc).
 	 */
-	shmem_comp_loc_link(pool, &ent->loc);
-
-	return ent;
-}
-
-struct shmem_comp_entry *
-shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
-			     unsigned int length)
-{
-	struct shmem_comp_entry *ent;
-
-	ent = kmalloc(sizeof(*ent), GFP_KERNEL);
-	if (!ent)
-		return NULL;
-
-	ent->loc.handle = handle;
-	ent->loc.length = length;
-	ent->nr_pages = 1;
-	ent->handles = NULL;
-	ent->nchunks = 0;
-	ent->pool = pool;
-	/* id == 0: not in the global shmem_comp_entries table; entry_free
-	 * skips the xa_erase for these.  The caller's block table names the
-	 * entry by POINTER, and GC finds it via the reverse index below. */
-	ent->id = 0;
-	atomic_set(&ent->loc.refs, 1);
-	atomic_set(&ent->slots, 1);
-
-	atomic_inc(&shmem_comp_ram_entries);
-	atomic_long_add(ksize(ent), &shmem_comp_ram_entry_bytes);
-
-	/* Reverse index: same as entry_alloc -- GC finds this entry via the
-	 * per-cell list, not the global table. */
 	shmem_comp_loc_link(pool, &ent->loc);
 
 	return ent;
@@ -2039,14 +1982,6 @@ int shmem_comp_loc_read(struct shmem_comp_pool *pool,
 	}
 
 	return ret;
-}
-
-int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
-			  bool *raw)
-{
-	if (!ent)
-		return -ENOENT;
-	return shmem_comp_loc_read(ent->pool, &ent->loc, dst, raw);
 }
 
 /* Debug hook: run one GC pass on every cell-backed pool. */

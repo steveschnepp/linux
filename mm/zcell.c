@@ -14,15 +14,21 @@
  *   - a PRIVATE shmem_comp_pool per device (created on disksize=)
  *   - shmem_comp_compress/decompress   (sync compression, HIGHMEM-safe)
  *   - shmem_comp_store/load            (handle-keyed storage, cell backend)
- *   - the entry table + reverse index  (so the engine's 1 Hz GC can
- *                                       relocate this device's blocks)
+ *   - the reverse index            (so the engine's 1 Hz GC can
+ *                                   relocate this device's blocks)
  *   - the shrinker / watermark / cell GC
- * The device adds only: a per-device block table (block_nr -> entry
- * pointer), the bio path, and the swap-slot-free hook.
+ * The device adds only: a per-device DENSE block table, the bio
+ * path, and the swap-slot-free hook.
  *
- * Block table stores the struct shmem_comp_entry * DIRECTLY (not an id).
- * That makes GC relocation transparent: the engine moves ent->handle in
- * place, and a reader holding the pointer always loads the fresh handle.
+ * The block table is a preallocated array of struct zcell_slot,
+ * indexed by block number: block_nr COMPUTES the slot address -- no
+ * xarray, no per-block allocation, no pointer chase, the metadata is
+ * one array index away.  Each slot embeds the engine's
+ * shmem_comp_loc_node (handle, length, refs, reverse-index node), so
+ * GC relocation stays transparent exactly as the old
+ * entry-pointer-in-table design made it: the engine moves
+ * node->handle in place and every reader of the slot loads the fresh
+ * location.
  *
  * Ratio 1: one logical block (PAGE_SIZE) = one compression unit.  mTHP
  * folio grouping (compress a whole swap folio as one unit) is a later
@@ -36,7 +42,6 @@
 #include <linux/bio.h>
 #include <linux/gfp.h>
 #include <linux/slab.h>
-#include <linux/xarray.h>
 #include <linux/mutex.h>
 #include <linux/atomic.h>
 #include <linux/string.h>
@@ -52,15 +57,42 @@
 /* bi_sector is 512-byte; a logical block is one PAGE_SIZE page. */
 #define ZCELL_BLOCK_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 
+/*
+ * One slot per logical block.  The loc node is embedded DIRECTLY (not
+ * pointed at): computing the slot from block_nr is cheaper than any RAM
+ * lookup of a pointer, and there is no per-block allocation to make or
+ * free.  @present is the reader-visible liveness flag; it and the
+ * install/drop transitions are guarded by @lock.  GC never takes @lock
+ * and never touches @present -- it relocates storage behind a live
+ * block by updating loc.handle in place.
+ *
+ * Generation protocol (why one refs counter is safe on a reused slot):
+ * a new generation is installed only when present == false, refs == 0
+ * and handle == 0 (EMPTY).  A dying generation keeps its handle in the
+ * slot until its last pin drops (the put frees the storage, then
+ * clears the handle), so pins always drain against their own
+ * generation's location -- no ABA, no refcount sharing across
+ * generations.
+ */
+struct zcell_slot {
+	struct shmem_comp_loc_node loc;
+	bool present;
+	spinlock_t lock;
+};
+
 struct zcell {
 	struct gendisk		*disk;
 	/* Private compression pool: cell backend + per-CPU contexts +
 	 * reverse index + shrinker + GC. All storage lifecycle lives
 	 * here, in the engine. */
 	struct shmem_comp_pool	*pool;
-	/* block table: block_nr -> struct shmem_comp_entry *.  Sparse;
-	 * unwritten blocks have no slot and read as zeros. */
-	struct xarray		table;
+	/*
+	 * Dense block table: index == block_nr.  Allocated at disksize=
+	 * (the block count is fixed then), freed at reset.  A block is
+	 * live iff slot->present; unwritten blocks read as zeros.
+	 */
+	struct zcell_slot	*table;
+	unsigned long		nr_blocks;
 	u64			logical_bytes;	/* bytes; 0 until disksize= */
 	bool			compressed;	/* false when algo == none */
 	char			algo[ZCELL_ALGO_MAX];
@@ -97,24 +129,34 @@ MODULE_PARM_DESC(gc_percent,
 static int zcell_major;
 static struct zcell **zcell_devs;
 
+/*
+ * The refs==0 teardown for device slots; also installed as the engine's
+ * node_put hook so the GC drain's pin drop lands here.  Releases the
+ * block's storage (reverse-index unlink + cell_free: the cell returns
+ * to the buddy inline when its last block goes) and marks the slot
+ * empty.  Exactly one thread runs the teardown: the dec_and_test
+ * winner.
+ */
+static void zcell_slot_put(void *priv, struct shmem_comp_loc_node *node)
+{
+	struct zcell *zc = priv;
+
+	if (!atomic_dec_and_test(&node->refs))
+		return;
+	shmem_comp_loc_dispose(zc->pool, node);
+	/*
+	 * present is already false (only the durable-ref drop, which must
+	 * precede the last pin, clears it); clearing the handle completes
+	 * the EMPTY state the install loop waits for.
+	 */
+	WRITE_ONCE(node->handle, 0);
+}
+
 /* ---- block helpers ------------------------------------------------ */
 
 static unsigned long zcell_block_of(sector_t sector)
 {
 	return sector >> ZCELL_BLOCK_SHIFT;
-}
-
-/* ---- entry helpers ------------------------------------------------ */
-
-/* The table owns the entry's durable (slot) reference.  Dropping it on
- * overwrite / discard / swap-free releases that ref; the entry (and its
- * cell region) frees when the last ref of any kind drops. */
-static void zcell_put_entry(void *entry)
-{
-	struct shmem_comp_entry *ent = entry;
-
-	if (ent)
-		shmem_comp_entry_release(ent);
 }
 
 /* ---- data path ---------------------------------------------------- */
@@ -126,49 +168,53 @@ static void zcell_put_entry(void *entry)
 static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 			    void *dst, unsigned int len_bytes)
 {
-	struct shmem_comp_entry *ent;
-	int ret;
+	struct zcell_slot *slot = &zc->table[block_nr];
+	struct shmem_comp_loc_node *node = &slot->loc;
 
-	/* Pin the entry: xa_load + entry_get inside one RCU section.
-	 * Retry while the entry is dying (an overwrite/swap-free raced
-	 * us); the racing path erases or replaces the slot, so this
-	 * converges to a live entry or to NULL (empty). */
 	for (;;) {
-		bool dying = false;
+		u64 h;
 
-		rcu_read_lock();
-		ent = xa_load(&zc->table, block_nr);
-		if (ent && !shmem_comp_entry_get(ent))
-			dying = true;
-		rcu_read_unlock();
-		if (!dying)
-			break;
+		if (!READ_ONCE(slot->present))
+			break;	/* empty or dying -> zeros */
+		h = READ_ONCE(node->handle);
+		if (h && atomic_inc_not_zero(&node->refs)) {
+			/*
+			 * Pin succeeded.  Re-check present: a drop or
+			 * overwrite that hid the block between our handle
+			 * read and the pin owns its teardown -- our pin
+			 * only delays it.  Retry and observe the outcome; a
+			 * pin can never be mistaken for another generation's
+			 * (install waits for refs == 0).
+			 */
+			if (READ_ONCE(slot->present))
+				goto pinned;
+			zcell_slot_put(zc, node);
+		}
 		cpu_relax();
 	}
 
-	if (!ent) {
-		memset(dst, 0, len_bytes);
-		return 0;
-	}
+	memset(dst, 0, len_bytes);
+	return 0;
 
+pinned:
 	/* Decompress directly from the cell under its rwsem -- no bounce
-	 * buffer (read_entry).  len_bytes == PAGE_SIZE is the bio-path
-	 * contract (a partial bvec is bounced by the caller). */
-	ret = shmem_comp_read_entry(ent, dst, NULL);
-	shmem_comp_entry_put(ent);
-	return ret;
+	 * buffer.  loc_read re-reads the handle under the cell lock and
+	 * retries if GC relocated the block; the pin keeps the storage
+	 * alive across that. */
+	return shmem_comp_loc_read(zc->pool, node, dst, NULL);
 }
 
 static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 			     const void *src)
 {
-	struct shmem_comp_entry *ent, *old;
+	struct zcell_slot *slot = &zc->table[block_nr];
+	struct shmem_comp_loc_node *node = &slot->loc;
 	unsigned int len_bytes;
 	u64 handle;
 
+	/* Compress + store first; the slot is untouched until the new
+	 * block is safely in a cell. */
 	if (zc->compressed) {
-		/* compress + store in one step; the compression output lives
-		 * in the pool's per-CPU buffer -- no per-block kmalloc. */
 		handle = shmem_comp_compress_store(zc->pool, src, PAGE_SIZE,
 						   &len_bytes);
 	} else {
@@ -178,43 +224,75 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 	if (!handle)
 		return -ENOMEM;
 
-	ent = shmem_comp_entry_alloc_local(zc->pool, handle, len_bytes);
-	if (!ent) {
-		shmem_comp_free(zc->pool, handle);
-		return -ENOMEM;
+	for (;;) {
+		spin_lock(&slot->lock);
+		if (!slot->present && !atomic_read(&node->refs) &&
+		    !READ_ONCE(node->handle))
+			break;	/* EMPTY: install below */
+		if (slot->present) {
+			/*
+			 * Hide the old generation; we now own its durable
+			 * ref.  The flag flip under the lock elects exactly
+			 * one dropper: a concurrent swap_slot_free_notify
+			 * sees present == false and returns.
+			 */
+			slot->present = false;
+			spin_unlock(&slot->lock);
+			zcell_slot_put(zc, node);
+		} else {
+			/* DYING (pins draining) or mid-dispose. */
+			spin_unlock(&slot->lock);
+		}
+		/*
+		 * Wait out the old generation: the last put frees its
+		 * storage and clears the handle.  On the swap workload
+		 * this wait never fires (slots are written once; the
+		 * swap layer serialises read vs write per slot).
+		 */
+		while (atomic_read(&node->refs) ||
+		       READ_ONCE(node->handle))
+			cpu_relax();
 	}
 
-	/* Atomic replace-and-return-old (no xa_exchange).  The new
-	 * entry's slot ref is now owned by the table; the old entry's
-	 * slot ref is dropped here. */
-	old = xa_store(&zc->table, block_nr, ent, GFP_NOIO);
-	if (IS_ERR(old)) {
-		/* never installed: release the slot ref we hold, which
-		 * frees the entry and its storage. */
-		shmem_comp_entry_release(ent);
-		return PTR_ERR(old);
-	}
-	if (old)
-		zcell_put_entry(old);
+	node->length = len_bytes;
+	atomic_set(&node->refs, 1);	/* the durable ref */
+	WRITE_ONCE(node->handle, handle);
+	shmem_comp_loc_link(zc->pool, node);
+	slot->present = true;
+	spin_unlock(&slot->lock);
 
 	atomic64_add(PAGE_SIZE, &zc->orig_data_bytes);
 	atomic64_add(len_bytes, &zc->compr_data_bytes);
 	return 0;
 }
 
-/* Drop one logical block (ratio 1: unit == block).  Erases the slot and
- * releases the table's durable ref; the cell returns to the buddy inline
+/* Drop one logical block (ratio 1: unit == block).  Clears the slot and
+ * drops the table's durable ref; the cell returns to the buddy inline
  * when the last object goes. */
 static void zcell_drop_block(struct zcell *zc, unsigned long block_nr,
 			     bool count)
 {
-	void *old = xa_erase(&zc->table, block_nr);
+	struct zcell_slot *slot = &zc->table[block_nr];
 
-	if (old) {
-		zcell_put_entry(old);
-		if (count)
-			atomic64_inc(&zc->discarded_blocks);
+	spin_lock(&slot->lock);
+	if (!slot->present) {
+		spin_unlock(&slot->lock);
+		return;
 	}
+	slot->present = false;
+	spin_unlock(&slot->lock);
+
+	if (count)
+		atomic64_inc(&zc->discarded_blocks);
+
+	/*
+	 * Drop the durable ref: the common case (no pins) frees the
+	 * storage synchronously HERE -- the cell goes back to the buddy
+	 * before the freeing reclaim pass completes, which is the
+	 * synchronous reclamation zram's architecture lacks.  With pins
+	 * outstanding, the last put frees instead.
+	 */
+	zcell_slot_put(zc, &slot->loc);
 }
 
 /* ---- bio path ----------------------------------------------------- */
@@ -368,6 +446,8 @@ static ssize_t disksize_store(struct device *dev,
 	struct gendisk *disk = dev_to_disk(dev);
 	struct zcell *zc = disk->private_data;
 	struct shmem_comp_pool *pool;
+	struct zcell_slot *table;
+	unsigned long nr_blocks, i;
 	u64 size_bytes;
 	u64 cell_bytes;
 	u64 nr_cells;
@@ -405,7 +485,26 @@ static ssize_t disksize_store(struct device *dev,
 		return PTR_ERR(pool);
 	}
 
+	/* Dense block table: one slot per logical block, indexed by
+	 * block_nr.  Allocated here (the block count is fixed now),
+	 * freed by reset. */
+	nr_blocks = size_bytes >> PAGE_SHIFT;
+	table = kvcalloc(nr_blocks, sizeof(*table), GFP_KERNEL);
+	if (!table) {
+		shmem_comp_pool_put(pool);
+		mutex_unlock(&zc->io_lock);
+		return -ENOMEM;
+	}
+	for (i = 0; i < nr_blocks; i++)
+		spin_lock_init(&table[i].lock);
+
+	/* The engine's GC drain drops its pins for this pool's bare slot
+	 * nodes through our teardown (not the entry free path). */
+	shmem_comp_pool_set_node_put(pool, zcell_slot_put, zc);
+
 	zc->pool = pool;
+	zc->table = table;
+	zc->nr_blocks = nr_blocks;
 	zc->logical_bytes = size_bytes;
 	set_capacity(zc->disk, size_bytes >> SECTOR_SHIFT);
 	pr_info("%s: disksize=%llu algo=%s cell_order=%d\n",
@@ -495,33 +594,57 @@ static ssize_t io_stat_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(io_stat);
 
+/*
+ * Quiesce and empty a device: hide + release every block, wait out
+ * outstanding pins, drop the pool and the table.  Caller holds io_lock
+ * and must have frozen the queue first (no bios in flight; only
+ * transient GC pins can remain).
+ */
+static void zcell_reset_locked(struct zcell *zc)
+{
+	unsigned long block_nr;
+
+	set_capacity(zc->disk, 0);
+	zc->logical_bytes = 0;
+
+	for (block_nr = 0; block_nr < zc->nr_blocks; block_nr++)
+		zcell_drop_block(zc, block_nr, false);
+
+	/*
+	 * Wait for outstanding pins (finished readers -- the queue is
+	 * frozen -- and transient GC pins) so no teardown can run after
+	 * the pool is dropped: the last put dereferences zc->pool.
+	 */
+	for (block_nr = 0; block_nr < zc->nr_blocks; block_nr++) {
+		struct zcell_slot *slot = &zc->table[block_nr];
+
+		while (atomic_read(&slot->loc.refs) ||
+		       READ_ONCE(slot->loc.handle))
+			cpu_relax();
+	}
+
+	if (zc->pool) {
+		shmem_comp_pool_put(zc->pool);
+		zc->pool = NULL;
+	}
+	kvfree(zc->table);
+	zc->table = NULL;
+	zc->nr_blocks = 0;
+	atomic64_set(&zc->orig_data_bytes, 0);
+	atomic64_set(&zc->compr_data_bytes, 0);
+}
+
 static ssize_t reset_store(struct device *dev,
 			   struct device_attribute *attr,
 			   const char *buf, size_t len)
 {
 	struct gendisk *disk = dev_to_disk(dev);
 	struct zcell *zc = disk->private_data;
-	unsigned long block_nr;
 	unsigned int memflags;
-	void *entry;
 
 	mutex_lock(&zc->io_lock);
 	memflags = blk_mq_freeze_queue(zc->disk->queue);
-	set_capacity(zc->disk, 0);
-	zc->logical_bytes = 0;
-	while ((entry = xa_find(&zc->table, &block_nr, ULONG_MAX,
-				XA_PRESENT))) {
-		void *old = xa_erase(&zc->table, block_nr);
-
-		if (old)
-			zcell_put_entry(old);
-	}
-	if (zc->pool) {
-		shmem_comp_pool_put(zc->pool);
-		zc->pool = NULL;
-	}
-	atomic64_set(&zc->orig_data_bytes, 0);
-	atomic64_set(&zc->compr_data_bytes, 0);
+	zcell_reset_locked(zc);
 	blk_mq_unfreeze_queue(zc->disk->queue, memflags);
 	mutex_unlock(&zc->io_lock);
 	return len;
@@ -569,7 +692,6 @@ static int zcell_add(int id)
 	if (!zc)
 		return -ENOMEM;
 
-	xa_init(&zc->table);
 	mutex_init(&zc->io_lock);
 	strscpy(zc->algo, "lz4", sizeof(zc->algo));
 	zc->compressed = true;
@@ -608,24 +730,10 @@ out_free_dev:
 static void zcell_remove(struct zcell *zc)
 {
 	unsigned int memflags;
-	unsigned long block_nr;
-	void *entry;
 
 	mutex_lock(&zc->io_lock);
 	memflags = blk_mq_freeze_queue(zc->disk->queue);
-	set_capacity(zc->disk, 0);
-	zc->logical_bytes = 0;
-	while ((entry = xa_find(&zc->table, &block_nr, ULONG_MAX,
-				XA_PRESENT))) {
-		void *old = xa_erase(&zc->table, block_nr);
-
-		if (old)
-			zcell_put_entry(old);
-	}
-	if (zc->pool) {
-		shmem_comp_pool_put(zc->pool);
-		zc->pool = NULL;
-	}
+	zcell_reset_locked(zc);
 	blk_mq_unfreeze_queue(zc->disk->queue, memflags);
 	mutex_unlock(&zc->io_lock);
 
