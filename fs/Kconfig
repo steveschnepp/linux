@@ -242,6 +242,24 @@ config TMPFS_COMPRESSOR_DEFAULT
 	  This can be changed at runtime via /sys/fs/tmpfs/compressor or
 	  per-mount via the compress= mount option.
 
+config ZCELL
+	bool "Cell-backed compressed RAM block device"
+	depends on BLOCK && TMPFS_COMPRESSION
+	help
+	  A zram-style compressed-RAM block device whose storage backend is
+	  the tmpfs compression engine on the cell allocator (not zsmalloc).
+	  Intended for use as swap on RAM-constrained systems: the cell
+	  allocator's zero per-object metadata and synchronous whole-cell
+	  return to the buddy hold more compressed data per RAM byte than
+	  zram's zsmalloc pools.
+
+	  The device is a thin frontend; compression, storage, the cell
+	  garbage collector, the shrinker and the watermark are all reused
+	  from the shmem_comp engine.  Create /dev/zcellN, then mkswap and
+	  swapon it like zram.
+
+	  If unsure, say N.
+
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT
