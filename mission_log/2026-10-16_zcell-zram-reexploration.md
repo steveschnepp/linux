@@ -453,3 +453,85 @@ orders that make folios >= a cell.
 4. Measure vs zram with mTHP enabled on the fleet-shaped workload; the
    win is per-folio compression ratio + cells' zero-metadata storage,
    the cost is mTHP reliability on fragmented 64M.
+
+---
+
+## Session 69: The zcell Device, Ratio-1 (2026-10-16)
+
+(Session 69; same file as the design sessions 67-68.  Build phase.)
+
+### What We Did
+
+Confirmed the differentiator, then built the ratio-1 device in two
+bisectable commits.
+
+**1. Confirmed zram is per-page (the differentiator is real).**
+`zram_bio_write()` caps each bvec at PAGE_SIZE
+(`bv.bv_len = min_t(u32, bv.bv_len, PAGE_SIZE - offset)`) and calls
+`zram_write_page(zram, page, index)` -- one page compressed
+independently into its own zsmalloc object.  Even when a large mTHP
+folio is swapped out, zram splits it into per-page compressions and
+gets ZERO cross-page redundancy.  A zcell device that compresses the
+whole folio as one unit (the merge path) achieves a ratio zram
+structurally cannot.  mTHP unlocks that only for us.
+
+**2. Commit `d1c18dc255cc` -- export `shmem_comp_entry_get()`.**
+The post-pointer-encoding entry API lost the generic id-based
+`entry_get`; a device frontend needs to pin an entry (from its own
+block table) for a race-free read.  Factored the RCU + inc_not_zero pin
+out of `shmem_comp_entries_get()` into an exported
+`shmem_comp_entry_get(ent)`.  i386 gate 0/0.
+
+**3. Commit `553231150228` -- the zcell device (ratio-1).**
+`mm/zcell.c` + `Kconfig(ZCELL)` + `Makefile`.  A thin gendisk over a
+private `shmem_comp_pool`:
+- block table `block_nr -> struct shmem_comp_entry *` (the POINTER, not
+  an id).  Makes GC relocation transparent: the engine moves
+  `ent->handle` in place, a reader holding the pointer always loads the
+  fresh handle, no table update on GC.
+- write: `shmem_comp_compress` -> `shmem_comp_store` ->
+  `shmem_comp_entry_alloc` -> `xa_store(pointer)`; overwrite releases
+  the old entry.
+- read: `xa_load` + `entry_get` (RCU) -> `load_entry` (cell-specific,
+  has the GC-retry) -> decompress if `ent->length < PAGE_SIZE`.
+- `swap_slot_free_notify` -> `xa_erase` + `entry_release` -> the cell
+  returns to the buddy inline (synchronous reclaim zram lacks).
+- sysfs: disksize / comp_algorithm / mm_stat (via
+  `cell_get_total_pages`) / io_stat / reset.
+i386: `zcell.o` 0/0; all 13 `shmem_comp_`/`cell_` engine symbols resolve
+against `shmem_compress.o`/`cell_store.o` (verified with nm).
+
+### What We Learned (session 69)
+
+### Technical
+- **The current entry API is cell-backend-specific on the read side**:
+  `shmem_comp_load_entry()` unpacks `pack_loc` and uses `cp->cells`, so
+  it only works for a cell pool (fine -- zcell is cell-only by design).
+  The device reads `ent->length` (immutable post-alloc) to tell raw
+  (`== PAGE_SIZE`) from compressed (`< PAGE_SIZE`).
+- **Storing the entry POINTER (not an id) in the block table makes GC
+  transparent** -- the one design choice that lets the device reuse the
+  engine's cell GC without a table-relocation hook.
+- **A block device needs `<linux/blk-mq.h>`** for
+  `blk_mq_freeze_queue`/`unfreeze` (reset/remove) -- implicit
+  declaration otherwise.
+- **The full-vmlinux build is blocked by the known VT/ucs_width_table.h
+  tree-tip bug** (session 47), unrelated to zcell; the arch gate works
+  around it with `--disable CONFIG_VT`.  Object compile + nm symbol
+  resolution stand in for the link check until a bootable build.
+
+### What We Decided (session 69)
+- **Ratio-1 first** (the known-baseline config: old cellzram's default
+  minus staging), to establish a correct, testable device on the modern
+  engine before layering the novel mTHP grouping.
+- **Cell-only backend** (load_entry is cell-specific; zsmalloc users
+  have zram).
+
+### Next Steps (session 69)
+1. Boot-test: build a bootable x86_64 kernel with ZCELL=y (VT off, via
+   the rig builder), mkswap/swapon /dev/zcell0, swap-pressure
+   correctness + mm_stat/io_stat in the rig guest.
+2. mTHP config surface (which orders yield large anon folios on 64M +
+   the 64K-page aarch64 kernel; CONFIG_THP_SWAP).
+3. Commit 3: mTHP folio grouping (the differentiator).
+4. Measure cell-swap vs zram on the fleet workload.
