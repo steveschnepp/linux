@@ -871,3 +871,295 @@ Held per user: no next-steps planned this session.  Standing state:
 zcell correct, ~0.85x zram swap-in / 1.14x swap-out / RAM-tie on
 default config; entry-elimination is the identified (unimplemented)
 path toward parity.
+
+---
+
+## Session 74: The Indirection Question -- loc-Node Extraction (2026-10-17)
+
+(Session 74; same file.  Starts the session-73 held lever:
+entry-elimination / "indirection suppression", driven by the user's
+observation.)
+
+### What We Did
+
+**1. Answered "why does the entry exist" field by field, in code.**
+The zcell read chain is block_nr -> xa_load -> entry * -> ent->handle
+(pack_loc: cellid+offset) -> cell data: a ptr-to-ptr, exactly as the
+user said.  The entry exists for four reasons, each traced to code:
+(a) GC relocation transparency -- the drain updates ent->handle in
+place, so a table holding the POINTER never needs a fix-up (the
+session-69 design comment); (b) the refs/slots lifetime pin across
+decompress vs swap_slot_free_notify; (c) fields the 64-bit handle
+cannot carry (length -- the raw-vs-compressed discriminator, pool,
+the reverse-index node); (d) tmpfs's one-to-many sharing (one entry
+backs N entries[] slots for a merge group).  Only (a), (b), (c) are
+needed by the device; (d) is pure overhead it pays for nothing.
+
+**2. zsmalloc precedent read (the decisive comparison).**  zram's
+dense table stores `struct zram_table_entry { unsigned long handle;
+... }` inline per disk page -- but its handle is a STABLE ID, not a
+location: zs_malloc's handle goes through record_obj(handle, obj),
+and migrate_zspage() re-records the SAME handle to the new location
+(zsmalloc.c:1677-1705, obj_malloc()'s `link->handle = handle |
+OBJ_ALLOCATED_TAG`).  So zsmalloc maintains a central
+handle->location mapping and updates IT on compaction; owners are
+never touched.  That is the ptr-to-ptr the user distrusts -- hidden
+inside zsmalloc, paid as handle-table pages per object.  Our
+pack_loc encodes the location directly (one hop, zero central
+table), which is why OUR relocation must fix up owners.  Design
+conclusion: keep pack_loc (the direct encoding is the cheap part);
+suppress the OWNER NODE's separate allocation instead.
+
+**3. The dense-slot protocol designed on paper before coding.**  The
+hard part is that a table slot is IMMORTAL and reused across
+generations, while an entry is per-generation -- so the refs==0
+teardown, which reads node->handle to free the right location, breaks
+under slot reuse (a new generation could install its handle under a
+dying generation's pins).  Resolved with a generation protocol:
+- slot state = {present (under per-slot spinlock), refs, handle}.
+  present==false && refs>0 = DYING (pins draining, last put frees via
+  the preserved handle); present==false && refs==0 && handle!=0 =
+  mid-dispose; all clear = EMPTY.
+- Install waits for EMPTY, so a dying generation's pins always drain
+  against their own handle.  This is what makes refcount sharing
+  across generations safe -- no ABA.
+- Drop (swap free / discard / overwrite-hide) clears present under
+  the slot lock, then drops the durable ref: the common case (no
+  pins) frees synchronously inline (cells -> buddy, the headline
+  property); the pinned case hands off to the last put.
+- GC needs NO slot lock: it pins (inc_not_zero), detaches,
+  relocates, WRITE_ONCEs the handle, relinks, puts.  present is
+  never touched by GC, so no resurrection is possible (the old
+  ptr-to-ptr design needed no such argument; the dense design does,
+  and it holds).
+- Reader: lockless pin (present check, inc_not_zero, present
+  recheck); a spurious pin is put and retried.  No RCU: slot
+  addresses are stable (preallocated), and the pin keeps storage
+  alive; relocation is handled by loc_read's existing
+  re-read-under-cell-rwsem retry.
+- Deadlock audit: writers wait for pins WITHOUT holding the slot
+  lock (spinlock across a sleeping decompress would also break);
+  readers take no locks before the pin; GC holds only the victim
+  rwsem + index_lock and never takes a slot lock.  No cycles.
+
+**4. Commit `f6cc4dd096c1` -- the engine extraction (this session's
+landing).**  `struct shmem_comp_loc_node { u64 handle; unsigned int
+length; atomic_t refs; struct list_head cell_node; }` extracted and
+embedded at the entry's head; ~50 field accesses renamed to
+`ent->loc.*`; the GC drain walks bare nodes and drops its pin via
+`shmem_comp_loc_pin_put()` (frontend hook `pool->node_put` when set,
+entry put otherwise); new exported `shmem_comp_loc_link/dispose/
+read` + `shmem_comp_pool_set_node_put()`.  entry_alloc/alloc_local,
+entry_free, load_entry/read_entry became thin wrappers -- pure
+refactor, no behavior change.
+
+**5. Gate-script bug found (pre-existing, fixed).**  The i386 gate
+suddenly lost CONFIG_TMPFS_COMPRESSION: ZSMALLOC is PROMPTLESS at
+tree tip -- scripts/config --enable writes it but olddefconfig drops
+it, taking TMPFS_COMPRESSION with it.  build_arch_gate.sh already
+carried the lesson (ZRAM selects ZSMALLOC); build_i386.sh predated
+it.  Fixed + added mm/zcell.o to the gated object list (harness
+commit 9ef1cef).  Symptom recognition was one grep: the gate's
+"did the feature survive" line showed only CRYPTO_LZ4 left.
+
+### What We Learned (session 74)
+
+### Technical
+
+- **zsmalloc handles are stable ids through a central mapping, not
+  locations.**  migrate_zspage re-records the same handle
+  (obj_malloc's record_obj).  zram's "inline handle in a dense
+  table" therefore hides a ptr-to-ptr inside zsmalloc (handle-table
+  pages per object).  pack_loc's direct location encoding is
+  genuinely one hop; its cost is owner-fixup on relocate, which the
+  node-in-table design absorbs.
+- **An immortal reused table slot cannot share one refcount across
+  generations.**  Either install waits for the old generation to
+  fully drain (chosen: swap writes a slot once, so the wait is
+  free), or each generation needs its own object (the entry again).
+- **GC must never take a per-slot lock** -- the reader path is
+  slot-lock -> cell rwsem, so a GC path of victim-rwsem -> slot-lock
+  would be an AB-BA deadlock.  The refs-pin protocol keeps GC
+  lock-free w.r.t. slots; `present` being GC-invisible is what kills
+  the resurrection hazard the naive clear-handle drop would have.
+
+### Process
+
+- **Design the concurrency protocol on paper BEFORE the code** --
+  the generation states (EMPTY/DYING/INSTALLING), the exactly-once
+  durable-ref drop, and the lock-order audit all fit in the head
+  once written down; the code then matched it on the first gate run.
+- **Whitespaces in kernel oldText anchors: `cat -A` is the ground
+  truth.**  Three edit retries were lost to tabs-vs-spaces in comment
+  bodies (including a 4-tab-vs-5-tab in a continuation line); the
+  fix was to verify the exact block with `sed -n | cat -A` and splice
+  via python when the anchor kept drifting.
+- **A failed compile gate can be a config failure, not a code
+  failure** -- check the "feature survived" grep before reading
+  compiler errors.
+
+### What We Decided (session 74)
+
+- **Dense per-block slot table for zcell** (the user's call, after
+  "computing a ptr from index is way cheaper than a ram lookup"):
+  block_nr indexes a preallocated `struct zcell_slot` embedding the
+  loc node; no xarray, no per-block kmalloc, no entry pointer.
+  pack_loc stays as the (single, irreducible) data indirection.
+- **Engine extraction committed first** (pure refactor, gate-green)
+  so the device rewrite is a separate bisectable step.
+
+### Files Changed (session 74)
+
+| File | Purpose |
+|------|---------|
+| `include/linux/shmem_compress.h` | +`struct shmem_comp_loc_node`, entry embeds it, +loc API decls |
+| `mm/shmem_compress.c` | field renames, loc_link/dispose/pin_put, node-based drain + loc_load/loc_read cores |
+| `~/tmpfs-compress-test/scripts/build_i386.sh` | ZRAM-not-ZSMALLOC fix, +zcell.o (harness 9ef1cef) |
+
+(Kernel commit `f6cc4dd096c1`; i386 gate 0/0 on all 5 objects.)
+
+### Next Steps (session 74)
+
+1. Commit 2: the zcell dense slot table -- slot struct, install/
+   drop/read/reset protocols per the design above, drop
+   entry_alloc_local usage (then remove it if unused).
+2. i386 gate + boot test (round-trip + swap integrity) + swapbench
+   A/B vs the session-73 baseline (0.85x in / 1.14x out).
+3. Log session 75 with the numbers.
+
+---
+
+## Session 75: Dense Slots Landed, Correctness Pass Launched, the Config Slash (2026-10-17)
+
+(Intermediate append -- the full-matrix correctness pass is still
+running; results below are build-phase only.)
+
+### What We Did
+
+**1. Commit `0fe6a709c80b` -- the dense slot table (the session-74
+design, implemented).**  `struct zcell_slot { loc; present; lock }`
+in a kvcalloc'd array indexed by block_nr, allocated at disksize=.
+The generation protocol exactly as designed: install waits for EMPTY
+(present==false && refs==0 && handle==0); drop hides under the slot
+lock then drops the durable ref (no-pin case frees synchronously --
+cells to buddy inline); the last put disposes and clears the handle;
+GC takes no slot lock and never touches present (no resurrection);
+reader pins lockless (present, inc_not_zero, present-recheck,
+spurious pin put+retry); reset gained a pin-drain wait before
+pool_put, closing the old entry-based reset's late-entry_put window.
+Dead API removed with it (zcell was the only consumer):
+`shmem_comp_entry_alloc_local()`, `shmem_comp_entry_get()`,
+`shmem_comp_read_entry()`; the doc moved to `shmem_comp_loc_read()`.
+i386 gate 0/0 on all five objects.
+
+**2. Full-matrix correctness pass written and launched**
+(harness `1e1384e`, `scripts/dense_correctness_pass.sh`): pristine
+worktree at HEAD -> all 8 arch guests+initramfs rebuilt -> 10 sweep
+kernels (ZCELL=y) -> arch battery on 8 subs -> x86_64 KASAN suite
+(default + zcell boot + trunc-resurrect + entry-race) -> the five
+ztmpfs config sweeps.  Sequential, per-step logs, summary table.
+Guests/initramfs all green; i386 + i386-pae kernels green.
+
+**3. arm builds died -- diagnosed as tree-tip defconfig breakage,
+not our code.**  Both failed at MODPOST (after vmlinux linked):
+arm32/multi_v7 = cros_ec modules with unresolved symbols,
+arm64 = ath11k_pci (Qualcomm WiFi) same class.  The mm/ code built
+fine on both.  User interrupted the pass mid-arm64 ("super long")
+and called the config slash.
+
+**4. The config slash (harness `a3d6b1c`).**  The sweep kernels are
+QEMU -kernel + initrd + serial and NOTHING else, so the builder's
+fixed block now disables everything the runners cannot reach --
+uniformly on every arch:
+- CONFIG_MODULES=n -- kills the modpost failure class AND ~1537
+  arm64 / 958 arm32 module builds (the "super long" was mostly this)
+- NET=n (no net devices; cascades wifi/bt/netfilter), SOUND, DRM/FB/
+  LOGO, MEDIA_SUPPORT, USB_SUPPORT, SCSI/ATA/NVMe/MD/dm, MMC, MTD,
+  IIO/HWMON/THERMAL/HW-watchdog, loop/ramdisk, every filesystem
+  except tmpfs (user: "add several fs drivers later if needed"), input
+  fat, EFI+EFI_STUB (all archs now, was x86-only), IOMMUs; ACPI off
+  on DT-booted archs (arm64/riscv/mips), kept on x86 pc.
+- Feature set UNIFORM for every arch: ZRAM + ZCELL + SWAP +
+  ADVISE_SYSCALLS + TMPFS_COMPRESSION in the fixed block -- every
+  arch can run every zram/ztmpfs/zcell test (the user's consistency
+  requirement).  New hard gates both directions: the quartet must be
+  =y; MODULES/NET must not resurface (the slash cannot silently rot
+  against a defconfig change).
+- Caller flags still apply AFTER the slash -> any disabled driver/fs
+  can be re-enabled per experiment without editing the block.
+
+**5. Slash validated on the two broken/slow archs** (clean O= dirs):
+arm32 rc=0 in 4m49s (was 12+ min, dead); arm64-4k rc=0 in 8m7s (was
+22+ min, dead).  i386 probe: 1456 -> 1040 =y (-29%), 14 -> 0 =m.
+
+### What We Learned (session 75)
+
+### Technical
+
+- **A modpost failure after a successful vmlinux link is a config
+  smell, not a code smell** -- at tree tip, defconfig-selected module
+  sets break against each other (cros_ec, ath11k).  For a kernel
+  that can never load a module, CONFIG_MODULES=n is both the fix and
+  a large build-time cut.
+- **MODULES=n is the biggest single lever in the whole slash**: the
+  arm64 build's module forest (1537 =m) dwarfed everything else and
+  was the "super long" build the user killed.
+- **The dense-slot protocol survived implementation exactly as
+  designed on paper** -- no redesign was needed during coding; the
+  gate passed first try after the two mechanical fixes (node-typed
+  drain field accesses, and a whitespace-mangled anchor).
+
+### Process
+
+- **Correctness before perf, explicitly** (user: "performance
+  without correctness is futile"): the swapbench A/B is queued
+  BEHIND the matrix pass, not run alongside it.  The session-71
+  entry-table kernel artifact (build/arch/i386zcell/kernel) is
+  preserved untouched as the future A/B control.
+- **Diagnose the failure class before slashing** -- the slash was
+  justified by reading the modpost errors first; a blind slash would
+  have masked whether OUR build was broken on arm.
+- The pass orchestrator's design (per-step logs, failures don't
+  abort the rest, summary table) paid off immediately: three
+  independent failures were classifiable from two log files without
+  re-running anything.
+
+### What We Decided (session 75)
+
+- **QEMU-only slash, brutal but uniform** (user): the matrix kernels
+  carry zero hardware surface beyond the QEMU machines; SBC/real
+  kernels get their own configs later; disabled things return per
+  need via caller flags.
+- **Uniform zram/ztmpfs/zcell feature set across all archs**,
+  enforced by gates.
+- **A/B deferred until the matrix is green.**
+
+### Files Changed (session 75)
+
+| File | Purpose |
+|------|---------|
+| `mm/zcell.c` (linux, `0fe6a709c80b`) | dense slot table + generation protocol; xa/entry/RCU path removed |
+| `mm/shmem_compress.c`, `include/linux/shmem_compress.h` | dead entry-front-end API removed; doc moved to loc_read |
+| rig `scripts/dense_correctness_pass.sh` (`1e1384e`) | the full-matrix pass orchestrator |
+| rig `scripts/build_arch_kernel.sh` (`a3d6b1c`) | the slash + uniform features + gates |
+
+### Test Results / Benchmarks (session 75)
+
+- i386 compile gate: 0 errors 0 warnings (5 objects) at `0fe6a709c80b`.
+- Correctness pass so far: guests+initramfs 8/8 PASS; kernels i386,
+  i386-pae PASS; arm32/arm64-4k PASS post-slash (4m49s / 8m7s);
+  battery/suite/sweeps NOT YET RUN.
+- Config shrink (i386 probe): 1456 -> 1040 =y; modules 0.
+- No perf numbers this session; swapbench A/B pending.
+
+### Next Steps (session 75)
+
+1. Relaunch the full pass (kernels phase onward) with the slashed
+   builder: remaining kernels = arm64-16k/64k, riscv64, mips32-be,
+   x86_64 plain + KASAN; then the arch battery, the x86_64 KASAN
+   suite (incl. test.zcell boot on the dense device), the config
+   sweeps.
+2. Triage any arch failures from the serial signatures in
+   out/dense_pass/.
+3. Only then: the swapbench A/B vs the preserved entry-table kernel
+   (dense vs entry, zram as in-kernel control).
