@@ -203,9 +203,10 @@ struct shmem_comp_pool {
 	 * directory slot, so GC drains a victim by walking its own cells
 	 * instead of the whole entry table.  cell_index is an array of
 	 * cp->nslots list heads, allocated only when use_cells.  Every
-	 * live cell-backed entry sits on cell_index[cellid] (from its
+	 * live cell-backed block node (an entry's embedded loc node, or
+	 * a device table slot's) sits on cell_index[cellid] (from its
 	 * handle's cellid) for its whole life -- alloc links, free
-	 * unlinks, GC relocate moves.  A live entry missing from its
+	 * unlinks, GC relocate moves.  A live node missing from its
 	 * cell's list is invisible to GC and leaks the cell, so the three
 	 * mutations are exhaustive by construction.
 	 *
@@ -217,6 +218,16 @@ struct shmem_comp_pool {
 	 */
 	struct list_head *cell_index;
 	spinlock_t index_lock;
+	/*
+	 * Frontend teardown hook for bare loc nodes (block-device table
+	 * slots): set via shmem_comp_pool_set_node_put() when the
+	 * reverse index holds frontend-owned loc nodes instead of engine
+	 * entries; the GC drain drops its pin through this, so the
+	 * refs==0 teardown runs frontend code.  NULL for entry pools
+	 * (the drain uses shmem_comp_entry_put()).
+	 */
+	void (*node_put)(void *priv, struct shmem_comp_loc_node *node);
+	void *node_priv;
 	struct list_head list;			/* global pools list */
 };
 
@@ -1158,6 +1169,110 @@ MODULE_PARM_DESC(gc_use_index,
  * before put_super() destroys the pool, and reader pins cannot
  * outlive their inode.
  */
+/*
+ * shmem_comp_loc_link - put a loc node on its cell's reverse-index list
+ * @pool: pool that owns the node's storage
+ * @node: node whose @handle already names a cell (storage allocated)
+ *
+ * Called once per block generation, after the storage exists and
+ * before the frontend presents the block to readers.  From here until
+ * dispose, GC can find and relocate the block.  The handle's cellid
+ * is the list index; it is stable until GC relocates (gc_lock
+ * serialises that against this link).
+ */
+void shmem_comp_loc_link(struct shmem_comp_pool *pool,
+			 struct shmem_comp_loc_node *node)
+{
+	INIT_LIST_HEAD(&node->cell_node);
+	if (pool->use_cells) {
+		u32 cellid, offset;
+
+		shmem_comp_unpack_loc(node->handle, &cellid, &offset);
+		spin_lock(&pool->index_lock);
+		list_add_tail(&node->cell_node, &pool->cell_index[cellid]);
+		spin_unlock(&pool->index_lock);
+	}
+}
+
+/*
+ * shmem_comp_loc_dispose - unlink a dead node and release its storage
+ * @pool: pool that owns the storage
+ * @node: node at refs==0; the caller owns the last reference
+ *
+ * Two releases, unlink first:
+ *   - Reverse index: a stale node left on cell_index[cellid] would
+ *     point into a cell that cell_free() may return to the buddy
+ *     synchronously and that a later alloc may reuse for different
+ *     data; the next GC walk would touch freed memory.  Only the
+ *     refs==0 thread runs here (dec_and_test), so no other thread
+ *     can be unlinking this node concurrently.  A node GC currently
+ *     holds detached (list_del_init) is a self-linked singleton;
+ *     list_del on it is harmless (the frontend re-links via
+ *     loc_link on the node's next generation).
+ *   - Storage: cell storage needs the block length to decrement
+ *     live_bytes, which is why cell_free() is called directly rather
+ *     than through shmem_comp_free().  The zsmalloc free path does
+ *     not need the length -- zs_free() recovers it from the size
+ *     class encoded in the handle.
+ *
+ * Does NOT touch node->handle: an entry is dying and gets freed
+ * whole; a table slot clears its handle itself (marking itself
+ * empty).
+ */
+void shmem_comp_loc_dispose(struct shmem_comp_pool *pool,
+			    struct shmem_comp_loc_node *node)
+{
+	if (pool->use_cells) {
+		spin_lock(&pool->index_lock);
+		list_del(&node->cell_node);
+		spin_unlock(&pool->index_lock);
+	}
+
+	if (node->handle) {
+		if (pool->use_cells) {
+			u32 cellid;
+			u32 offset;
+
+			shmem_comp_unpack_loc(node->handle,
+					      &cellid, &offset);
+			cell_free(pool->cells, cellid, offset,
+				  node->length);
+		} else {
+			shmem_comp_free(pool, node->handle);
+		}
+	}
+}
+
+/*
+ * shmem_comp_loc_pin_put - drop a pin taken on a loc node
+ * @pool: pool the node belongs to
+ * @node: node the caller pinned (atomic_inc_not_zero on loc.refs)
+ *
+ * The refs==0 teardown dispatches to the node's owner: a frontend
+ * hook when set (bare table-slot nodes), the entry free path
+ * otherwise (an entry pool's reverse index holds entries' embedded
+ * loc nodes).
+ */
+void shmem_comp_loc_pin_put(struct shmem_comp_pool *pool,
+			    struct shmem_comp_loc_node *node)
+{
+	if (pool->node_put) {
+		pool->node_put(pool->node_priv, node);
+		return;
+	}
+	shmem_comp_entry_put(container_of(node, struct shmem_comp_entry,
+					  loc));
+}
+
+void shmem_comp_pool_set_node_put(struct shmem_comp_pool *pool,
+				  void (*fn)(void *,
+					     struct shmem_comp_loc_node *),
+				  void *priv)
+{
+	pool->node_put = fn;
+	pool->node_priv = priv;
+}
+
 static void shmem_comp_entry_free(struct shmem_comp_entry *ent)
 {
 	/* xa_erase() takes the xarray lock internally.  The guard is the
@@ -1177,7 +1292,7 @@ static void shmem_comp_entry_free(struct shmem_comp_entry *ent)
 
 	/* Teardown runs only from the refs==0 path (dec_and_test); a
 	 * live entry here means double teardown. Debug kernels panic. */
-	VM_BUG_ON(atomic_read(&ent->refs) != 0);
+	VM_BUG_ON(atomic_read(&ent->loc.refs) != 0);
 
 	/* Un-account live RAM before freeing (ksize needs a live
 	 * object; do it before kfree/kfree_rcu). */
@@ -1188,42 +1303,12 @@ static void shmem_comp_entry_free(struct shmem_comp_entry *ent)
 				 &shmem_comp_ram_merged_bytes);
 
 	/*
-	 * Reverse index: unlink from the owning cell's list BEFORE
-	 * releasing storage.  cell_free() may return the cell to the
-	 * buddy synchronously and the slot be reused as a new cell; a
-	 * stale node left on cell_index[cellid] would then point at a
-	 * freed entry from a slot that now names different data, and the
-	 * next GC walk of that list would touch freed memory.  Unlinking
-	 * first closes that window.  Only the refs==0 thread runs here
-	 * (dec_and_test + xa_erase guard), so no other thread can be
-	 * unlinking this node concurrently.  Zsmalloc entries were never
-	 * linked (cell_node stays an initialised singleton) -- list_del
-	 * on an unlinked node is a no-op by INIT, but we guard on
-	 * use_cells to keep the intent explicit and skip the lock.
+	 * Reverse index unlink + storage release, in that order (the
+	 * rationale lives on shmem_comp_loc_dispose).  Zsmalloc entries
+	 * were never linked; the use_cells guard skips the lock for them.
 	 */
-	if (ent->pool->use_cells) {
-		spin_lock(&ent->pool->index_lock);
-		list_del(&ent->cell_node);
-		spin_unlock(&ent->pool->index_lock);
-	}
+	shmem_comp_loc_dispose(ent->pool, &ent->loc);
 
-	/*
-	 * Release the backing storage.  Cell storage needs the block
-	 * length to decrement live_bytes, which is why cell_free() is
-	 * called directly here rather than through shmem_comp_free().	 * The zsmalloc free path does not need the length — zs_free()	 * recovers it from the size class encoded in the handle.	 */
-	if (ent->handle) {
-		if (ent->pool->use_cells) {
-			u32 cellid;
-			u32 offset;
-
-			shmem_comp_unpack_loc(ent->handle,
-					      &cellid, &offset);
-			cell_free(ent->pool->cells, cellid, offset,
-				  ent->length);
-		} else {
-			shmem_comp_free(ent->pool, ent->handle);
-		}
-	}
 	if (ent->handles)
 		shmem_comp_free_merged(ent->pool, ent->handles,
 				       ent->nchunks);
@@ -1260,15 +1345,15 @@ shmem_comp_entries_get(struct inode *inode, pgoff_t index, u64 *handle,
 		return NULL;
 	rcu_read_lock();
 	ent = xa_load(xa, index);
-	if (ent && !atomic_inc_not_zero(&ent->refs))
+	if (ent && !atomic_inc_not_zero(&ent->loc.refs))
 		ent = NULL;
 	rcu_read_unlock();
 
 	if (ent) {
 		if (handle)
-			*handle = ent->handle;
+			*handle = ent->loc.handle;
 		if (length)
-			*length = ent->length;
+			*length = ent->loc.length;
 		if (nr_pages)
 			*nr_pages = ent->nr_pages;
 		if (handles)
@@ -1323,20 +1408,20 @@ static bool shmem_comp_entries_names(struct inode *inode, pgoff_t index,
  * time the object is provably the original (dying -> pin fails; alive
  * -> correct object).  This is the same discipline as
  * shmem_comp_entries_get(), factored out so a non-inode consumer (a
- * block/swap frontend with its own entry->handle table) can pin by
+ * block/swap frontend with its own block table) can pin by
  * pointer.
  */
 bool shmem_comp_entry_get(struct shmem_comp_entry *ent)
 {
-	return ent && atomic_inc_not_zero(&ent->refs);
+	return ent && atomic_inc_not_zero(&ent->loc.refs);
 }
 
 void shmem_comp_entry_put(struct shmem_comp_entry *ent)
 {
 	if (!ent)
 		return;
-	if (!atomic_dec_and_test(&ent->refs)) {
-		if (unlikely(atomic_read(&ent->refs) < 0))
+	if (!atomic_dec_and_test(&ent->loc.refs)) {
+		if (unlikely(atomic_read(&ent->loc.refs) < 0))
 			panic("shmem_comp: entry %u refs underflow -- "
 			      "reference accounting corrupted", ent->id);
 		return;
@@ -1361,8 +1446,8 @@ bool shmem_comp_entry_release(struct shmem_comp_entry *ent)
 	if (unlikely(atomic_read(&ent->slots) < 0))
 		panic("shmem_comp: entry %u slots underflow -- "
 		      "page cache slot released twice", ent->id);
-	if (!atomic_dec_and_test(&ent->refs)) {
-		if (unlikely(atomic_read(&ent->refs) < 0))
+	if (!atomic_dec_and_test(&ent->loc.refs)) {
+		if (unlikely(atomic_read(&ent->loc.refs) < 0))
 			panic("shmem_comp: entry %u refs underflow -- "
 			      "reference accounting corrupted", ent->id);
 		return last_slot;
@@ -1385,13 +1470,13 @@ shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 	if (!ent)
 		return 0;
 
-	ent->handle = handle;
-	ent->length = length;
+	ent->loc.handle = handle;
+	ent->loc.length = length;
 	ent->nr_pages = nr_pages;
 	ent->handles = handles;
 	ent->nchunks = nchunks;
 	ent->pool = pool;
-	atomic_set(&ent->refs, nr_pages);
+	atomic_set(&ent->loc.refs, nr_pages);
 	atomic_set(&ent->slots, nr_pages);
 
 	/*
@@ -1430,15 +1515,7 @@ shmem_comp_entry_alloc(struct shmem_comp_pool *pool, u64 handle,
 	 * index; it is stable for the entry's life here (only GC relocates,
 	 * and gc_lock serialises that against this alloc).
 	 */
-	INIT_LIST_HEAD(&ent->cell_node);
-	if (pool->use_cells) {
-		u32 cellid, offset;
-
-		shmem_comp_unpack_loc(handle, &cellid, &offset);
-		spin_lock(&pool->index_lock);
-		list_add_tail(&ent->cell_node, &pool->cell_index[cellid]);
-		spin_unlock(&pool->index_lock);
-	}
+	shmem_comp_loc_link(pool, &ent->loc);
 
 	return ent;
 }
@@ -1453,8 +1530,8 @@ shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
 	if (!ent)
 		return NULL;
 
-	ent->handle = handle;
-	ent->length = length;
+	ent->loc.handle = handle;
+	ent->loc.length = length;
 	ent->nr_pages = 1;
 	ent->handles = NULL;
 	ent->nchunks = 0;
@@ -1463,7 +1540,7 @@ shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
 	 * skips the xa_erase for these.  The caller's block table names the
 	 * entry by POINTER, and GC finds it via the reverse index below. */
 	ent->id = 0;
-	atomic_set(&ent->refs, 1);
+	atomic_set(&ent->loc.refs, 1);
 	atomic_set(&ent->slots, 1);
 
 	atomic_inc(&shmem_comp_ram_entries);
@@ -1471,15 +1548,7 @@ shmem_comp_entry_alloc_local(struct shmem_comp_pool *pool, u64 handle,
 
 	/* Reverse index: same as entry_alloc -- GC finds this entry via the
 	 * per-cell list, not the global table. */
-	INIT_LIST_HEAD(&ent->cell_node);
-	if (pool->use_cells) {
-		u32 cellid, offset;
-
-		shmem_comp_unpack_loc(handle, &cellid, &offset);
-		spin_lock(&pool->index_lock);
-		list_add_tail(&ent->cell_node, &pool->cell_index[cellid]);
-		spin_unlock(&pool->index_lock);
-	}
+	shmem_comp_loc_link(pool, &ent->loc);
 
 	return ent;
 }
@@ -1553,15 +1622,15 @@ static unsigned int shmem_comp_drain_victim_scan(struct shmem_comp_pool *pool,
 
 		if (ent->pool != pool)
 			continue;
-		h = READ_ONCE(ent->handle);
+		h = READ_ONCE(ent->loc.handle);
 		if (!h)
 			continue;
 		shmem_comp_unpack_loc(h, &cellid, &offset);
 		if (cellid != vic->cellid)
 			continue;
-		if (!atomic_inc_not_zero(&ent->refs))
+		if (!atomic_inc_not_zero(&ent->loc.refs))
 			continue;
-		len = ent->length;
+		len = ent->loc.length;
 		if (offset + len > (1UL << cp->cell_order) * PAGE_SIZE) {
 			shmem_comp_entry_put(ent);
 			continue;
@@ -1569,10 +1638,11 @@ static unsigned int shmem_comp_drain_victim_scan(struct shmem_comp_pool *pool,
 		ret = cell_relocate_one(cp, vic, vic->base + offset, len,
 					&nc, &no);
 		if (ret == 0) {
-			WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
+			WRITE_ONCE(ent->loc.handle,
+				   shmem_comp_pack_loc(nc, no));
 			if (pool->use_cells) {
 				spin_lock(&pool->index_lock);
-				list_move_tail(&ent->cell_node,
+				list_move_tail(&ent->loc.cell_node,
 					       &pool->cell_index[nc]);
 				spin_unlock(&pool->index_lock);
 			}
@@ -1608,7 +1678,7 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 	 * signal bounds the non-progress case.
 	 */
 	for (;;) {
-		struct shmem_comp_entry *ent = NULL, *iter;
+		struct shmem_comp_loc_node *node = NULL, *iter;
 		u64 h;
 		u32 cellid, offset;
 		unsigned int len;
@@ -1616,51 +1686,51 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 		int ret;
 
 		/*
-		 * Detach the first LIVE entry on the victim's list.  Under
-		 * index_lock so a concurrent entry_free() unlink (also under
+		 * Detach the first LIVE node on the victim's list.  Under
+		 * index_lock so a concurrent dispose's unlink (also under
 		 * index_lock) cannot yank a node out from under the walk.
-		 * A dying entry (pin fails) is left on the list: its own
-		 * entry_free() unlinks it and its cell_free() does the
-		 * live_bytes accounting -- GC need not touch dying entries.
+		 * A dying node (pin fails) is left on the list: its own
+		 * refs==0 teardown unlinks it and releases the storage.
 		 */
 		spin_lock(&pool->index_lock);
 		list_for_each_entry(iter, &pool->cell_index[vic->cellid],
 				    cell_node) {
 			if (atomic_inc_not_zero(&iter->refs)) {
 				list_del_init(&iter->cell_node);
-				ent = iter;
+				node = iter;
 				break;
 			}
 		}
 		spin_unlock(&pool->index_lock);
-		if (!ent)
-			break;	/* no live entries remain in this victim */
+		if (!node)
+			break;	/* no live blocks remain in this victim */
 
 		/*
-		 * Pinned (refs >= 1) and detached: the entry cannot be freed
-		 * and its handle cannot change under us (only GC relocates,
-		 * serialised by gc_lock).  The pin -- not the index_lock --
-		 * is what keeps vic->base valid across the memcpy below.
+		 * Pinned (refs >= 1) and detached: the block cannot be
+		 * freed and its handle cannot change under us (only GC
+		 * relocates, serialised by gc_lock).  The pin -- not the
+		 * index_lock -- is what keeps vic->base valid across the
+		 * memcpy below.
 		 */
-		h = READ_ONCE(ent->handle);
+		h = READ_ONCE(node->handle);
 		shmem_comp_unpack_loc(h, &cellid, &offset);
 
 		/* The reverse index is keyed by the handle's cellid, so a
-		 * live entry on this list must name this cell.  A violation
+		 * live node on this list must name this cell.  A violation
 		 * means the alloc/free/reloc linkage is broken; catch it
 		 * loudly rather than read the wrong cell's memory. */
 		VM_BUG_ON(cellid != vic->cellid);
 
-		len = ent->length;
+		len = node->length;
 		if (offset + len > (1UL << cp->cell_order) * PAGE_SIZE) {
-			/* Defensive: a live entry should never be too big for
+			/* Defensive: a live block should never be too big for
 			 * its own cell (would mean corrupt accounting).  Put it
 			 * back and stop -- cannot loop-and-continue. */
 			spin_lock(&pool->index_lock);
-			list_add(&ent->cell_node,
+			list_add(&node->cell_node,
 				 &pool->cell_index[vic->cellid]);
 			spin_unlock(&pool->index_lock);
-			shmem_comp_entry_put(ent);
+			shmem_comp_loc_pin_put(pool, node);
 			break;
 		}
 
@@ -1668,29 +1738,29 @@ static unsigned int shmem_comp_drain_victim(struct shmem_comp_pool *pool,
 					&nc, &no);
 		if (ret) {
 			/* Relocate failed (directory full / ENOMEM).  Put the
-			 * entry back on the victim's list so it is not stranded
+			 * node back on the victim's list so it is not stranded
 			 * off-index, drop the pin, and stop. */
 			spin_lock(&pool->index_lock);
-			list_add(&ent->cell_node,
+			list_add(&node->cell_node,
 				 &pool->cell_index[vic->cellid]);
 			spin_unlock(&pool->index_lock);
-			shmem_comp_entry_put(ent);
+			shmem_comp_loc_pin_put(pool, node);
 			break;
 		}
 
-		WRITE_ONCE(ent->handle, shmem_comp_pack_loc(nc, no));
+		WRITE_ONCE(node->handle, shmem_comp_pack_loc(nc, no));
 		/* Relink onto the destination cell's list: the handle now
 		 * names nc, so the "list == handle's cellid" invariant
 		 * requires the move. */
 		spin_lock(&pool->index_lock);
-		list_add_tail(&ent->cell_node, &pool->cell_index[nc]);
+		list_add_tail(&node->cell_node, &pool->cell_index[nc]);
 		spin_unlock(&pool->index_lock);
 		moved++;
 
-		/* Drop our pin; may hit refs==0 -> entry_free unlinks from
-		 * the DESTINATION list (handle already updated), decrementing
-		 * nc's live_bytes -- correct. */
-		shmem_comp_entry_put(ent);
+		/* Drop our pin; may hit refs==0 -> the refs==0 teardown
+		 * unlinks from the DESTINATION list (handle already
+		 * updated), decrementing nc's live_bytes -- correct. */
+		shmem_comp_loc_pin_put(pool, node);
 	}
 	return moved;
 }
@@ -1821,39 +1891,41 @@ static unsigned long shmem_comp_cell_scan(struct shrinker *shrinker,
 
 
 /*
- * shmem_comp_load_entry - relocation-safe block load on a pinned entry
- * @ent: entry, pinned by the caller (entries_get / entry_get)
+ * shmem_comp_loc_load - relocation-safe block load on a pinned loc node
+ * @pool: pool that owns the node's storage
+ * @node: loc node, pinned by the caller (refs >= 1 held)
  * @dst: destination buffer
  * @len: [in,out] buffer size in, data size out
  *
- * Return: 0 on success, -ENOENT if @ent is NULL, -EINVAL if the entry
- * is not cell-backed, -EIO if the block could not be located within
- * the retry budget (unreachable unless the entry table and cell
- * accounting disagree).
+ * Return: 0 on success, -ENOENT if @node is NULL, -EINVAL if the
+ * pool is not cell-backed, -EIO if the block could not be located
+ * within the retry budget (unreachable unless the node table and
+ * cell accounting disagree).
  *
  * The reader's side of the GC contract.  A plain load could memcpy
  * from a cell that GC relocated and returned to the buddy between the
- * caller's pin and the copy.  This helper re-reads the entry handle
+ * caller's pin and the copy.  This helper re-reads the node handle
  * under the cell's read lock and retries if GC moved the block -- the
  * same retry shape the page-cache install path uses.  The caller's
- * pin keeps the entry (and its accounting) alive across the retry;
+ * pin keeps the block (and its accounting) alive across the retry;
  * nothing here re-resolves an id, so nothing here can go stale.
  */
-int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
-			  unsigned int *len)
+static int shmem_comp_loc_load(struct shmem_comp_pool *pool,
+			       struct shmem_comp_loc_node *node,
+			       void *dst, unsigned int *len)
 {
 	struct cell_pool *cp;
 	unsigned int budget = 8;
 	int ret = -EIO;
 
-	if (!ent)
+	if (!node)
 		return -ENOENT;
-	cp = ent->pool->cells;
+	cp = pool->cells;
 	if (!cp)
 		return -EINVAL;
 
 	while (budget--) {
-		u64 h = READ_ONCE(ent->handle);
+		u64 h = READ_ONCE(node->handle);
 		u32 cellid;
 		u32 offset;
 		struct cell *c;
@@ -1874,7 +1946,7 @@ int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
 		 * the original cell is still live (its last object is
 		 * this one, pinned by us).
 		 */
-		if (READ_ONCE(ent->handle) != h) {
+		if (READ_ONCE(node->handle) != h) {
 			up_read(&c->lock);
 			continue;
 		}
@@ -1895,21 +1967,30 @@ int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
 	return ret;
 }
 
-int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
-			  bool *raw)
+int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
+			  unsigned int *len)
+{
+	if (!ent)
+		return -ENOENT;
+	return shmem_comp_loc_load(ent->pool, &ent->loc, dst, len);
+}
+
+int shmem_comp_loc_read(struct shmem_comp_pool *pool,
+			struct shmem_comp_loc_node *node, void *dst,
+			bool *raw)
 {
 	struct cell_pool *cp;
 	unsigned int budget = 8;
 	int ret = -EIO;
 
-	if (!ent)
+	if (!node)
 		return -ENOENT;
-	cp = ent->pool->cells;
+	cp = pool->cells;
 	if (!cp)
 		return -EINVAL;
 
 	while (budget--) {
-		u64 h = READ_ONCE(ent->handle);
+		u64 h = READ_ONCE(node->handle);
 		u32 cellid, offset, dlen;
 		struct cell *c;
 		u32 cell_size;
@@ -1923,7 +2004,7 @@ int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
 		/* Re-read under the lock: GC relocates the handle while holding
 		 * down_write on this rwsem, so a change means the block moved --
 		 * retry with the fresh location. */
-		if (READ_ONCE(ent->handle) != h) {
+		if (READ_ONCE(node->handle) != h) {
 			up_read(&c->lock);
 			continue;
 		}
@@ -1932,7 +2013,7 @@ int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
 			continue;
 		}
 
-		dlen = ent->length;
+		dlen = node->length;
 		cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
 		if (offset + dlen > cell_size) {
 			up_read(&c->lock);
@@ -1947,7 +2028,7 @@ int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
 		} else {
 			unsigned int out = PAGE_SIZE;
 
-			ret = shmem_comp_decompress(ent->pool,
+			ret = shmem_comp_decompress(pool,
 						    c->base + offset, dlen,
 						    dst, &out);
 			if (raw)
@@ -1958,6 +2039,14 @@ int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
 	}
 
 	return ret;
+}
+
+int shmem_comp_read_entry(struct shmem_comp_entry *ent, void *dst,
+			  bool *raw)
+{
+	if (!ent)
+		return -ENOENT;
+	return shmem_comp_loc_read(ent->pool, &ent->loc, dst, raw);
 }
 
 /* Debug hook: run one GC pass on every cell-backed pool. */
@@ -3983,7 +4072,7 @@ static unsigned int shmem_comp_entry_drop(struct inode *inode,
 	unsigned int length, nr;
 	bool last;
 
-	length = ent->length;
+	length = ent->loc.length;
 	nr = ent->nr_pages;
 	last = shmem_comp_entry_release(ent);
 	if (comp && last) {

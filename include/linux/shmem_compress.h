@@ -72,15 +72,59 @@ struct kobject;
 #include <crypto/acompress.h>
 
 /**
+ * struct shmem_comp_loc_node - the relocation-critical block state
+ * @handle: storage location.  For zsmalloc-backed pools this is a
+ *          zs_malloc() handle (widened to u64; the kernel API hands
+ *          out unsigned long, which fits into u64 on every arch).
+ *          For cell-backed pools it encodes {cellid, offset} --
+ *          cellid+1 at bit 24 (40 bits) and offset in the low 24
+ *          bits (max cell is 16 MiB, CELL_ORDER_MAX), so the encoding
+ *          needs all 64 bits on EVERY arch.  Fixed-width (u64),
+ *          never unsigned long: on 32-bit unsigned long silently
+ *          truncates cellid to 8 bits (wrong cell, corrupt read, no
+ *          compiler warning).  pool->use_cells determines which
+ *          interpretation applies; a pool never switches backing
+ *          store after creation.
+ * @length: compressed size in bytes (cell_free needs it; readers use
+ *          it to tell raw blocks from compressed ones)
+ * @refs: liveness count = durable references + temporary pins.  Cell
+ *        GC relocates the block behind this node (updating @handle
+ *        in place, so every frontend pointing at the node sees the
+ *        move); the node's storage is released by whichever party
+ *        drops @refs to zero.  How the durable reference is accounted
+ *        is the frontend's business: struct shmem_comp_entry counts
+ *        entries[] slots (one per page-cache slot naming it), while
+ *        a block-device table slot keeps a single durable ref.
+ * @cell_node: reverse-index linkage: which cell holds this block.
+ *             Lives on pool->cell_index[cellid] for the whole time
+ *             @handle names that cell; link on install, unlink on
+ *             dispose, GC relocate moves it.  Guarded by
+ *             pool->index_lock.  The 16 B cost is the price of
+ *             O(blocks-in-victim) GC instead of an O(total-blocks)
+ *             table scan; see specs/04_GC_REVERSE_INDEX.md.
+ *
+ * The state the cell GC protocol touches, extracted so that a frontend
+ * can keep it where it best fits: struct shmem_comp_entry embeds it
+ * (kmalloc'd, one per compression unit), while a block device with a
+ * fixed block count embeds it in a preallocated dense table slot
+ * indexed by block number -- computing the slot address from the
+ * index is cheaper than any pointer chase, and there is no per-block
+ * allocation at all.  The GC drain and the relocation-safe loaders
+ * operate on this node and do not know or care which frontend owns it.
+ */
+struct shmem_comp_loc_node {
+	u64 handle;
+	unsigned int length;
+	atomic_t refs;
+	struct list_head cell_node;
+};
+
+/**
  * struct shmem_comp_entry - Compressed page metadata
- * @handle: zsmalloc allocation handle for compressed data (a kernel
- *          pointer, must not be packed into the xarray value)
- * @length: Compressed size in bytes
+ * @loc: storage location, length, pin count and reverse-index node
+ *       (the GC-facing prefix; see struct shmem_comp_loc_node)
  * @nr_pages: number of consecutive pages merged into this block
  *            (1 = single page, >1 = merge_pages group)
- * @refs: liveness count = page cache slots + reader pins; the entry
- *        (and its zsmalloc block / merged buffer) is freed when this
- *        drops to zero, whichever reference kind drops it
  * @slots: page cache slots only; gates the once-per-group accounting
  *         in shmem_free_swap() (last slot, not last reference)
  * @data: kmalloc'd block for merged groups: zsmalloc caps objects at
@@ -96,26 +140,7 @@ struct kobject;
  * {id, generation} xa_value, which could not fit a 32-bit xa slot.
  */
 struct shmem_comp_entry {
-	/*
-	 * Storage location.  For zsmalloc-backed pools this is a
-	 * zs_malloc() handle (widened to u64; the kernel API hands out
-	 * unsigned long, which fits into u64 on every arch).  For
-	 * cell-backed pools it encodes {cellid, offset} -- cellid+1 at
-	 * bit 24 (40 bits) and offset in the low 24 bits (max cell is
-	 * 16 MiB, CELL_ORDER_MAX), so the encoding needs all 64 bits on
-	 * EVERY arch.  Fixed-width (u64), never unsigned long: on
-	 * 32-bit unsigned long silently truncates cellid to 8 bits
-	 * (wrong cell, corrupt read, no compiler warning).  Reusing the
-	 * handle field avoids growing every entry by the size of a
-	 * second pointer, which matters because the entry table is
-	 * proportional to the number of compressed blocks in the
-	 * system.
-	 *
-	 * pool->use_cells determines which interpretation applies.  A
-	 * pool never switches backing store after creation, so the
-	 * interpretation is stable for the lifetime of the entry.
-	 */
-	u64 handle;
+	struct shmem_comp_loc_node loc;
 	/*
 	 * The xarray index this entry occupies in shmem_comp_entries,
 	 * assigned by xa_alloc().  Stable for the entry's life (a new
@@ -124,10 +149,10 @@ struct shmem_comp_entry {
 	 * refs==0 teardown without an xa_load per entry.
 	 */
 	unsigned int id;
-	unsigned int length;		/* compressed size in bytes */
 	unsigned short nr_pages;	/* pages merged into this block */
 	/*
-	 * Two-counter reference scheme:
+	 * Two-counter reference scheme (loc.refs is the counter the
+	 * scheme splits):
 	 *   slots  — entries[] slots (the per-inode two-table mapping)
 	 *            that name this entry; the durable reference.  One per
 	 *            entries[] slot (a merge group writes one per page).
@@ -148,7 +173,6 @@ struct shmem_comp_entry {
 	 * folio cache (the "both" state), so reclaim can drop the folio
 	 * and a later read re-decompresses.
 	 */
-	atomic_t refs;
 	atomic_t slots;
 	/*
 	 * Merged-group zsmalloc chunks.  When merge_pages > 1 and the
@@ -168,16 +192,6 @@ struct shmem_comp_entry {
 	 * decompression.
 	 */
 	struct shmem_comp_pool *pool;
-	/*
-	 * Reverse-index linkage: which cell holds this block.  For
-	 * cell-backed pools only (zsmalloc entries leave it unlinked).
-	 * The block lives on pool->cell_index[cellid] for the whole time
-	 * its handle names that cell; alloc links it, free unlinks it,
-	 * GC relocate moves it.  Guarded by pool->index_lock.  The 16 B
-	 * cost is the price of O(entries-in-victim) GC instead of an
-	 * O(total-entries) table scan; see specs/04_GC_REVERSE_INDEX.md.
-	 */
-	struct list_head cell_node;
 	struct rcu_head rcu;
 };
 
@@ -553,6 +567,37 @@ unsigned int shmem_comp_pool_cell_pages(struct shmem_comp_pool *pool);
  */
 int shmem_comp_load_entry(struct shmem_comp_entry *ent, void *dst,
 			  unsigned int *len);
+
+/*
+ * The loc-node API: the same relocation-safe machinery on a bare
+ * struct shmem_comp_loc_node, for frontends that keep the node in
+ * their own table (a dense block-device slot table) instead of an
+ * engine entry.  The caller pins the node (atomic_inc_not_zero on
+ * loc.refs) before read/link bookkeeping and drops the pin with
+ * shmem_comp_loc_pin_put().
+ */
+int shmem_comp_loc_read(struct shmem_comp_pool *pool,
+			struct shmem_comp_loc_node *node, void *dst,
+			bool *raw);
+void shmem_comp_loc_link(struct shmem_comp_pool *pool,
+			 struct shmem_comp_loc_node *node);
+void shmem_comp_loc_dispose(struct shmem_comp_pool *pool,
+			    struct shmem_comp_loc_node *node);
+void shmem_comp_loc_pin_put(struct shmem_comp_pool *pool,
+			    struct shmem_comp_loc_node *node);
+
+/*
+ * Let a frontend own the refs==0 teardown of its own nodes.  A pool
+ * whose reverse index holds bare loc nodes (not engine entries) sets
+ * this; the GC drain then drops its pin through the frontend's put
+ * (which releases the node's storage and unlinks it) instead of
+ * shmem_comp_entry_put() on a container_of that would not be an
+ * entry.  Set once, right after pool creation.
+ */
+void shmem_comp_pool_set_node_put(struct shmem_comp_pool *pool,
+				  void (*fn)(void *,
+					     struct shmem_comp_loc_node *),
+				  void *priv);
 
 /*
  * shmem_comp_read_entry - read a block into @dst, decompressing in place
