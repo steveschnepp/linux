@@ -1302,3 +1302,23 @@ which is exactly why the boot test caught it and the bench did not.
    KASAN kernel to characterize.
 4. mTHP folio grouping (the differentiator) next on the feature
    track.
+
+### matrix_watermark, classified (2026-10-17, session 76 addendum)
+
+The pass's orchestrator had died mid-sweep (collateral of a kill
+spree); matrix_watermark was rerun in the foreground.  Result on the
+dense kernel: 838 passed / 25 failed (11 sweep points), failures of
+the form "aging engaged across config (aged_pages grew)" on TMPFS
+rows (lz4 m1/m8, zstd, cell256k, zsmalloc) -- no zcell device
+involved.  Classified against the pre-dense baseline kernel
+(x86-64-sweep, built 2026-10-16 before any of this session's commits):
+**800 / 26 failed, 12 points -- the same failure class.**  Verdict:
+pre-existing watermark-policy state, NOT a regression from the dense
+slots or the engine refactor; the dense kernel scores marginally
+better within config differences.  Open as its own policy item
+(the aging-engaged assertions vs the watermark matrix), not blocking.
+
+With this the full-matrix pass is closed: kernels 10/10, batteries
+8/8, KASAN suite PASS, zcell boot 13/13 post-fix on plain+KASAN,
+trres+entryrace PASS, 4/5 sweeps PASS + matrix_watermark classified
+pre-existing.
