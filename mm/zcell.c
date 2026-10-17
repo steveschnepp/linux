@@ -80,6 +80,30 @@ struct zcell_slot {
 	spinlock_t lock;
 };
 
+/*
+ * Bounded slot waits: a wait longer than this is a protocol bug, not
+ * contention -- pins are held across at most one <=PAGE_SIZE
+ * copy/decompress.  Report the stuck slot and panic (the rig runs
+ * with panic=1, so the guest reboots and the serial log names the
+ * stuck generation) instead of spinning silently forever, which is
+ * what schedulable cpu_relax loops do past a hang (no hung-task, no
+ * softlockup -- the KASAN zcell-boot hangs of 2026-10-17).
+ */
+#define ZCELL_WAIT_DEADLINE	(10 * HZ)
+
+struct zcell;
+
+static void zcell_wait_stuck(const char *fn, struct zcell *zc,
+			     unsigned long block_nr,
+			     struct zcell_slot *slot)
+{
+	pr_err("zcell: %s stuck slot=%lu present=%d refs=%d handle=%llx\n",
+	       fn, block_nr, slot->present,
+	       atomic_read(&slot->loc.refs),
+	       (unsigned long long)slot->loc.handle);
+	panic("zcell: slot wait exceeded %d jiffies", ZCELL_WAIT_DEADLINE);
+}
+
 struct zcell {
 	struct gendisk		*disk;
 	/* Private compression pool: cell backend + per-CPU contexts +
@@ -170,6 +194,7 @@ static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 {
 	struct zcell_slot *slot = &zc->table[block_nr];
 	struct shmem_comp_loc_node *node = &slot->loc;
+	unsigned long deadline = jiffies + ZCELL_WAIT_DEADLINE;
 
 	for (;;) {
 		u64 h;
@@ -190,6 +215,8 @@ static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 				goto pinned;
 			zcell_slot_put(zc, node);
 		}
+		if (time_after(jiffies, deadline))
+			zcell_wait_stuck("read", zc, block_nr, slot);
 		cpu_relax();
 	}
 
@@ -209,6 +236,7 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 {
 	struct zcell_slot *slot = &zc->table[block_nr];
 	struct shmem_comp_loc_node *node = &slot->loc;
+	unsigned long deadline;
 	unsigned int len_bytes;
 	u64 handle;
 
@@ -224,6 +252,7 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 	if (!handle)
 		return -ENOMEM;
 
+	deadline = jiffies + ZCELL_WAIT_DEADLINE;
 	for (;;) {
 		spin_lock(&slot->lock);
 		if (!slot->present && !atomic_read(&node->refs) &&
@@ -250,8 +279,12 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 		 * swap layer serialises read vs write per slot).
 		 */
 		while (atomic_read(&node->refs) ||
-		       READ_ONCE(node->handle))
+		       READ_ONCE(node->handle)) {
+			if (time_after(jiffies, deadline))
+				zcell_wait_stuck("write", zc, block_nr,
+						  slot);
 			cpu_relax();
+		}
 	}
 
 	node->length = len_bytes;
