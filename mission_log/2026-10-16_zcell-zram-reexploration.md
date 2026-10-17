@@ -632,3 +632,94 @@ Test exit code: 0
    unit via the merge path (the differentiator vs zram's per-page).
 3. Measure cell-swap vs zram (the build script already enables ZRAM, so
    both devices are in the same kernel) on the fleet workload.
+
+---
+
+## Session 71: The Ratio-1 Baseline -- zcell vs zram (2026-10-17)
+
+(Session 71; same file.  The honest baseline the mTHP grouping must beat.)
+
+### What We Did
+
+Benched the ratio-1 device against zram on real swap traffic, on the
+i386 rig (KVM-fast, and 32-bit representative of the fleet's arm32/arm7
+cores).
+
+**Use case: cold-anon tiering** -- the zram-swap scenario OpenWrt ships.
+An idle working set is swapped out to compressed RAM to free memory for
+an active burst, then swapped back in on wakeup.  The backend (zsmalloc
+in zram vs cells in zcell) decides (a) how much host RAM the compressed
+cold set costs, (b) how fast it swaps back.  This is the fleet's real
+behavior, not a synthetic.
+
+**The bench** (`test.mode=swapbench`, added to the sweep guest
+`arch_init.c`, rig `2369ff8` + `5a0a98b`).  Self-contained (no busybox):
+mkswap header in C, swapon syscall, swap out a cold ~2:1 anon set via
+MADV_PAGEOUT, read mm_stat (backend RAM), fault back in (timed + data
+integrity), swapoff.  zram first, then zcell, identical bytes both.
+i386 kernel with ZCELL+ZRAM+SWAP+ADVISE=y, KVM, 1536M, 32M cold set,
+64M swap device.
+
+**Two build/runtime fixes on the way:**
+1. **A real 32-bit bug in zcell.c** (kernel `e9d45c8e96e5`): the i386
+   vmlinux link failed with `undefined reference to '__udivdi3'` --
+   `DIV_ROUND_UP(u64,u64)` and the mm_stat ratio emit a libgcc 64-bit
+   divide the kernel does not link.  Fixed with `div64_u64()`
+   (linux/math64.h).  **The compile gate could not catch this** (it
+   compiles objects, does not link vmlinux); only the bootable 32-bit
+   build did.  The arch matrix keeps earning its keep.
+2. **No /dev in the sweep initramfs** (rig `5a0a98b`): the guest never
+   mounts devtmpfs, so /dev/zram0 + /dev/zcell0 were missing (mkswap
+   ENOENT).  mount("devtmpfs") at the start of swapbench.
+
+### Test Results (3 reps, i386/KVM, near-zero variance)
+
+Identical compressed bytes both backends (same lz4, same data -- so the
+ONLY difference is the storage backend):
+
+| metric | zram (zsmalloc) | zcell (cells) | delta |
+|---|---|---|---|
+| compressed bytes | 18,628,465 | 18,628,465 | identical |
+| backend overhead (mem/compr) | 1.032 | 1.031 | zcell -0.15% (tie) |
+| swap-out time | 44.5 ms | 52.5 ms | zcell ~18% slower (0.85x) |
+| swap-in throughput | 610 MB/s | 500 MB/s | zcell ~18% slower (0.82x) |
+| data integrity | intact | intact | both correct |
+
+### Verdict
+
+**At ratio-1 zcell is NOT competitive with zram: it ties on RAM
+efficiency (0.15%, noise) and is ~18% slower on swap throughput in both
+directions.**  This confirms the session-35 0.86x prior on the modern
+engine with real swap traffic and a realistic ~1.8:1 data profile.  The
+zero-per-object-metadata cell advantage does NOT show at ratio-1 for
+~1K compressed objects (zsmalloc's per-object overhead is also small
+there); it needs the grouped/larger objects the mTHP path would create.
+
+### What We Learned (session 71)
+
+- **A 32-bit runtime build catches __udivdi3; the compile gate cannot**
+  (compile does not link vmlinux).  Any runtime u64/u64 divide in our
+  code is a latent i386/arm32 link bomb.  div64_u64() everywhere.
+- **The baseline is low-variance on i386/KVM** (3 reps, same data ->
+  byte-identical compressed size, +/-1% timing), so an ~18% throughput
+  gap is real, not noise.
+- **At ratio-1, cells and zsmalloc are RAM-equivalent** for ~1K
+  objects.  The cell win is a GROUPING win, not a per-object win -- which
+  is exactly the mTHP bet.
+- **The swapbench-in-the-sweep-guest pattern works**: self-contained
+  mkswap+swapon+A/B in one static guest, no busybox, cross-compiles to
+  any arch.  Reusable for the mTHP re-measure.
+
+### What We Decided (session 71)
+- **The ratio-1 baseline is established: tie on RAM, ~0.82-0.85x on
+  throughput.**  This is the floor.  The mTHP folio grouping must
+  clear it to make zcell worth deploying over zram.
+
+### Next Steps (session 71)
+1. mTHP config surface (which orders yield large anon folios on the
+   i386/64M target + the 64K-page aarch64 kernel; CONFIG_THP_SWAP).
+2. Commit 3: mTHP folio grouping -- compress the whole swap folio as one
+   unit via shmem_comp_store_merged (the cross-page ratio zram cannot
+   get).
+3. Re-run swapbench with mTHP on: does the per-folio compression ratio
+   beat zram's per-page enough to offset the ~18% throughput deficit?
