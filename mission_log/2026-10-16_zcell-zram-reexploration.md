@@ -535,3 +535,100 @@ against `shmem_compress.o`/`cell_store.o` (verified with nm).
    the 64K-page aarch64 kernel; CONFIG_THP_SWAP).
 3. Commit 3: mTHP folio grouping (the differentiator).
 4. Measure cell-swap vs zram on the fleet workload.
+
+---
+
+## Session 70: The Device Boots and Works as Swap (2026-10-17)
+
+(Session 70; same file.  Boot-test phase for the ratio-1 device.)
+
+### What We Did
+
+Built a bootable x86_64 kernel with `ZCELL=y`, wrote a focused boot
+test, and exercised `/dev/zcell0` as real swap.  **All checks PASS.**
+
+**1. Kernel build -- the stale-artifact rule reaffirmed.**  The first
+build (from the main tree `/home/snide/linux`, `build_arch_kernel.sh
+x86_64 zcell --enable CONFIG_ZCELL`) produced a kernel that died at boot
+with `uncompression error -- System halted`: the session-66 stale-artifact
+class (the main tree's historical in-tree builds leave stale generated
+files that corrupt the gzip payload).  Rebuilt from a **pristine git
+worktree** (`git worktree add /home/snide/linux-zcell HEAD`; `SRC=`
+override) -> clean boot (`Decompressing Linux... done`).  The session-66
+rule ("bootable kernels are built from a pristine worktree, not the main
+tree") holds and paid off immediately.
+
+**2. The boot test** (`tests/test_zcell.c`, rig `2a8e450`):
+- O_DIRECT block round-trip: write patterned pages, read back, verify.
+- mm_stat sanity (orig/compr/mem_used, ratio in (0,1)).
+- Swap trial: mkswap + swapon + anon pressure + MADV_PAGEOUT; verify the
+  device takes swap writes (io_writes up, SwapFree down), then **DATA
+  INTEGRITY** -- fault every chunk back in and byte-compare the pattern,
+  which exercises the full compress->store->swapout->swapin->load->
+  decompress path.  swapoff must return the cells.
+
+**3. Two TEST bugs on first boot** (not device bugs), fixed in rig
+`440d376`:
+- The fill + integrity loops used `n < 16 * 4096` (=65536 pages = 268MB)
+  against a 16MB mapping -> segfault (write past the mmap).  Fixed to
+  `CHUNK_PAGES = 16*MIB/PAGE` (=4096).
+- test_swap re-set disksize already set by the round-trip (-EBUSY);
+  reset the device between the two tests first.
+The device itself was innocent: the round-trip PASSED and compression
+worked on the very first boot, before either test bug was fixed.
+
+### Test Results (the decisive boot, QEMU/KVM, 1G, x86_64 worktree kernel)
+
+```
+PASS sysfs disksize present
+PASS set disksize 16M / write patterned blocks / read back matches pattern
+mm_stat: orig=262144 compr=41344 mem=65536 ratio/10000=1577   (6.3:1)
+PASS mm_stat fields populated / compression ratio in (0,10000)
+PASS set disksize 64M (after reset) / swapon / SwapTotal > 0
+pressure: 48 x 16M anon chunks, MemFree 863256 -> 97452 kB
+SwapTotal=65532 SwapFree=0 kB; device io_writes 65 -> 16448
+PASS swap writes hit the device / SwapFree dropped
+PASS swapped data read back intact (no corruption)
+post-swapoff mm_stat mem_used=64 kB
+PASS cells returned after swapoff
+Test exit code: 0
+```
+
+### What We Learned (session 70)
+
+- **The zcell device works end to end as swap.**  The thin gendisk over
+  the shmem_comp engine, the private pool, the pointer-based block
+  table, the entry machinery, and the swap integration all function
+  together on first real execution (modulo two test bugs).
+- **Data integrity through the full swap round-trip is CONFIRMED**: the
+  compress->store->swapout->swapin->load->decompress chain returns
+  byte-identical data under real swap I/O and memory pressure.
+- **The synchronous whole-cell return works live in the swap context**:
+  after swapoff `mem_used` dropped 65536 -> 64 kB, i.e. the cells went
+  back to the buddy inline as swapin freed the slots.  This is the
+  property zram's architecture lacks (it retains zspages for reuse), and
+  it is why MemFree tracks usage on a cell device.
+- **Compression on real swap pages is strong**: 6.3:1 on the (admittedly
+  compressible) test pattern; real anon pages will vary.
+- **The session-66 stale-artifact rule is load-bearing for x86_64**: the
+  main tree cannot produce a bootable x86_64 kernel; always use a
+  pristine worktree.
+- **A data-integrity check is the only thing that proves a swap device.**
+  "Swap writes hit the device" (io_writes) proves the WRITE path; only
+  faulting the pages back in and comparing proves the READ path.  The
+  old cellzram test checked io_writes but not readback integrity; this
+  test checks both.
+
+### What We Decided (session 70)
+- **The ratio-1 baseline is validated and correct.**  It is now a solid
+  foundation to layer the mTHP folio grouping (the differentiator) on top.
+- **Bootable-kernel builds go through a pristine worktree** (session-66
+  rule, now applied to the zcell track).
+
+### Next Steps (session 70)
+1. mTHP config surface: which orders produce large anon folios on a 64M
+   guest + the 64K-page aarch64 kernel (`CONFIG_THP_SWAP`, THP sysfs).
+2. Commit 3: mTHP folio grouping -- compress the whole swap folio as one
+   unit via the merge path (the differentiator vs zram's per-page).
+3. Measure cell-swap vs zram (the build script already enables ZRAM, so
+   both devices are in the same kernel) on the fleet workload.
