@@ -195,6 +195,7 @@ static int zcell_read_block(struct zcell *zc, unsigned long block_nr,
 	struct zcell_slot *slot = &zc->table[block_nr];
 	struct shmem_comp_loc_node *node = &slot->loc;
 	unsigned long deadline = jiffies + ZCELL_WAIT_DEADLINE;
+	int ret;
 
 	for (;;) {
 		u64 h;
@@ -228,7 +229,9 @@ pinned:
 	 * buffer.  loc_read re-reads the handle under the cell lock and
 	 * retries if GC relocated the block; the pin keeps the storage
 	 * alive across that. */
-	return shmem_comp_loc_read(zc->pool, node, dst, NULL);
+	ret = shmem_comp_loc_read(zc->pool, node, dst, NULL);
+	zcell_slot_put(zc, node);
+	return ret;
 }
 
 static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
@@ -650,10 +653,14 @@ static void zcell_reset_locked(struct zcell *zc)
 	 */
 	for (block_nr = 0; block_nr < zc->nr_blocks; block_nr++) {
 		struct zcell_slot *slot = &zc->table[block_nr];
+		unsigned long deadline = jiffies + ZCELL_WAIT_DEADLINE;
 
 		while (atomic_read(&slot->loc.refs) ||
-		       READ_ONCE(slot->loc.handle))
+		       READ_ONCE(slot->loc.handle)) {
+			if (time_after(jiffies, deadline))
+				zcell_wait_stuck("reset", zc, block_nr, slot);
 			cpu_relax();
+		}
 	}
 
 	if (zc->pool) {
