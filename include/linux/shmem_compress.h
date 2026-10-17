@@ -591,6 +591,23 @@ int shmem_comp_compress(struct shmem_comp_pool *pool,
 			const void *src, unsigned int slen,
 			void *dst, unsigned int *dst_len);
 
+/*
+ * shmem_comp_compress_store - compress @src and store it, no per-call kmalloc
+ * @pool: compression pool
+ * @src: source data (at most PAGE_SIZE -- single-page compression)
+ * @slen: source length in bytes
+ * @clen_out: optional out; the STORED length (compressed size, or @slen
+ *            when stored raw because it did not compress)
+ *
+ * Compresses into the pool's per-CPU buffer (held under the per-CPU lock
+ * across compress+store), so the caller supplies no output buffer and no
+ * per-block kmalloc happens.  Falls back to storing @src raw when
+ * compression does not reduce size.  Returns the handle, or 0 on failure.
+ */
+u64 shmem_comp_compress_store(struct shmem_comp_pool *pool,
+			      const void *src, unsigned int slen,
+			      unsigned int *clen_out);
+
 /**
  * shmem_comp_decompress - Decompress a block of memory
  * @pool: Compression pool to use

@@ -163,37 +163,26 @@ static int zcell_write_block(struct zcell *zc, unsigned long block_nr,
 			     const void *src)
 {
 	struct shmem_comp_entry *ent, *old;
-	unsigned int len_bytes = PAGE_SIZE;
-	const void *data = src;
-	void *cbuf = NULL;
+	unsigned int len_bytes;
 	u64 handle;
-	int ret;
 
 	if (zc->compressed) {
-		cbuf = kmalloc(PAGE_SIZE, GFP_NOIO);
-		if (!cbuf)
-			return -ENOMEM;
-		ret = shmem_comp_compress(zc->pool, src, PAGE_SIZE, cbuf,
-					  &len_bytes);
-		if (ret)
-			len_bytes = PAGE_SIZE;	/* -ENOSPC: store raw */
-		else
-			data = cbuf;
+		/* compress + store in one step; the compression output lives
+		 * in the pool's per-CPU buffer -- no per-block kmalloc. */
+		handle = shmem_comp_compress_store(zc->pool, src, PAGE_SIZE,
+						   &len_bytes);
+	} else {
+		handle = shmem_comp_store(zc->pool, src, PAGE_SIZE);
+		len_bytes = PAGE_SIZE;
 	}
-
-	handle = shmem_comp_store(zc->pool, data, len_bytes);
-	if (!handle) {
-		kfree(cbuf);
+	if (!handle)
 		return -ENOMEM;
-	}
 
 	ent = shmem_comp_entry_alloc_local(zc->pool, handle, len_bytes);
 	if (!ent) {
 		shmem_comp_free(zc->pool, handle);
-		kfree(cbuf);
 		return -ENOMEM;
 	}
-	kfree(cbuf);
 
 	/* Atomic replace-and-return-old (no xa_exchange).  The new
 	 * entry's slot ref is now owned by the table; the old entry's

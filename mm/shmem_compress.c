@@ -125,6 +125,14 @@ struct shmem_comp_pcpu {
 	struct acomp_req *req;		/* compression request */
 	struct crypto_wait wait;	/* async wait queue */
 	struct mutex lock;		/* protects req usage */
+	/*
+	 * Compression output buffer (PAGE_SIZE).  Owned by this CPU's
+	 * context and used by shmem_comp_compress_store() under @lock, so
+	 * there is no per-call kmalloc for the compression output: the
+	 * buffer stays valid across compress+store because the lock is held
+	 * until the store's memcpy has read it.
+	 */
+	u8 *outbuf;
 };
 
 /*
@@ -321,6 +329,16 @@ static int shmem_comp_pcpu_init(struct shmem_comp_pcpu *pcpu,
 	/* Initialize crypto wait queue */
 	crypto_init_wait(&pcpu->wait);
 
+	/* Per-CPU compression output buffer (see shmem_comp_compress_store) */
+	pcpu->outbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!pcpu->outbuf) {
+		acomp_request_free(pcpu->req);
+		pcpu->req = NULL;
+		crypto_free_acomp(pcpu->acomp);
+		pcpu->acomp = NULL;
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 
@@ -332,6 +350,11 @@ static int shmem_comp_pcpu_init(struct shmem_comp_pcpu *pcpu,
  */
 static void shmem_comp_pcpu_free(struct shmem_comp_pcpu *pcpu)
 {
+	if (pcpu->outbuf) {
+		kfree(pcpu->outbuf);
+		pcpu->outbuf = NULL;
+	}
+
 	if (pcpu->req) {
 		acomp_request_free(pcpu->req);
 		pcpu->req = NULL;
@@ -741,6 +764,75 @@ int shmem_comp_decompress(struct shmem_comp_pool *pool,
 	mutex_unlock(&pcpu->lock);
 
 	return ret;
+}
+
+/*
+ * shmem_comp_compress_store - compress @src and store it, with no per-call
+ *                              kmalloc
+ * @pool: compression pool
+ * @src: source data (at most PAGE_SIZE -- single-page compression)
+ * @slen: source length in bytes
+ * @clen_out: optional out; the STORED length (compressed size, or @slen
+ *            when the block was stored raw because it did not compress)
+ *
+ * Compresses into the per-CPU @outbuf (held under pcpu->lock across both
+ * the compress and the store, so the buffer cannot be reused by another
+ * compress on this CPU mid-store).  Falls back to storing @src raw when
+ * compression does not reduce size.  Returns the store handle, or 0 on
+ * failure.
+ *
+ * Single-page only (slen <= PAGE_SIZE); a grouped/multi-page variant
+ * would need a larger per-CPU buffer.
+ */
+u64 shmem_comp_compress_store(struct shmem_comp_pool *pool,
+			      const void *src, unsigned int slen,
+			      unsigned int *clen_out)
+{
+	struct shmem_comp_pcpu *pcpu;
+	struct scatterlist input, output;
+	const void *data;
+	unsigned int clen;
+	u64 handle;
+	int ret;
+
+	if (!pool || !src || slen == 0 || slen > PAGE_SIZE)
+		return 0;
+
+	pcpu = this_cpu_ptr(pool->pcpu);
+	mutex_lock(&pcpu->lock);
+
+	/* compress src -> per-CPU outbuf; capacity is slen (a compressed
+	 * block never exceeds its input, else we store raw). */
+	sg_init_one(&input, src, slen);
+	sg_init_one(&output, pcpu->outbuf, slen);
+	acomp_request_set_params(pcpu->req, &input, &output, slen, slen);
+	ret = crypto_wait_req(crypto_acomp_compress(pcpu->req),
+			      &pcpu->wait);
+
+	if (!ret && pcpu->req->dlen < slen) {
+		clen = pcpu->req->dlen;
+		data = pcpu->outbuf;
+	} else {
+		if (ret) {
+			spin_lock(&shmem_comp_stats_lock);
+			shmem_comp_global_stats.compress_fails++;
+			spin_unlock(&shmem_comp_stats_lock);
+		}
+		/* incompressible or crypto failure: store raw */
+		clen = slen;
+		data = src;
+	}
+
+	/* Store while still holding pcpu->lock so @outbuf stays valid for
+	 * the store's memcpy.  (The cell path may sleep in alloc_pages;
+	 * holding a mutex across it is fine.) */
+	handle = shmem_comp_store(pool, data, clen);
+
+	mutex_unlock(&pcpu->lock);
+
+	if (clen_out)
+		*clen_out = clen;
+	return handle;
 }
 
 /*
