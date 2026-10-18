@@ -260,6 +260,20 @@ config ZCELL
 
 	  If unsure, say N.
 
+config ZCELL_DEBUG_BVEC
+	bool "zcell bvec-size instrumentation"
+	depends on ZCELL
+	default n
+	help
+	  Log the distribution of bio bvec sizes the zcell device receives
+	  on the swap-write path.  Answers whether the swap layer ever
+	  sends a multi-page bvec (bv_len > PAGE_SIZE) -- the folio-grouping
+	  signal that cross-page compression merging depends on.  On
+	  base-page swap (no mTHP/THP) every bvec is PAGE_SIZE and this
+	  reports multi=0.  Debug aid; adds a pr_info on the hot write path.
+
+	  If unsure, say N.
+
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT

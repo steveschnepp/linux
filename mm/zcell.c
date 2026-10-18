@@ -129,6 +129,13 @@ struct zcell {
 	atomic64_t		io_writes;
 	atomic64_t		failed_writes;
 	atomic64_t		discarded_blocks;
+#ifdef CONFIG_ZCELL_DEBUG_BVEC
+	/* bvec size distribution (verify folio-grouping signal) */
+	atomic64_t		bvec_total;
+	atomic64_t		bvec_multi;
+	u32			bvec_max;
+	bool			bvec_reported;
+#endif
 	struct mutex		io_lock;	/* serialises reset + sysfs */
 };
 
@@ -379,6 +386,26 @@ static void zcell_bio_write(struct zcell *zc, struct bio *bio)
 		void *mem = kmap_local_page(bv.bv_page) + bv.bv_offset;
 		unsigned long block_nr = zcell_block_of(sector);
 		int ret;
+
+#ifdef CONFIG_ZCELL_DEBUG_BVEC
+		/* bvec size distribution (verify the folio-grouping signal:
+		 * does swap ever send bv_len > PAGE_SIZE?) */
+		atomic64_inc(&zc->bvec_total);
+		if (bv.bv_len > PAGE_SIZE) {
+			atomic64_inc(&zc->bvec_multi);
+			if (bv.bv_len > zc->bvec_max)
+				zc->bvec_max = bv.bv_len;
+			if (!zc->bvec_reported) {
+				zc->bvec_reported = true;
+				pr_info("zcell: MULTI-PAGE bvec first block=%lu bv_len=%u (folio-grouping signal)\n",
+					block_nr, bv.bv_len);
+			}
+		}
+		if ((atomic64_read(&zc->bvec_total) & 0xffff) == 0)
+			pr_info("zcell: bvec stats total=%lld multi=%lld max=%u\n",
+				atomic64_read(&zc->bvec_total),
+				atomic64_read(&zc->bvec_multi), zc->bvec_max);
+#endif
 
 		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
 			ret = zcell_write_block(zc, block_nr, mem);
