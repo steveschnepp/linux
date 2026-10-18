@@ -2232,6 +2232,13 @@ static unsigned int shmem_comp_default_wm_low = 50;	/* Stage 5 flip
 							 * (watermark_seen). */
 static unsigned int shmem_comp_default_wm_high = 70;
 
+/* Aging / GC cadence defaults (sysfs RW; mount options override). */
+static unsigned int shmem_comp_default_age_delay_ms = SHMEM_COMP_AGE_DELAY_MS;
+static unsigned int shmem_comp_default_age_budget = SHMEM_COMP_AGE_BUDGET;
+static unsigned int shmem_comp_default_age_rounds = SHMEM_COMP_AGE_MAX_ROUNDS;
+static unsigned int shmem_comp_default_age_batch = SHMEM_COMP_AGE_BATCH_INODES;
+static unsigned int shmem_comp_default_gc_debounce_ms = SHMEM_COMP_CELL_GC_DEBOUNCE_MS;
+
 static const char *shmem_comp_off_reason_str(enum shmem_comp_off_reason reason)
 {
 	switch (reason) {
@@ -2423,6 +2430,21 @@ static void shmem_comp_default_watermark_get(unsigned int *low,
 	mutex_unlock(&shmem_comp_defaults_lock);
 }
 
+static void shmem_comp_cadence_defaults_get(unsigned int *delay,
+					    unsigned int *budget,
+					    unsigned int *rounds,
+					    unsigned int *batch,
+					    unsigned int *debounce)
+{
+	mutex_lock(&shmem_comp_defaults_lock);
+	*delay = shmem_comp_default_age_delay_ms;
+	*budget = shmem_comp_default_age_budget;
+	*rounds = shmem_comp_default_age_rounds;
+	*batch = shmem_comp_default_age_batch;
+	*debounce = shmem_comp_default_gc_debounce_ms;
+	mutex_unlock(&shmem_comp_defaults_lock);
+}
+
 static inline struct shmem_sb_info *shmem_comp_get_sb(struct super_block *sb)
 {
 	return sb->s_fs_info;
@@ -2458,11 +2480,15 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	enum shmem_comp_off_reason reason = opts->off_reason;
 	struct shmem_comp_sb *comp;
 	unsigned int wm_low, wm_high;
+	unsigned int cad_delay, cad_budget, cad_rounds, cad_batch, cad_debounce;
 	char *algo;
 	unsigned int cell_order;
 	unsigned int nr_cells;
 
 	sbinfo->comp = NULL;
+
+	shmem_comp_cadence_defaults_get(&cad_delay, &cad_budget, &cad_rounds,
+					  &cad_batch, &cad_debounce);
 
 	if (opts->watermark_seen) {
 		wm_low = opts->watermark_low;
@@ -2567,8 +2593,7 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells,
 					   opts->gc_percent,
 					   opts->gc_debounce_seen ?
-					   opts->gc_debounce_ms :
-					   SHMEM_COMP_CELL_GC_DEBOUNCE_MS);
+					   opts->gc_debounce_ms : cad_debounce);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");
@@ -2589,13 +2614,13 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	comp->merge_pages = opts->merge_pages ?:
 		      (shmem_comp_default_merge_get() ?: 1);
 	comp->age_delay_ms = opts->age_delay_seen ? opts->age_delay_ms :
-			     SHMEM_COMP_AGE_DELAY_MS;
+			     cad_delay;
 	comp->age_budget = opts->age_budget_seen ? opts->age_budget :
-			   SHMEM_COMP_AGE_BUDGET;
+			   cad_budget;
 	comp->age_rounds = opts->age_rounds_seen ? opts->age_rounds :
-			   SHMEM_COMP_AGE_MAX_ROUNDS;
+			   cad_rounds;
 	comp->age_batch = opts->age_batch_seen ? opts->age_batch :
-			  SHMEM_COMP_AGE_BATCH_INODES;
+			  cad_batch;
 	atomic_long_set(&comp->pages, 0);
 	atomic_long_set(&comp->bytes, 0);
 	/* Stage 2: deferred-compression policy state */
@@ -3033,6 +3058,77 @@ static struct kobj_attribute compress_watermark_attr =
 	__ATTR(compress_watermark, 0644, compress_watermark_show,
 	       compress_watermark_store);
 
+/* Aging / GC cadence defaults (RW, same pattern as merge_pages). */
+static int shmem_comp_def_show_uint(char *buf, unsigned int *src)
+{
+	int ret;
+
+	mutex_lock(&shmem_comp_defaults_lock);
+	ret = sysfs_emit(buf, "%u\n", *src);
+	mutex_unlock(&shmem_comp_defaults_lock);
+	return ret;
+}
+
+static int shmem_comp_def_store_uint(const char *buf, unsigned int min,
+				     unsigned int max, unsigned int *dst,
+				     const char *name)
+{
+	unsigned int v;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &v);
+	if (ret)
+		return ret;
+	if (v < min || v > max)
+		return -EINVAL;
+	mutex_lock(&shmem_comp_defaults_lock);
+	*dst = v;
+	mutex_unlock(&shmem_comp_defaults_lock);
+	pr_info("tmpfs: default %s set to %u\n", name, v);
+	return 0;
+}
+
+#define SHMEM_COMP_CADENCE_SHOW(fn, var) \
+static ssize_t fn##_show(struct kobject *kobj, \
+			 struct kobj_attribute *attr, char *buf) \
+{ return shmem_comp_def_show_uint(buf, &var); }
+
+#define SHMEM_COMP_CADENCE_STORE(fn, var, min, max, name) \
+static ssize_t fn##_store(struct kobject *kobj, \
+			  struct kobj_attribute *attr, \
+			  const char *buf, size_t count) \
+{ \
+	int ret = shmem_comp_def_store_uint(buf, min, max, &var, name); \
+	return ret ? ret : (ssize_t)count; \
+}
+
+SHMEM_COMP_CADENCE_SHOW(age_delay, shmem_comp_default_age_delay_ms)
+SHMEM_COMP_CADENCE_STORE(age_delay, shmem_comp_default_age_delay_ms,
+			 1, 60000, "age_delay_ms")
+SHMEM_COMP_CADENCE_SHOW(age_budget, shmem_comp_default_age_budget)
+SHMEM_COMP_CADENCE_STORE(age_budget, shmem_comp_default_age_budget,
+			 1, 65536, "age_budget")
+SHMEM_COMP_CADENCE_SHOW(age_rounds, shmem_comp_default_age_rounds)
+SHMEM_COMP_CADENCE_STORE(age_rounds, shmem_comp_default_age_rounds,
+			 1, 64, "age_rounds")
+SHMEM_COMP_CADENCE_SHOW(age_batch, shmem_comp_default_age_batch)
+SHMEM_COMP_CADENCE_STORE(age_batch, shmem_comp_default_age_batch,
+			 1, SHMEM_COMP_AGE_BATCH_INODES, "age_batch")
+SHMEM_COMP_CADENCE_SHOW(gc_debounce, shmem_comp_default_gc_debounce_ms)
+SHMEM_COMP_CADENCE_STORE(gc_debounce, shmem_comp_default_gc_debounce_ms,
+			 0, 60000, "gc_debounce_ms")
+
+static struct kobj_attribute age_delay_attr =
+	__ATTR(age_delay_ms, 0644, age_delay_show, age_delay_store);
+static struct kobj_attribute age_budget_attr =
+	__ATTR(age_budget, 0644, age_budget_show, age_budget_store);
+static struct kobj_attribute age_rounds_attr =
+	__ATTR(age_rounds, 0644, age_rounds_show, age_rounds_store);
+static struct kobj_attribute age_batch_attr =
+	__ATTR(age_batch, 0644, age_batch_show, age_batch_store);
+static struct kobj_attribute gc_debounce_attr =
+	__ATTR(gc_debounce_ms, 0644, gc_debounce_show, gc_debounce_store);
+
 /*
  * Per-mount counters.  comp_stats above aggregates every pool, so on a
  * boot with several compressed mounts it cannot attribute anything to
@@ -3141,6 +3237,11 @@ static struct attribute *tmpfs_comp_attrs[] = {
 	&compressor_attr.attr,
 	&merge_pages_attr.attr,
 	&compress_watermark_attr.attr,
+	&age_delay_attr.attr,
+	&age_budget_attr.attr,
+	&age_rounds_attr.attr,
+	&age_batch_attr.attr,
+	&gc_debounce_attr.attr,
 	&comp_stats_attr.attr,
 	&mount_stats_attr.attr,
 	&cell_stats_attr.attr,
