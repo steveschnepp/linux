@@ -136,6 +136,13 @@ struct zcell {
 	u32			bvec_max;
 	bool			bvec_reported;
 #endif
+#ifdef CONFIG_ZCELL_DEBUG_GROUPWIN
+	/* swap-grouping window state (~5ms batch ratio A/B) */
+	spinlock_t		gw_lock;
+	u8			*gw_buf;
+	u32			gw_nr;
+	u64			gw_t0_ns;
+#endif
 	struct mutex		io_lock;	/* serialises reset + sysfs */
 };
 
@@ -376,6 +383,83 @@ static void zcell_bio_read(struct zcell *zc, struct bio *bio)
 	}
 }
 
+#ifdef CONFIG_ZCELL_DEBUG_GROUPWIN
+#define GW_MAX		128U
+#define GW_WINDOW_NS	5000000ULL	/* 5 ms */
+
+/* Close a window of @n swapped-out pages: compress each individually
+ * (the ratio-1 baseline) vs the whole window as one block (what async
+ * staging grouping would achieve).  Report the ratio win. */
+static void zcell_gw_close(struct zcell *zc, u32 n, u8 *win)
+{
+	unsigned int indiv = 0, glen;
+	u8 *cbuf;
+	u32 i;
+
+	if (n < 2)
+		return;
+	cbuf = kmalloc((size_t)n * PAGE_SIZE, GFP_NOIO);
+	if (!cbuf)
+		return;
+	for (i = 0; i < n; i++) {
+		unsigned int cl = (unsigned int)n * PAGE_SIZE;
+
+		if (shmem_comp_compress(zc->pool, win + (size_t)i * PAGE_SIZE,
+					PAGE_SIZE, cbuf, &cl) == 0)
+			indiv += cl;
+		else
+			indiv += PAGE_SIZE;	/* incompressible */
+	}
+	glen = (unsigned int)n * PAGE_SIZE;
+	if (shmem_comp_compress(zc->pool, win, (unsigned int)n * PAGE_SIZE,
+				cbuf, &glen) != 0)
+		glen = (unsigned int)n * PAGE_SIZE;
+	pr_info("zcell: gw window n=%u indiv=%u grouped=%u win=%d%%\n",
+		n, indiv, glen,
+		indiv ? (int)((long)(indiv - glen) * 100 / (long)indiv) : 0);
+	kfree(cbuf);
+}
+
+/* Buffer one swapped-out page; close+report the window when full or the
+ * ~5ms window elapses.  Best-effort debug (window boundary races are
+ * harmless for the ratio trend). */
+static void zcell_gw_add(struct zcell *zc, const u8 *page, u64 now_ns)
+{
+	u8 *win;
+	u32 n;
+
+	spin_lock(&zc->gw_lock);
+	if (!zc->gw_buf) {
+		spin_unlock(&zc->gw_lock);
+		zc->gw_buf = kmalloc((size_t)GW_MAX * PAGE_SIZE, GFP_NOIO);
+		spin_lock(&zc->gw_lock);
+		if (!zc->gw_buf) {
+			spin_unlock(&zc->gw_lock);
+			return;
+		}
+	}
+	if (zc->gw_nr == 0)
+		zc->gw_t0_ns = now_ns;
+	if (zc->gw_nr < GW_MAX) {
+		memcpy(zc->gw_buf + (size_t)zc->gw_nr * PAGE_SIZE, page,
+		       PAGE_SIZE);
+		zc->gw_nr++;
+	}
+	if (zc->gw_nr >= GW_MAX ||
+	    now_ns - zc->gw_t0_ns > GW_WINDOW_NS) {
+		win = zc->gw_buf;
+		n = zc->gw_nr;
+		zc->gw_buf = NULL;	/* next window reallocs */
+		zc->gw_nr = 0;
+		spin_unlock(&zc->gw_lock);
+		zcell_gw_close(zc, n, win);
+		kfree(win);
+		return;
+	}
+	spin_unlock(&zc->gw_lock);
+}
+#endif
+
 static void zcell_bio_write(struct zcell *zc, struct bio *bio)
 {
 	struct bvec_iter iter;
@@ -407,8 +491,12 @@ static void zcell_bio_write(struct zcell *zc, struct bio *bio)
 				atomic64_read(&zc->bvec_multi), zc->bvec_max);
 #endif
 
-		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE)
+		if (bv.bv_offset == 0 && bv.bv_len == PAGE_SIZE) {
+#ifdef CONFIG_ZCELL_DEBUG_GROUPWIN
+			zcell_gw_add(zc, mem, ktime_get_ns());
+#endif
 			ret = zcell_write_block(zc, block_nr, mem);
+		}
 		else {
 			void *tmp = kmalloc(PAGE_SIZE, GFP_NOIO);
 
@@ -760,6 +848,9 @@ static int zcell_add(int id)
 		return -ENOMEM;
 
 	mutex_init(&zc->io_lock);
+#ifdef CONFIG_ZCELL_DEBUG_GROUPWIN
+	spin_lock_init(&zc->gw_lock);
+#endif
 	strscpy(zc->algo, "lz4", sizeof(zc->algo));
 	zc->compressed = true;
 
@@ -806,6 +897,9 @@ static void zcell_remove(struct zcell *zc)
 
 	device_del(disk_to_dev(zc->disk));
 	put_disk(zc->disk);
+#ifdef CONFIG_ZCELL_DEBUG_GROUPWIN
+	kfree(zc->gw_buf);
+#endif
 	kfree(zc);
 }
 

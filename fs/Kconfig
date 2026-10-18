@@ -274,6 +274,23 @@ config ZCELL_DEBUG_BVEC
 
 	  If unsure, say N.
 
+config ZCELL_DEBUG_GROUPWIN
+	bool "zcell swap-grouping window measurement"
+	depends on ZCELL
+	default n
+	help
+	  Measure whether staging swapped-out pages for ~5ms and
+	  compressing them as ONE block beats per-page compression (the
+	  ratio-1 baseline).  Buffers a ~5ms / 128-page window of
+	  swap-out writes, compresses each page individually vs the whole
+	  window as one block, and logs the ratio win per window.  This is
+	  the empirical question behind async swap-out staging: if the win
+	  is ~0 (base-page swap slots carry no memory adjacency), grouping
+	  buys nothing; if it is large, async staging is worth building.
+	  Debug aid; heavy (N+1 compressions per window) and best-effort.
+
+	  If unsure, say N.
+
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT
