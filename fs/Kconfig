@@ -242,55 +242,6 @@ config TMPFS_COMPRESSOR_DEFAULT
 	  This can be changed at runtime via /sys/fs/tmpfs/compressor or
 	  per-mount via the compress= mount option.
 
-config ZCELL
-	bool "Cell-backed compressed RAM block device"
-	depends on BLOCK && TMPFS_COMPRESSION
-	help
-	  A zram-style compressed-RAM block device whose storage backend is
-	  the tmpfs compression engine on the cell allocator (not zsmalloc).
-	  Intended for use as swap on RAM-constrained systems: the cell
-	  allocator's zero per-object metadata and synchronous whole-cell
-	  return to the buddy hold more compressed data per RAM byte than
-	  zram's zsmalloc pools.
-
-	  The device is a thin frontend; compression, storage, the cell
-	  garbage collector, the shrinker and the watermark are all reused
-	  from the shmem_comp engine.  Create /dev/zcellN, then mkswap and
-	  swapon it like zram.
-
-	  If unsure, say N.
-
-config ZCELL_DEBUG_BVEC
-	bool "zcell bvec-size instrumentation"
-	depends on ZCELL
-	default n
-	help
-	  Log the distribution of bio bvec sizes the zcell device receives
-	  on the swap-write path.  Answers whether the swap layer ever
-	  sends a multi-page bvec (bv_len > PAGE_SIZE) -- the folio-grouping
-	  signal that cross-page compression merging depends on.  On
-	  base-page swap (no mTHP/THP) every bvec is PAGE_SIZE and this
-	  reports multi=0.  Debug aid; adds a pr_info on the hot write path.
-
-	  If unsure, say N.
-
-config ZCELL_DEBUG_GROUPWIN
-	bool "zcell swap-grouping window measurement"
-	depends on ZCELL
-	default n
-	help
-	  Measure whether staging swapped-out pages for ~5ms and
-	  compressing them as ONE block beats per-page compression (the
-	  ratio-1 baseline).  Buffers a ~5ms / 128-page window of
-	  swap-out writes, compresses each page individually vs the whole
-	  window as one block, and logs the ratio win per window.  This is
-	  the empirical question behind async swap-out staging: if the win
-	  is ~0 (base-page swap slots carry no memory adjacency), grouping
-	  buys nothing; if it is large, async staging is worth building.
-	  Debug aid; heavy (N+1 compressions per window) and best-effort.
-
-	  If unsure, say N.
-
 config TMPFS_INODE64
 	bool "Use 64-bit ino_t by default in tmpfs"
 	depends on TMPFS && 64BIT

@@ -599,19 +599,6 @@ void shmem_comp_loc_dispose(struct shmem_comp_pool *pool,
 void shmem_comp_loc_pin_put(struct shmem_comp_pool *pool,
 			    struct shmem_comp_loc_node *node);
 
-/*
- * Let a frontend own the refs==0 teardown of its own nodes.  A pool
- * whose reverse index holds bare loc nodes (not engine entries) sets
- * this; the GC drain then drops its pin through the frontend's put
- * (which releases the node's storage and unlinks it) instead of
- * shmem_comp_entry_put() on a container_of that would not be an
- * entry.  Set once, right after pool creation.
- */
-void shmem_comp_pool_set_node_put(struct shmem_comp_pool *pool,
-				  void (*fn)(void *,
-					     struct shmem_comp_loc_node *),
-				  void *priv);
-
 /* Debug hook: run one async GC pass on every cell-backed pool. */
 void shmem_comp_cell_gc_all(void);
 

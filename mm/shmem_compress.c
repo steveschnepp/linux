@@ -219,16 +219,6 @@ struct shmem_comp_pool {
 	 */
 	struct list_head *cell_index;
 	spinlock_t index_lock;
-	/*
-	 * Frontend teardown hook for bare loc nodes (block-device table
-	 * slots): set via shmem_comp_pool_set_node_put() when the
-	 * reverse index holds frontend-owned loc nodes instead of engine
-	 * entries; the GC drain drops its pin through this, so the
-	 * refs==0 teardown runs frontend code.  NULL for entry pools
-	 * (the drain uses shmem_comp_entry_put()).
-	 */
-	void (*node_put)(void *priv, struct shmem_comp_loc_node *node);
-	void *node_priv;
 	struct list_head list;			/* global pools list */
 	/*
 	 * Demand-triggered cell GC (per pool: device, tmpfs mount, ...).
@@ -1328,29 +1318,15 @@ void shmem_comp_loc_dispose(struct shmem_comp_pool *pool,
  * @pool: pool the node belongs to
  * @node: node the caller pinned (atomic_inc_not_zero on loc.refs)
  *
- * The refs==0 teardown dispatches to the node's owner: a frontend
- * hook when set (bare table-slot nodes), the entry free path
- * otherwise (an entry pool's reverse index holds entries' embedded
- * loc nodes).
+ * The refs==0 teardown runs the entry free path: an entry pool's
+ * reverse index holds entries' embedded loc nodes, so the node always
+ * belongs to an entry.
  */
 void shmem_comp_loc_pin_put(struct shmem_comp_pool *pool,
 			    struct shmem_comp_loc_node *node)
 {
-	if (pool->node_put) {
-		pool->node_put(pool->node_priv, node);
-		return;
-	}
 	shmem_comp_entry_put(container_of(node, struct shmem_comp_entry,
 					  loc));
-}
-
-void shmem_comp_pool_set_node_put(struct shmem_comp_pool *pool,
-				  void (*fn)(void *,
-					     struct shmem_comp_loc_node *),
-				  void *priv)
-{
-	pool->node_put = fn;
-	pool->node_priv = priv;
 }
 
 static void shmem_comp_entry_free(struct shmem_comp_entry *ent)
