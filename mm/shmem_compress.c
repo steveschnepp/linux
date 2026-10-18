@@ -97,6 +97,7 @@
 
 /* GC implementation lives after the entry table (needs the xarray) */
 static void shmem_comp_cell_gc(struct shmem_comp_pool *pool);
+static void shmem_comp_pool_gc_work(struct work_struct *work);
 static int shmem_comp_entries_set(struct inode *inode, pgoff_t index,
 				  struct shmem_comp_entry *ent);
 static unsigned int shmem_comp_invalidate_index(struct inode *inode,
@@ -229,6 +230,13 @@ struct shmem_comp_pool {
 	void (*node_put)(void *priv, struct shmem_comp_loc_node *node);
 	void *node_priv;
 	struct list_head list;			/* global pools list */
+	/*
+	 * Demand-triggered cell GC (per pool: device, tmpfs mount, ...).
+	 * Armed from the cell-object free path (loc_dispose); coalescing +
+	 * debounced so a burst of frees merges into one evacuation pass.
+	 * Replaces the fixed 1 Hz GC cadence.  Cancelled in pool_destroy().
+	 */
+	struct delayed_work cell_gc_work;
 };
 
 /* Global list of all compression pools */
@@ -270,6 +278,16 @@ static atomic_long_t shmem_comp_skipped_dead;
 #define SHMEM_COMP_AGE_BATCH_INODES	64U	/* inodes pinned per pass */
 #define SHMEM_COMP_AGE_DELAY_MS		1000U	/* armed-work delay */
 #define SHMEM_COMP_AGE_MAX_ROUNDS	4U	/* rounds per pass (~2 MiB) */
+/*
+ * Demand-triggered cell-GC debounce: a burst of N cell-object frees
+ * within this window merges into ONE evacuation pass (schedule_delayed_
+ * work is a no-op if already pending).  Leading-edge: fires this long
+ * after the FIRST free, so a sustained free stream cannot starve GC.
+ * A few ms easily beats the OOM killer (which fires only after reclaim
+ * has failed) -- the race the fixed 1 Hz cadence and the shrinker both
+ * lost under a tight-RAM OOM scenario.
+ */
+#define SHMEM_COMP_CELL_GC_DEBOUNCE_MS	20U
 
 /* gc_percent= mount option: clamped range and default */
 #define SHMEM_COMP_GC_PERCENT_MIN	10U
@@ -452,6 +470,9 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 	/* Initialize refcount */
 	atomic_set(&pool->refcount, 1);
 
+	/* Per-pool demand-triggered cell GC (armed from loc_dispose). */
+	INIT_DELAYED_WORK(&pool->cell_gc_work, shmem_comp_pool_gc_work);
+
 	/* Cell storage: no zsmalloc pool needed */
 	if (cell_order > 0) {
 		pool->cells = cell_pool_create(cell_order, cell_order >= 4,
@@ -587,6 +608,11 @@ void shmem_comp_pool_destroy(struct shmem_comp_pool *pool)
 	spin_lock(&shmem_comp_pools_lock);
 	list_del(&pool->list);
 	spin_unlock(&shmem_comp_pools_lock);
+
+	/* Stop any queued/running demand GC before teardown.  The armer
+	 * (loc_dispose) only runs while the pool is alive, so after this
+	 * no work can touch the pool. */
+	cancel_delayed_work_sync(&pool->cell_gc_work);
 
 	/* Free per-CPU contexts */
 	if (pool->pcpu) {
@@ -1195,6 +1221,52 @@ void shmem_comp_loc_link(struct shmem_comp_pool *pool,
 }
 
 /*
+ * Per-pool demand-triggered cell GC.
+ *
+ * Replaces the fixed 1 Hz GC cadence: the pool's cell evacuation runs
+ * on demand, armed from the cell-object free path (loc_dispose -- the
+ * unified choke point for both the device table slots and tmpfs
+ * entries, so one worker covers device, tmpfs mount, and anything else
+ * with a cell pool).  Coalescing + debounced: schedule_delayed_work()
+ * is a no-op if already pending, so a burst of N frees within the
+ * debounce window merges into ONE evacuation pass.  Leading-edge (fires
+ * DEBOUNCE_MS after the FIRST free) so a sustained free stream cannot
+ * starve GC.  Bounded latency (a few ms) beats the OOM killer, which
+ * fires only after reclaim has already failed -- the race the fixed
+ * 1 Hz cadence and the shrinker both lost under a tight-RAM OOM
+ * scenario (zcell failed to re-extend RAM on a second alloc wave).
+ *
+ * Runs in kworker context (process; GFP_KERNEL in cell_relocate_one is
+ * honest here, unlike a shrinker -- which is why the shrinker only
+ * arms work and never GCs under fs_reclaim).  Lifetime: pool_destroy()
+ * calls cancel_delayed_work_sync(), and the armer only runs while the
+ * pool is alive (a live node is being disposed), so no work can run on
+ * a freed pool.
+ */
+static void shmem_comp_pool_gc_work(struct work_struct *work)
+{
+	struct shmem_comp_pool *pool;
+
+	pool = container_of(to_delayed_work(work), struct shmem_comp_pool,
+			    cell_gc_work);
+	if (!pool->cells)
+		return;
+	mutex_lock(&pool->cells->gc_lock);
+	shmem_comp_cell_gc(pool);
+	mutex_unlock(&pool->cells->gc_lock);
+}
+
+/* Arm (or coalesce onto) the pool's cell GC.  Atomic-safe: only queues
+ * work.  Called from loc_dispose on every cell-object free. */
+static void shmem_comp_pool_arm_gc(struct shmem_comp_pool *pool)
+{
+	if (!pool || !pool->use_cells)
+		return;
+	schedule_delayed_work(&pool->cell_gc_work,
+			      msecs_to_jiffies(SHMEM_COMP_CELL_GC_DEBOUNCE_MS));
+}
+
+/*
  * shmem_comp_loc_dispose - unlink a dead node and release its storage
  * @pool: pool that owns the storage
  * @node: node at refs==0; the caller owns the last reference
@@ -1237,6 +1309,14 @@ void shmem_comp_loc_dispose(struct shmem_comp_pool *pool,
 					      &cellid, &offset);
 			cell_free(pool->cells, cellid, offset,
 				  node->length);
+			/* A cell-object just went free: this may have made a
+			 * cell sparse.  Arm the pool's demand GC (coalescing +
+			 * debounced) so the partial cell is evacuated and
+			 * returned to the buddy promptly, without waiting for
+			 * the shrinker/OOM race.  Both the device and tmpfs
+			 * free paths funnel through here, so one armer covers
+			 * all cell pools. */
+			shmem_comp_pool_arm_gc(pool);
 		} else {
 			shmem_comp_free(pool, node->handle);
 		}
@@ -4507,11 +4587,11 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 			atomic_long_add(aged, &comp->aged_pages);
 			atomic_long_add(aged, &shmem_comp_aged_pages);
 		}
-		/* ~4:1 alternation: one GC batch per round of aging --
-		 * compression raises cell density, which is what makes
-		 * the next GC cheaper */
-		if (comp->pool->use_cells)
-			shmem_comp_cell_gc(comp->pool);
+		/* Cell GC moved off the fixed 1 Hz cadence: it is now a
+		 * per-pool demand-triggered worker armed from the free path
+		 * (see shmem_comp_pool_arm_gc).  This pass keeps only the
+		 * mount-specific page aging (compressing uncompressed
+		 * survivors), which is not tied to cell frees. */
 		if (budget) {
 			/* candidates exhausted within the budget: done */
 			break;
