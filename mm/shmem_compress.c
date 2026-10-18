@@ -3551,6 +3551,15 @@ static int shmem_comp_compress_chunk(struct inode *inode, pgoff_t head,
 		 * cache).  One entry pointer covers the whole group. */
 		shmem_comp_entries_set(inode, folios[i]->index, ent);
 		folio_unlock(folios[i]);
+		/* The folio just left the page cache: drain lock waiters the
+		 * PG_waiters fast path can skip (entry-race lost-wakeup fix,
+		 * with the single-page drain in shmem_comp_compress_one).  The
+		 * group swap-out path was missing it: a concurrent reader that
+		 * cache-hit this folio and slept in folio_lock() could have its
+		 * wake skipped, and since the folio is out of i_pages no later
+		 * lock/unlock is guaranteed to wake it -- a lost wakeup that
+		 * hangs the reader (observed as the trres Phase-B merge=8 hang). */
+		wake_up_folio_waiters(folios[i]);
 		folio_put(folios[i]);
 	}
 
