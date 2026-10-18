@@ -3183,6 +3183,55 @@ static ssize_t mount_stats_show(struct kobject *kobj,
 }
 static struct kobj_attribute mount_stats_attr = __ATTR_RO(mount_stats);
 
+/*
+ * mount_options - the whole resolved option set, one line per mount
+ *
+ * Complements mount_stats (live state) with pure config: reconstructs
+ * the effective mount options for every compressed mount, so a reader
+ * sees exactly what each mount is using.  Keyed dev=MAJOR:MINOR (same
+ * as mount_stats); map to a path via /proc/self/mountinfo if needed.
+ * Only compressed mounts appear (a mount forced off has no comp).
+ * Truncation guard stops cleanly before the single-page sysfs buffer
+ * fills.
+ */
+static ssize_t mount_options_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct shmem_comp_sb *comp;
+	int len = 0;
+
+	mutex_lock(&shmem_comp_mounts_lock);
+	list_for_each_entry(comp, &shmem_comp_mounts, list) {
+		char line[384];
+		int n;
+
+		if (len >= (int)(PAGE_SIZE - sizeof(line)))
+			break;	/* truncation guard */
+		n = snprintf(line, sizeof(line),
+			     "dev=%u:%u compress=%s compress_threshold=%u "
+			     "compress_watermark=%u:%u merge_pages=%u "
+			     "cell=%u gc_percent=%u age_delay_ms=%u "
+			     "age_budget=%u age_rounds=%u age_batch=%u "
+			     "gc_debounce_ms=%u\n",
+			     MAJOR(comp->sb->s_dev), MINOR(comp->sb->s_dev),
+			     comp->compressor, comp->threshold_bytes,
+			     comp->watermark_low, comp->watermark_high,
+			     comp->merge_pages, comp->cell_order,
+			     comp->gc_percent, comp->age_delay_ms,
+			     comp->age_budget, comp->age_rounds,
+			     comp->age_batch, comp->pool->gc_debounce_ms);
+		if (n < 0)
+			break;
+		if (n >= (int)sizeof(line))
+			n = (int)sizeof(line) - 1;
+		len += sysfs_emit_at(buf, len, "%s", line);
+	}
+	mutex_unlock(&shmem_comp_mounts_lock);
+
+	return len;
+}
+static struct kobj_attribute mount_options_attr = __ATTR_RO(mount_options);
+
 static struct kobj_attribute comp_stats_attr = __ATTR_RO(comp_stats);
 
 static ssize_t cell_stats_show(struct kobject *kobj,
@@ -3244,6 +3293,7 @@ static struct attribute *tmpfs_comp_attrs[] = {
 	&gc_debounce_attr.attr,
 	&comp_stats_attr.attr,
 	&mount_stats_attr.attr,
+	&mount_options_attr.attr,
 	&cell_stats_attr.attr,
 	&gc_now_attr.attr,
 	NULL,
