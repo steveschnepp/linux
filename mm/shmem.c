@@ -4612,6 +4612,11 @@ enum shmem_param {
 	Opt_compress_merge,
 	Opt_cell,
 	Opt_gc_percent,
+	Opt_age_delay,
+	Opt_age_budget,
+	Opt_age_rounds,
+	Opt_age_batch,
+	Opt_gc_debounce,
 #endif
 	Opt_casefold_version,
 	Opt_casefold,
@@ -4655,6 +4660,11 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_string("compress_watermark", Opt_compress_watermark),
 	fsparam_string("cell", Opt_cell),
 	fsparam_string("gc_percent", Opt_gc_percent),
+	fsparam_u32   ("age_delay_ms", Opt_age_delay),
+	fsparam_u32   ("age_budget", Opt_age_budget),
+	fsparam_u32   ("age_rounds", Opt_age_rounds),
+	fsparam_u32   ("age_batch", Opt_age_batch),
+	fsparam_u32   ("gc_debounce_ms", Opt_gc_debounce),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -4905,6 +4915,41 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		if (shmem_comp_opts_set_gc_percent(&ctx->comp_opts,
 						   param->string))
 			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_age_delay:
+		if (result.uint_32 < 1 || result.uint_32 > 60000)
+			goto bad_value;
+		ctx->comp_opts.age_delay_ms = result.uint_32;
+		ctx->comp_opts.age_delay_seen = true;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_age_budget:
+		if (result.uint_32 < 1 || result.uint_32 > 65536)
+			goto bad_value;
+		ctx->comp_opts.age_budget = result.uint_32;
+		ctx->comp_opts.age_budget_seen = true;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_age_rounds:
+		if (result.uint_32 < 1 || result.uint_32 > 64)
+			goto bad_value;
+		ctx->comp_opts.age_rounds = result.uint_32;
+		ctx->comp_opts.age_rounds_seen = true;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_age_batch:
+		if (result.uint_32 < 1 || result.uint_32 > SHMEM_COMP_AGE_BATCH_INODES)
+			goto bad_value;
+		ctx->comp_opts.age_batch = result.uint_32;
+		ctx->comp_opts.age_batch_seen = true;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_gc_debounce:
+		if (result.uint_32 > 60000)
+			goto bad_value;
+		ctx->comp_opts.gc_debounce_ms = result.uint_32;
+		ctx->comp_opts.gc_debounce_seen = true;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 #endif

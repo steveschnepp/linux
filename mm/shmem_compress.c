@@ -177,6 +177,12 @@ struct shmem_comp_sb {
 					 * READ_ONCE on the write path */
 	bool wm_kick_spent;		/* one highwater kick per flip; reset at LOW */
 	struct delayed_work age_work;	/* per-mount maintenance pass */
+	/* Aging cadence tuning (mount-overridable; default = the header
+	 * SHMEM_COMP_AGE_* constants). */
+	unsigned int age_delay_ms;	/* aging-pass period */
+	unsigned int age_budget;	/* pages compressed per round */
+	unsigned int age_rounds;	/* rounds per pass */
+	unsigned int age_batch;		/* inodes pinned per pass */
 	struct list_head list;		/* on shmem_comp_mounts */
 	atomic_long_t aged_pages;	/* pages compressed by the aging pass */
 	atomic_long_t skipped_dead;	/* chilled pages freed without compression */
@@ -192,6 +198,7 @@ struct shmem_comp_pool {
 	struct shmem_comp_pcpu __percpu *pcpu;	/* per-CPU compression contexts */
 	char algo_name[CRYPTO_MAX_ALG_NAME];	/* algorithm name */
 	atomic_t refcount;			/* shared across mounts using this pool */
+	unsigned int gc_debounce_ms;	/* demand-GC debounce (mount-overridable) */
 	/*
 	 * Writes that ran out of directory slots and were saved by the
 	 * exhaustion GC pass.  A counter, not a gauge: it answers "how
@@ -264,20 +271,7 @@ static atomic_long_t shmem_comp_skipped_dead;
  * pass so a mount full of incompressible data cannot monopolize the
  * CPU; the batch bounds how many inodes are pinned at once.
  */
-#define SHMEM_COMP_AGE_BUDGET		128U	/* pages per round */
-#define SHMEM_COMP_AGE_BATCH_INODES	64U	/* inodes pinned per pass */
-#define SHMEM_COMP_AGE_DELAY_MS		1000U	/* armed-work delay */
-#define SHMEM_COMP_AGE_MAX_ROUNDS	4U	/* rounds per pass (~2 MiB) */
-/*
- * Demand-triggered cell-GC debounce: a burst of N cell-object frees
- * within this window merges into ONE evacuation pass (schedule_delayed_
- * work is a no-op if already pending).  Leading-edge: fires this long
- * after the FIRST free, so a sustained free stream cannot starve GC.
- * A few ms easily beats the OOM killer (which fires only after reclaim
- * has failed) -- the race the fixed 1 Hz cadence and the shrinker both
- * lost under a tight-RAM OOM scenario.
- */
-#define SHMEM_COMP_CELL_GC_DEBOUNCE_MS	20U
+/* Aging/GC cadence defaults moved to <linux/shmem_compress.h>. */
 
 /* gc_percent= mount option: clamped range and default */
 #define SHMEM_COMP_GC_PERCENT_MIN	10U
@@ -436,7 +430,8 @@ static void shmem_comp_pool_cells_teardown(struct shmem_comp_pool *pool)
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
 						unsigned int nr_cells,
-						unsigned int gc_percent)
+						unsigned int gc_percent,
+						unsigned int gc_debounce_ms)
 {
 	struct shmem_comp_pool *pool;
 	int cpu;
@@ -456,6 +451,7 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 
 	/* Store algorithm name */
 	strscpy(pool->algo_name, algo, sizeof(pool->algo_name));
+	pool->gc_debounce_ms = gc_debounce_ms;
 
 	/* Initialize refcount */
 	atomic_set(&pool->refcount, 1);
@@ -1253,7 +1249,7 @@ static void shmem_comp_pool_arm_gc(struct shmem_comp_pool *pool)
 	if (!pool || !pool->use_cells)
 		return;
 	schedule_delayed_work(&pool->cell_gc_work,
-			      msecs_to_jiffies(SHMEM_COMP_CELL_GC_DEBOUNCE_MS));
+			      msecs_to_jiffies(pool->gc_debounce_ms));
 }
 
 /*
@@ -2569,7 +2565,10 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	}
 
 	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells,
-					   opts->gc_percent);
+					   opts->gc_percent,
+					   opts->gc_debounce_seen ?
+					   opts->gc_debounce_ms :
+					   SHMEM_COMP_CELL_GC_DEBOUNCE_MS);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");
@@ -2589,6 +2588,14 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	comp->cell_order = cell_order;
 	comp->merge_pages = opts->merge_pages ?:
 		      (shmem_comp_default_merge_get() ?: 1);
+	comp->age_delay_ms = opts->age_delay_seen ? opts->age_delay_ms :
+			     SHMEM_COMP_AGE_DELAY_MS;
+	comp->age_budget = opts->age_budget_seen ? opts->age_budget :
+			   SHMEM_COMP_AGE_BUDGET;
+	comp->age_rounds = opts->age_rounds_seen ? opts->age_rounds :
+			   SHMEM_COMP_AGE_MAX_ROUNDS;
+	comp->age_batch = opts->age_batch_seen ? opts->age_batch :
+			  SHMEM_COMP_AGE_BATCH_INODES;
 	atomic_long_set(&comp->pages, 0);
 	atomic_long_set(&comp->bytes, 0);
 	/* Stage 2: deferred-compression policy state */
@@ -2609,10 +2616,12 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	sbinfo->comp = comp;
 
 	pr_info("tmpfs: compression on, algo=%s merge_pages=%u threshold=%u "
-		"cell_order=%u watermark=%u:%u gc_percent=%u\n",
+		"cell_order=%u watermark=%u:%u gc_percent=%u "
+		"age_delay=%ums age_budget=%u age_rounds=%u age_batch=%u\n",
 		comp->compressor, comp->merge_pages, comp->threshold_bytes,
 		comp->cell_order, comp->watermark_low, comp->watermark_high,
-		comp->gc_percent);
+		comp->gc_percent, comp->age_delay_ms, comp->age_budget,
+		comp->age_rounds, comp->age_batch);
 	return 0;
 }
 
@@ -4519,6 +4528,8 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 	struct super_block *sb = comp->sb;
 	struct inode *inode;
 	struct inode *batch[SHMEM_COMP_AGE_BATCH_INODES];
+	unsigned int batch_n = min_t(unsigned int, comp->age_batch,
+				     SHMEM_COMP_AGE_BATCH_INODES);
 	unsigned int nb = 0, i, r;
 	bool more = false;
 
@@ -4538,7 +4549,7 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 
 	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
-		if (nb >= SHMEM_COMP_AGE_BATCH_INODES)
+		if (nb >= batch_n)
 			break;
 		if (!shmem_mapping(inode->i_mapping))
 			continue;
@@ -4554,8 +4565,8 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 	}
 	spin_unlock(&sb->s_inode_list_lock);
 
-	for (r = 0; r < SHMEM_COMP_AGE_MAX_ROUNDS; r++) {
-		unsigned int budget = SHMEM_COMP_AGE_BUDGET;
+	for (r = 0; r < comp->age_rounds; r++) {
+		unsigned int budget = comp->age_budget;
 		unsigned int aged = shmem_comp_age_round(comp, batch, nb,
 							 &budget, hot);
 
@@ -4586,7 +4597,7 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
 	 * hang. */
 	if (more)
 		schedule_delayed_work(&comp->age_work,
-				      msecs_to_jiffies(SHMEM_COMP_AGE_DELAY_MS));
+				      msecs_to_jiffies(comp->age_delay_ms));
 }
 
 /*

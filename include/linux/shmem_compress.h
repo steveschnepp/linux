@@ -67,6 +67,13 @@ struct kobject;
  * disable compression for the mount.
  */
 #define SHMEM_COMP_MERGE_MAX	1024
+
+/* Aging / GC cadence defaults (also the mount-option validation bounds). */
+#define SHMEM_COMP_AGE_BUDGET		128U	/* pages per round */
+#define SHMEM_COMP_AGE_BATCH_INODES	64U	/* inodes pinned per pass (cap) */
+#define SHMEM_COMP_AGE_DELAY_MS		1000U	/* armed-work delay */
+#define SHMEM_COMP_AGE_MAX_ROUNDS	4U	/* rounds per pass (~2 MiB) */
+#define SHMEM_COMP_CELL_GC_DEBOUNCE_MS	20U	/* demand-GC debounce */
 #include <linux/xarray.h>
 #include <linux/zsmalloc.h>
 #include <crypto/acompress.h>
@@ -353,6 +360,17 @@ struct shmem_comp_opts {
 	unsigned int gc_percent;	/* cell GC sparse threshold, percent byte
 					 * utilization; 0 = default (50) */
 	bool gc_percent_seen;		/* gc_percent= given */
+	/* Aging / GC cadence tuning (0 / !seen = default). */
+	unsigned int age_delay_ms;	/* aging-pass period */
+	bool age_delay_seen;
+	unsigned int age_budget;	/* pages compressed per aging round */
+	bool age_budget_seen;
+	unsigned int age_rounds;	/* rounds per aging pass */
+	bool age_rounds_seen;
+	unsigned int age_batch;		/* inodes pinned per pass */
+	bool age_batch_seen;
+	unsigned int gc_debounce_ms;	/* demand-GC debounce */
+	bool gc_debounce_seen;
 };
 
 void shmem_comp_opts_init(struct shmem_comp_opts *opts);
@@ -536,7 +554,8 @@ void shmem_comp_sysfs_unregister(void);
 struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
 						unsigned int nr_cells,
-						unsigned int gc_percent);
+						unsigned int gc_percent,
+						unsigned int gc_debounce_ms);
 
 /**
  * shmem_comp_pool_destroy - Destroy a compression pool
