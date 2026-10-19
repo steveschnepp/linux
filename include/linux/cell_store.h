@@ -315,6 +315,14 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	      void *dst, unsigned int *len);
 
 /*
+ * Whole-cell disk swap (specs/07).  Swap up to @max cold, resident,
+ * non-active, non-sparse cells out to the backing (O_DIRECT).  A pool
+ * with no backing (cp->backing == NULL) is a no-op returning 0.  Called
+ * from the aging workqueue (process context, may sleep for I/O).
+ */
+unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
+
+/*
  * Async GC interface.  cell_free() only links sparse cells; the
  * evacuation pass (shmem_compress.c) uses these to move live
  * objects into the active cell and release the emptied victim.

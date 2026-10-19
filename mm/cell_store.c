@@ -21,6 +21,10 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/shrinker.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/uio.h>
+#include <linux/bitops.h>
 #include <linux/cell_store.h>
 
 #define cell_dbg(fmt, ...) \
@@ -43,6 +47,66 @@ static gfp_t cell_gfp(struct cell_pool *cp)
 			__GFP_COMP | __GFP_NOWARN;
 	return (GFP_KERNEL & ~(__GFP_HIGHMEM | __GFP_MOVABLE)) |
 		__GFP_NOWARN;
+}
+
+/*
+ * Whole-cell disk swap (specs/07): the backing extent allocator and the
+ * O_DIRECT whole-cell I/O.  Everything here is inert until the pool has
+ * a backing (cp->backing != NULL, set only when a swapfile= is
+ * configured); every caller guards on that, so a NULL backing is a
+ * byte-for-byte no-op.
+ */
+
+/* Carve one cell-sized extent out of the free map.  Bit set = free. */
+static bool cell_backing_alloc_extent(struct cell_backing *b, u64 *extent_out)
+{
+	u64 i;
+	bool ok = false;
+
+	mutex_lock(&b->map_lock);
+	for (i = 0; i < b->nr_extents; i++) {
+		if (test_bit(i, b->free_map)) {
+			clear_bit(i, b->free_map);
+			*extent_out = i;
+			ok = true;
+			break;
+		}
+	}
+	mutex_unlock(&b->map_lock);
+	return ok;
+}
+
+static void cell_backing_free_extent(struct cell_backing *b, u64 extent)
+{
+	if (!b || extent >= b->nr_extents)
+		return;
+	mutex_lock(&b->map_lock);
+	set_bit(extent, b->free_map);
+	mutex_unlock(&b->map_lock);
+}
+
+/* Raw O_DIRECT write of a whole resident cell to @extent. */
+static int cell_backing_write_cell(struct cell_pool *cp, struct cell *c,
+				   u64 extent)
+{
+	loff_t pos = extent * cp->backing->cell_size;
+	size_t len = cp->backing->cell_size;
+	ssize_t w;
+
+	w = kernel_write(cp->backing->filp, c->base, len, &pos);
+	return (w == (ssize_t)len) ? 0 : (w < 0 ? (int)w : -EIO);
+}
+
+/* Raw O_DIRECT read of a whole cell from @extent into @base. */
+static int cell_backing_read_cell(struct cell_pool *cp, struct cell *c,
+				  void *base, u64 extent)
+{
+	loff_t pos = extent * cp->backing->cell_size;
+	size_t len = cp->backing->cell_size;
+	ssize_t r;
+
+	r = kernel_read(cp->backing->filp, base, len, &pos);
+	return (r == (ssize_t)len) ? 0 : (r < 0 ? (int)r : -EIO);
 }
 
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
@@ -425,6 +489,63 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	up_read(&c->lock);
 }
 
+/*
+ * Swap an ON_DISK cell back into RAM (whole, raw).  Takes c->lock for
+ * write: that excludes concurrent cell_load readers and a GC eviction,
+ * and it is the serializer that collapses N concurrent loaders into one
+ * swap-in (the losers re-check state under the lock and find IN_RAM).
+ * The O_DIRECT read sleeps but never runs under cp->lock.
+ */
+static int cell_swap_in(struct cell_pool *cp, struct cell *c)
+{
+	struct cell_backing *b = cp->backing;
+	struct page *page;
+	void *base;
+	u64 extent;
+	int ret;
+
+	if (!b || !b->filp)
+		return -EINVAL;
+
+	down_write(&c->lock);
+	if (c->state == CELL_IN_RAM) {		/* lost the race; already in */
+		up_write(&c->lock);
+		return 0;
+	}
+	if (c->state != CELL_ON_DISK) {		/* free slot */
+		up_write(&c->lock);
+		return -EINVAL;
+	}
+
+	page = alloc_pages(cell_gfp(cp), cp->cell_order);
+	if (!page) {
+		up_write(&c->lock);
+		return -ENOMEM;
+	}
+	base = page_address(page);
+
+	ret = cell_backing_read_cell(cp, c, base, c->swap_extent);
+	if (ret) {
+		__free_pages(page, cp->cell_order);
+		up_write(&c->lock);
+		return ret;
+	}
+
+	spin_lock(&cp->lock);
+	c->pages[0] = page;
+	c->base = base;
+	c->state = CELL_IN_RAM;
+	extent = c->swap_extent;
+	c->swap_extent = 0;
+	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
+	spin_unlock(&cp->lock);
+
+	/* The disk slot's contents now live in RAM; recycle the extent. */
+	cell_backing_free_extent(b, extent);
+	up_write(&c->lock);
+	return 0;
+}
+
 int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	      void *dst, unsigned int *len)
 {
@@ -437,17 +558,28 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	c = &cp->cells[cellid];
 
 	/*
-	 * Take the read side of the cell rwsem so a GC evacuation
-	 * (down_write on the same cell) cannot return the pages to
-	 * the buddy while we memcpy from them.  Uncontended in the
-	 * common case: readers run in parallel; only eviction of
-	 * THIS cell excludes them.
+	 * Whole-cell swap-in loop: a cell found ON_DISK is paged back in
+	 * (whole, raw) and we retry.  c->state is stable under down_read
+	 * because only swap-in/swap-out mutate it and both take
+	 * down_write.  A concurrent swap-out could re-page the cell out
+	 * between our up_read and the next down_read, so this loops; it
+	 * terminates once the cell stays resident long enough to serve
+	 * the memcpy below (which holds down_read throughout).
 	 */
-	down_read(&c->lock);
-
-	if (!c->pages[0] || !c->base) {
+	for (;;) {
+		down_read(&c->lock);
+		if (c->state != CELL_ON_DISK) {
+			if (c->pages[0] && c->base)
+				break;	/* resident: serve below */
+			up_read(&c->lock);
+			return -EINVAL;	/* free slot */
+		}
 		up_read(&c->lock);
-		return -EINVAL;
+		{
+			int ret = cell_swap_in(cp, c);
+			if (ret)
+				return ret;
+		}
 	}
 
 	cell_size = (1UL << cp->cell_order) * PAGE_SIZE;
@@ -471,6 +603,83 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	cell_dbg("load: cell=%u offset=%u len=%u", cellid, offset, *len);
 
 	return 0;
+}
+
+/*
+ * Swap one resident cell out to the backing (whole, raw).  Takes
+ * c->lock for write so it cannot race a cell_load memcpy or a GC
+ * evacuation.  The state flips to ON_DISK (and the cell unlinks from the
+ * sparse list) BEFORE the I/O so a concurrent shrinker/GC sees it as
+ * on-disk and skips it.  On I/O failure the cell rolls back to resident.
+ * Process context only (sleeps on I/O): the aging workqueue, never the
+ * shrinker (reclaim context; I/O there risks recursion).
+ */
+static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
+{
+	struct cell_backing *b = cp->backing;
+	u64 extent;
+	int ret;
+
+	down_write(&c->lock);
+	spin_lock(&cp->lock);
+	if (c == cp->active || c->state != CELL_IN_RAM || !c->pages[0] ||
+	    c->live_bytes == 0) {
+		spin_unlock(&cp->lock);
+		up_write(&c->lock);
+		return -EBUSY;
+	}
+	if (!cell_backing_alloc_extent(b, &extent)) {
+		spin_unlock(&cp->lock);
+		up_write(&c->lock);
+		return -ENOSPC;
+	}
+	c->swap_extent = extent;
+	c->state = CELL_ON_DISK;
+	if (!list_empty(&c->node))
+		list_del_init(&c->node);
+	spin_unlock(&cp->lock);
+
+	/* c->base is valid and stable: we hold c->lock for write. */
+	ret = cell_backing_write_cell(cp, c, extent);
+	if (!ret) {
+		__free_pages(c->pages[0], cp->cell_order);
+		spin_lock(&cp->lock);
+		c->pages[0] = NULL;
+		c->base = NULL;
+		atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
+		spin_unlock(&cp->lock);
+	} else {
+		spin_lock(&cp->lock);
+		c->state = CELL_IN_RAM;
+		c->swap_extent = 0;
+		spin_unlock(&cp->lock);
+		cell_backing_free_extent(b, extent);
+	}
+	up_write(&c->lock);
+	return ret;
+}
+
+unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max)
+{
+	unsigned int n = 0;
+	u32 i;
+
+	if (!cp->backing || !cp->backing->filp)
+		return 0;
+
+	for (i = 0; i < cp->nr_cells && n < max; i++) {
+		struct cell *c = &cp->cells[i];
+
+		/* Selection is a heuristic (re-checked under lock in
+		 * cell_swap_out_one): resident, non-empty, non-sparse.  The
+		 * active cell and sparse cells (GC's job) are skipped. */
+		if (c->state != CELL_IN_RAM || c->live_bytes == 0 ||
+		    cell_is_sparse(cp, c->live_bytes))
+			continue;
+		if (cell_swap_out_one(cp, c) == 0)
+			n++;
+	}
+	return n;
 }
 
 /*
@@ -508,6 +717,11 @@ struct cell *cell_pool_pick_victim(struct cell_pool *cp)
 		 * every pass without ever emptying the cell.
 		 */
 		if (c == cp->active)
+			continue;
+		/* Never harvest an ON_DISK cell: it holds no RAM to reclaim
+		 * (swap-out already unlinked it from sparse; this is a
+		 * defensive skip for a cell freed->sparse while on disk). */
+		if (c->state == CELL_ON_DISK)
 			continue;
 		list_del_init(&c->node);
 		spin_unlock(&cp->lock);
