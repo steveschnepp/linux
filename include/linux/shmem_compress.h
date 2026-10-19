@@ -371,6 +371,10 @@ struct shmem_comp_opts {
 	bool age_batch_seen;
 	unsigned int gc_debounce_ms;	/* demand-GC debounce */
 	bool gc_debounce_seen;
+	/* Whole-cell disk swap backing (specs/07).  swapfile NULL = no
+	 * backing (cells stay resident).  swapsize 0 = the file's size. */
+	char *swapfile;			/* backing file path, owned */
+	unsigned long long swapsize_bytes;	/* backing size; 0 = file size */
 };
 
 void shmem_comp_opts_init(struct shmem_comp_opts *opts);
@@ -555,7 +559,9 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
 						unsigned int nr_cells,
 						unsigned int gc_percent,
-						unsigned int gc_debounce_ms);
+						unsigned int gc_debounce_ms,
+						const char *swapfile,
+						unsigned long long swapsize_bytes);
 
 /**
  * shmem_comp_pool_destroy - Destroy a compression pool

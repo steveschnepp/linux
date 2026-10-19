@@ -4617,6 +4617,8 @@ enum shmem_param {
 	Opt_age_rounds,
 	Opt_age_batch,
 	Opt_gc_debounce,
+	Opt_swapfile,
+	Opt_swapsize,
 #endif
 	Opt_casefold_version,
 	Opt_casefold,
@@ -4665,6 +4667,8 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_u32   ("age_rounds", Opt_age_rounds),
 	fsparam_u32   ("age_batch", Opt_age_batch),
 	fsparam_u32   ("gc_debounce_ms", Opt_gc_debounce),
+	fsparam_string("swapfile", Opt_swapfile),
+	fsparam_string("swapsize", Opt_swapsize),
 #endif
 	fsparam_string("casefold",	Opt_casefold_version),
 	fsparam_flag  ("casefold",	Opt_casefold),
@@ -4909,6 +4913,21 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_cell:
 		if (shmem_comp_opts_set_cell(&ctx->comp_opts, param->string))
 			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_swapfile:
+		/* Whole-cell disk swap backing (specs/07): consume the
+		 * path; it is validated/opened at pool create. */
+		kfree(ctx->comp_opts.swapfile);
+		ctx->comp_opts.swapfile = param->string;
+		param->string = NULL;
+		ctx->seen |= SHMEM_SEEN_COMPRESS;
+		break;
+	case Opt_swapsize:
+		size = memparse(param->string, &rest);
+		if (*rest || size == 0)
+			goto bad_value;
+		ctx->comp_opts.swapsize_bytes = size;
 		ctx->seen |= SHMEM_SEEN_COMPRESS;
 		break;
 	case Opt_gc_percent:

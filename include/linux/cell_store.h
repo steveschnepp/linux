@@ -323,6 +323,17 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
 
 /*
+ * Attach a whole-cell disk backing (specs/07): an O_DIRECT file carved
+ * into @size_bytes / cell_size extents.  @size_bytes == 0 uses the
+ * file's current size; otherwise the file is fallocate'd to it.  Must be
+ * a positive multiple of the cell size.  Called once, right after pool
+ * create and before the first store/swap.  On failure no backing is
+ * attached (cells stay resident) and the pool remains usable.
+ */
+int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
+			     u64 size_bytes);
+
+/*
  * Async GC interface.  cell_free() only links sparse cells; the
  * evacuation pass (shmem_compress.c) uses these to move live
  * objects into the active cell and release the emptied victim.

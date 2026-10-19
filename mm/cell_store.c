@@ -25,6 +25,8 @@
 #include <linux/file.h>
 #include <linux/uio.h>
 #include <linux/bitops.h>
+#include <linux/bitmap.h>
+#include <linux/fcntl.h>
 #include <linux/cell_store.h>
 
 #define cell_dbg(fmt, ...) \
@@ -722,6 +724,61 @@ unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max)
 			n++;
 	}
 	return n;
+}
+
+int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
+			     u64 size_bytes)
+{
+	struct cell_backing *b;
+	struct file *filp;
+	u64 cell_size, nr;
+	int ret;
+
+	if (!cp || !path || !path[0])
+		return -EINVAL;
+	cell_size = (u64)PAGE_SIZE << cp->cell_order;
+
+	filp = filp_open(path, O_RDWR | O_DIRECT | O_LARGEFILE, 0);
+	if (IS_ERR(filp))
+		return PTR_ERR(filp);
+
+	if (size_bytes) {
+		ret = vfs_fallocate(filp, 0, 0, size_bytes);
+		if (ret) {
+			fput(filp);
+			return ret;
+		}
+	} else {
+		size_bytes = i_size_read(file_inode(filp));
+	}
+
+	/* One extent == one cell; the file must be a positive multiple. */
+	if (size_bytes < cell_size || (size_bytes & (cell_size - 1))) {
+		fput(filp);
+		return -EINVAL;
+	}
+
+	nr = size_bytes / cell_size;
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b) {
+		fput(filp);
+		return -ENOMEM;
+	}
+	b->filp = filp;
+	b->nr_extents = nr;
+	b->cell_size = cell_size;
+	mutex_init(&b->map_lock);
+	b->free_map = bitmap_zalloc(nr, GFP_KERNEL);	/* all free */
+	if (!b->free_map) {
+		fput(filp);
+		kfree(b);
+		return -ENOMEM;
+	}
+
+	cp->backing = b;
+	pr_info("cell_store: whole-cell swap backing %s, %llu extents x "
+		"%llu KiB\n", path, nr, cell_size / 1024);
+	return 0;
 }
 
 /*

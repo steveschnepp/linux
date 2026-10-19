@@ -431,7 +431,9 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int cell_order,
 						unsigned int nr_cells,
 						unsigned int gc_percent,
-						unsigned int gc_debounce_ms)
+						unsigned int gc_debounce_ms,
+						const char *swapfile,
+						unsigned long long swapsize_bytes)
 {
 	struct shmem_comp_pool *pool;
 	int cpu;
@@ -470,6 +472,19 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 		}
 		pool->use_cells = true;
 		pool->zs_pool = NULL;
+
+		/* Whole-cell disk swap backing (specs/07): best-effort.  A
+		 * failed attach just means no disk tier -- cells stay
+		 * resident and compression is unaffected. */
+		if (swapfile && swapfile[0]) {
+			int bret = cell_pool_enable_backing(pool->cells,
+							swapfile,
+							swapsize_bytes);
+			if (bret)
+				pr_warn("shmem_comp: swap backing %s unavailable "
+					"(%d); cells stay in RAM\n",
+					swapfile, bret);
+		}
 
 		/*
 		 * Reverse index: one entry list per directory slot, sized
@@ -2274,6 +2289,8 @@ void shmem_comp_opts_free(struct shmem_comp_opts *opts)
 {
 	kfree(opts->compressor);
 	opts->compressor = NULL;
+	kfree(opts->swapfile);
+	opts->swapfile = NULL;
 }
 
 /*
@@ -2593,7 +2610,9 @@ int shmem_comp_fill_sb(struct super_block *sb,
 	comp->pool = shmem_comp_pool_create(algo, cell_order, nr_cells,
 					   opts->gc_percent,
 					   opts->gc_debounce_seen ?
-					   opts->gc_debounce_ms : cad_debounce);
+					   opts->gc_debounce_ms : cad_debounce,
+					   opts->swapfile,
+					   opts->swapsize_bytes);
 	if (IS_ERR(comp->pool)) {
 		pr_warn("tmpfs: failed to create compression pool, "
 			"running uncompressed\n");
