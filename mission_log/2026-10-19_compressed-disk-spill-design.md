@@ -162,20 +162,26 @@ slower tier: compressed -> swap.
   is unswappable).
 - **Pageout stays compress-only**; the spill writes the compressed blob,
   never a decompressed page.
+- **On-disk format: per-slot reuse of the swap subsystem** (user).  One
+  compressed blob per PAGE_SIZE slot on a `swapon`'d device/file.  Disk
+  is cheaper than RAM, so per-slot alignment waste is accepted; a packed
+  custom allocator is not worth rebuilding.
 
-## Open design choice (not settled this session)
+## On-disk format: decided -- per-slot reuse of the swap subsystem
 
-- **Per-slot vs packed on-disk format.**
-  - *Reuse swap slots:* one blob per PAGE_SIZE slot.  Simple, reuses
-    the whole swap subsystem, works for device + file.  Cost: a sub-page
-    blob occupies a full slot, so disk footprint per spilled page is
-    1 slot -- compression's win is RAM, not disk capacity.
-  - *Packed custom format:* pack blobs into disk blocks -> more logical
-    pages per GB of swap.  Cost: manage our own disk-space allocation
-    (a file/partition with a custom allocator) -- essentially rebuilding
-    what the zcell device was.  The ghost to avoid unless capacity, not
-    just RAM, is the goal.
-  - Leaning **per-slot reuse** for a first implementation.
+**Decision (user): reuse swap slots, one blob per PAGE_SIZE slot.**  The
+rationale: *disk is cheaper than RAM*, so losing some disk capacity to
+per-slot alignment is acceptable.  The compression's win is RAM (the
+cell returns to the buddy); the disk footprint per spilled page is
+1 slot regardless of the blob's compressed size, and that is a fine
+trade because the alternative -- a packed custom format -- costs far
+more than the wasted disk it saves.
+
+- *Rejected -- packed custom format:* pack blobs into disk blocks ->
+  more logical pages per GB of swap.  Cost: manage our own disk-space
+  allocation (a file/partition with a custom allocator) -- essentially
+  rebuilding what the zcell device was.  Not worth it when disk
+  capacity is cheap relative to RAM.
 
 ## Rules Added
 
@@ -205,15 +211,13 @@ None -- design only.  No gates re-run.
 
 ## Next Steps
 
-1. **Decide per-slot vs packed** on-disk format (see open design
-   choice).  Per-slot reuse is the pragmatic default.
-2. **Spec the tier-3 spill** if it is to be built: swap-slot alloc +
-   compressed write from the aging workqueue, a swap-backed entry state,
-   a swapin+decompress path (cannot reuse `shmem_swapin_folio`, which
-   expects an uncompressed page), and optional re-cache-on-swapin.
-3. The gate that decides *when* to build it: the compressed footprint
-   of the real working set vs RAM (the compressible-non-zero workload
-   the logs keep flagging as unmeasured).  The user has stated disk
-   paging is a hard requirement ("at the end I need a way to page on
-   disk"), so this is a committed feature, not a measurement-gated
-   maybe -- but the measurement still sizes the per-slot disk need.
+1. ~~Decide per-slot vs packed~~ -- **settled: per-slot reuse** (see
+   "On-disk format").
+2. **Spec the tier-3 spill**: swap-slot alloc + compressed write from
+   the aging workqueue, a swap-backed entry state, a swapin+decompress
+   path (cannot reuse `shmem_swapin_folio`, which expects an
+   uncompressed page), and optional re-cache-on-swapin.
+3. The measurement that *sizes* the per-slot disk need (not whether to
+   build -- disk paging is a committed requirement): the compressed
+   footprint of the real working set vs RAM (the compressible-non-zero
+   workload the logs keep flagging as unmeasured).
