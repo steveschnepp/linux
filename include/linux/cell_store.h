@@ -57,7 +57,11 @@
 #include <linux/rwsem.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/mutex.h>
 #include <linux/mm.h>
+
+struct file;
 
 /*
  * Cell size bounds.  Minimum 16 KiB: smaller cells cannot hold even a
@@ -120,6 +124,35 @@
  */
 #define GC_MAX_VICTIMS	64
 
+/*
+ * Whole-cell disk swap (specs/07_WHOLE_CELL_DISK_SWAP.md).  A cell is
+ * either wholly in RAM (pages[] valid) or wholly on disk (a backing
+ * extent holds its raw bytes), never both.  Only the data leaves RAM;
+ * the directory (this struct, indexed by cellid) always stays resident.
+ * The swap unit is the whole cell, moved as RAW bytes -- a cell already
+ * holds compressed blobs, so the swap path does no compression.
+ */
+enum cell_state {
+	CELL_IN_RAM = 0,	/* pages[]/base valid */
+	CELL_ON_DISK,		/* pages[] NULL; backing extent holds the data */
+};
+
+/*
+ * The pool-owned disk backing: an O_DIRECT file carved into fixed
+ * cell-sized extents.  O_DIRECT is load-bearing -- a buffered backing
+ * file's page cache would pin the very RAM the swap frees (the
+ * reclaim-reentrancy hazard that disqualified swappable cell memory).
+ * The free_map is an in-RAM bitmap over the extents; it is metadata and
+ * like the directory it never leaves RAM.
+ */
+struct cell_backing {
+	struct file	*filp;		/* O_DIRECT backing file, or NULL */
+	u64		nr_extents;	/* extents in the file */
+	u64		cell_size;	/* bytes per extent == per cell */
+	unsigned long	*free_map;	/* bitmap: 1 = extent free */
+	struct mutex	map_lock;	/* guards free_map */
+};
+
 struct cell {
 	/*
 	 * Exactly one slot: a cell is one physically-contiguous compound
@@ -128,6 +161,9 @@ struct cell {
 	 * the data, __free_pages(head, order) to release it.  No tail
 	 * page needs its own slot; the head is stored so the free path
 	 * can find it.
+	 *
+	 * NULL while the slot is free OR while the cell is ON_DISK (both
+	 * read as "no resident pages"; state disambiguates).
 	 */
 	struct page	*pages[1];
 	void		*base;		/* virtual base = page_address(pages[0]) */
@@ -142,6 +178,16 @@ struct cell {
 	 */
 	struct rw_semaphore lock;
 	struct list_head node;		/* linkage in pool->sparse list */
+	/*
+	 * Whole-cell disk swap state (specs/07).  state/swap_extent/dirty
+	 * are guarded by cp->lock.  swap_comp serialises concurrent
+	 * swap-in of THIS cell: the first loader reinitialises it and
+	 * swaps; a second waits instead of issuing a duplicate read.
+	 */
+	enum cell_state state;
+	bool		dirty;		/* written since last swap-out */
+	u64		swap_extent;	/* backing extent index when ON_DISK */
+	struct completion swap_comp;	/* serialises concurrent swap-in */
 };
 
 struct cell_pool {
@@ -178,6 +224,13 @@ struct cell_pool {
 	unsigned int	gc_percent;	/* sparse threshold: byte-utilization
 					 * percent (mount gc_percent=, default 50) */
 	bool		use_thp;	/* request THP-backed pages */
+	/*
+	 * Disk backing for whole-cell swap (specs/07).  NULL unless the
+	 * mount configured a swapfile= -- with NULL every path is the
+	 * pre-swap behaviour byte-for-byte, which is what makes each
+	 * phase a no-op at default and bisectable.
+	 */
+	struct cell_backing	*backing;
 	struct list_head sparse;	/* cells below gc_percent utilization */
 	atomic_long_t	pages_used;	/* (1 << cell_order) * live cells */
 	/*

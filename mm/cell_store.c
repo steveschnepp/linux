@@ -110,8 +110,11 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	 * state if a stale reader still holds it from the previous
 	 * incarnation.
 	 */
-	for (i = 0; i < cp->nslots; i++)
+	for (i = 0; i < cp->nslots; i++) {
 		init_rwsem(&cp->cells[i].lock);
+		/* whole-cell swap: one completion per slot, like the rwsem */
+		init_completion(&cp->cells[i].swap_comp);
+	}
 
 	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d, "
 		 "max_cells=%u (%llu MiB incompressible cap)",
