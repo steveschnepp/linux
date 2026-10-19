@@ -1,203 +1,197 @@
 ---
 name: compressed-disk-spill-design
-description: design the disk-spill tier for ztmpfs -- paging cold compressed blobs to a swap device/file with no decompress on pageout; rejects swappable cells (reclaim reentrancy + cell forfeiture), picks the zswap-style engine-managed spill through the swap subsystem
+description: design the disk-spill tier for ztmpfs -- swap the WHOLE cell (raw, already-compressed bytes) to a swap device/file; a cell is in RAM or on disk, metadata stays in RAM; rejects per-blob zswap spill, swappable cells, and kernel-transparent paging
 project: linux
 ---
 
-# Mission Log: Paging Compressed Blobs to Disk (the Tier-3 Spill Design)
+# Mission Log: Paging Cells to Disk (the Tier-3 Swap Design)
 
 Part 60 of the tmpfs transparent-compression series.  A design session
-(2026-10-19), bootstrapping from the record (logs 1-59) then answering a
-run of architecture questions about whether ztmpfs can page its
-compressed backing out to disk.  No kernel code changed; this log
-captures the mapped design space and the chosen mechanism so a future
-session does not re-derive it.
+(2026-10-19), bootstrapping from the record (logs 1-59) then converging
+on how ztmpfs pages its compressed backing out to disk.  No kernel code
+changed; this log captures the mapped design space, the rejected
+options, and the chosen whole-cell swap mechanism so a future session
+does not re-derive it.
 
 ## The requirement (user)
 
-ztmpfs must be able to page its compressed backing to disk.  A page that
-was compressed into a cell but has been unread for a while should not be
-pinned in RAM even in compressed form -- it should reach a swap
-device/file and come back transparently.  Two constraints were stated
-and re-stated: page out COMPRESSED (never decompress on pageout), and
-the paging must be transparent.
+ztmpfs must page its compressed backing to disk: a cell that has been
+cold for a while should not be pinned in RAM.  Constraints stated and
+re-stated across the session: page out COMPRESSED (never decompress on
+pageout); the paging must be transparent; and finally -- **swap the
+whole cell, not the content, and do not compress/decompress in the swap
+path** because the cell already holds compressed blobs.
 
 ## What We Did
 
-The session was a sequence of architecture questions, each answered
-from the code and the earlier logs.  In order:
+The session was a sequence of architecture questions, each answered from
+the code and the earlier logs, converging on the mechanism.
 
 ### 0. Entry point: are watermark-async + bvec grouping relevant to ztmpfs?
 
-The session opened by asking whether the deferred "commit 3"
-(watermark-async staging + folio-bvec grouping) carried over to ztmpfs
-now that the zcell device is gone.  Answer: those were the **zcell swap
-device's** merge bet -- the multi-page bvec is the *swap layer's*
-large-folio signal for grouping anon pages by memory adjacency
-(logs 54-55).  ztmpfs already merges its own pages by **file index**
-(`merge_pages`, the `shmem_comp_compress_chunk` group path), a different
-and already-built mechanism.  So the bvec grouping has no carrier in
-ztmpfs; the spec06 watermark, however, is live in ztmpfs.
+The deferred "commit 3" (watermark-async staging + folio-bvec grouping)
+was the **zcell swap device's** merge bet -- the multi-page bvec is the
+*swap layer's* large-folio signal for grouping anon pages by memory
+adjacency (logs 54-55).  ztmpfs already merges its own pages by **file
+index** (`merge_pages`, `shmem_comp_compress_chunk`), a different,
+already-built mechanism.  So bvec grouping has no carrier in ztmpfs;
+the spec06 watermark, however, is live in ztmpfs.
 
 ### 1. "Can ztmpfs still swap out its pages, compressed, no decompress on pageout?"
 
-Grounded in `mm/shmem_compress.c`.  The answer is **yes, already, by
-design -- but not via a swap device.**  The model (confirmed in the
-decompress path's comments) is:
-
-- Compression **is** the pageout.  On reclaim the folio is compressed
-  into a cell and leaves `i_pages` (`shmem_comp_compress_one` /
-  `_compress_chunk`, both compress-only).  No decompression on any
-  pageout path.
-- The compressed entry (`entries[index]` -> `shmem_comp_entry`, backed
-  by a cell) **is the durable backing -- "like a disk block."**
-- The decompressed page you read back is installed **non-swapbacked**
-  (`__folio_clear_swapbacked`) on the *file* LRU: a reclaimable cache of
-  the entry, dropped by `__remove_mapping` (so a >RAM read-back
-  survives).  `shmem_writeout()` never fires on it.
-
-So ztmpfs already evicts compressed with no decompress-on-pageout.  What
-it does **not** do is reach disk: the cell is **kernel memory** (buddy
-pages), which the kernel never swaps.
+**Yes, already -- but not via a swap device.**  In `mm/shmem_compress.c`
+compression **is** the pageout: on reclaim the folio is compressed into
+a cell and leaves `i_pages` (`shmem_comp_compress_one`/`_compress_chunk`,
+both compress-only).  The compressed entry (`entries[index]` ->
+`shmem_comp_entry`, backed by a cell) **is the durable backing -- "like a
+disk block."**  The decompressed page you read back is installed
+**non-swapbacked** on the *file* LRU: a reclaimable cache of the entry,
+dropped by `__remove_mapping` (so a >RAM read-back survives);
+`shmem_writeout()` never fires on it.  What is missing is any path to
+disk -- the cell is **kernel memory**, which the kernel never swaps.
 
 ### 2. "Can't the compressed blob pages be swapped in/out transparently by the kernel?"
 
 **No.**  Cells are buddy-allocated kernel pages.  The kernel's swap
 machinery only unmaps process page-table entries for anon/file LRU
-pages; kernel memory has no such mapping, so `try_to_unmap` never sees
-it.  This is a hard boundary, not a tunable.  Hence "transparent kernel
-paging of the blobs" is impossible; if compressed data is to reach disk,
-**the engine must move it there itself.**
+pages; kernel memory has no mapping, so `try_to_unmap` never sees it.
+A hard boundary, not a tunable.  Any disk reach is engine-managed.
 
 ### 3. "Can the cells be allocated in swap-backed memory?" (so the kernel pages them)
 
 **Functionally yes, architecturally disqualified.**  Storing blobs as
-pages of a hidden shmem file would let the kernel page them to swap
-transparently (a shmem page holds arbitrary bytes and is written raw to
-a slot on reclaim).  But it costs two things:
-
-- **It forfeits the cell allocator.**  Cells are contiguous order-N
-  blocks with whole-cell return, zero per-object metadata, and a
-  merge-group-in-one-region.  Swappable shmem pages are per-page
-  reclaimable; none of that survives.
-- **Reclaim reentrancy.**  The engine compresses from the reclaim/aging
-  path.  If its own storage is swappable, the reclaim path can recurse
-  into swapping the engine's own data -- the classic deadlock that
-  `zswap`/`zsmalloc` avoid precisely by keeping the compressed pool in
-  unreclaimable kernel memory.
+pages of a hidden shmem file would let the kernel page them transparently
+(a shmem page holds arbitrary bytes, written raw to a slot on reclaim).
+But it **forfeits the cell allocator** (contiguous order-N blocks,
+whole-cell return, zero per-object metadata, merge-group-in-one-region --
+all lost to per-page reclaimable pages) and reintroduces **reclaim
+reentrancy**: the engine compresses from the reclaim/aging path, so if
+its own storage is swappable, reclaim recurses into swapping the engine's
+own data -- the classic deadlock `zswap`/`zsmalloc` avoid by keeping the
+compressed pool in unreclaimable kernel memory.
 
 ### 4. "Can we back it from a swap device/file?  At the end I need a way to page on disk."
 
-**Yes -- this is the design.**  The swap subsystem backs a bdev *or* a
-file interchangeably (`swap_info_struct`; `swap_writepage` /
-`read_swap_cache` are identical for both), so whatever the box has
-`swapon`'d is a valid spill target.  The engine reuses it zswap-style:
+**Yes.**  The swap subsystem backs a bdev *or* a file interchangeably
+(`swap_info_struct`; `swap_writepage`/`read_swap_cache` identical for
+both), so any `swapon`'d target is valid.  The first cut was framed as a
+zswap-style spill of **individual compressed blobs** into swap slots,
+with a decompress on swapin.  **The user corrected this** -- see the
+decision below: swap the **whole cell**, raw, not the per-blob content.
 
-- **Eviction (cold blob -> disk):** the aging pass picks a cold
-  compressed entry, allocates a swap slot, writes the **compressed
-  blob** into the slot (plus a small header), frees the cell, and
-  records the swap offset in the entry (third entry state:
-  swap-backed).
-- **Swapin (read):** on a fault/read whose `entries[index]` is
-  swap-backed, read the compressed blob from the slot, decompress into
-  the page cache (optionally re-cache the blob in a cell -- promotion).
-- **Context:** the spill does disk I/O, so it runs from the sleepable
-  aging workqueue (`shmem_comp_age_work`), not inside reclaim's
-  `shrink_folio_list`.  The cadence tunables (`age_delay_ms`,
-  `age_budget`, `age_rounds`, `age_batch`) are already the "unread for a
-  while" knobs.
+## The chosen model: whole-cell swap, raw
 
-The cold-detection machinery **already exists** (the aging pass:
-`shmem_comp_maintain` / `age_round` / `note_unmap` / `wm_update`).
-Today it moves uncompressed -> compressed.  The spill adds a second,
-slower tier: compressed -> swap.
+- **Swap unit = the whole cell, moved as raw bytes.**  A cell already
+  holds compressed blobs, so the swap path does **no compression or
+  decompression** -- it is a straight copy of an order-N contiguous
+  region to/from disk.  The swap tier is content-agnostic.
+- **A cell is wholly in RAM or wholly on disk, never both.**  Only the
+  cell *data* pages out; the cell **directory (metadata) stays in RAM
+  always**.
+- **Access to a block in an on-disk cell swaps the whole cell in
+  first**, then serves from RAM (read amplification by design).
+- **A cell is write-once at block granularity** -- only free blocks get
+  allocated, never in-place modify.  So an on-disk cell is immutable
+  until it is brought back to RAM.
+- **Evacuation invalidates the swap** -- when GC relocates a sparse
+  cell's live blocks and frees the cell, its disk copy is discarded
+  (`swapfree`), so no stale disk copy survives.
 
-## The three-tier model (the session's mental frame)
+### Why it beats the per-blob (zswap) spill
+
+No per-blob swap-slot bookkeeping; no decompress-on-swapin (the swap
+moves raw bytes; the only decompression is the normal read path, blob ->
+page, which is unchanged); and the cell's physical contiguity makes the
+disk I/O a simple contiguous copy.
+
+### The three-tier frame
 
 | tier | lives where | evicted how | reaches disk? |
 |------|-------------|-------------|---------------|
 | uncompressed page | page cache | -> compressed into a cell | no |
-| compressed blob | cell (kernel RAM) | -> **spill to a swap slot** | **yes (tier 3)** |
-| compressed blob | swap slot (disk) | -> swapin + decompress | is the disk |
+| compressed blobs | cell (kernel RAM) | -> **whole cell swapped out (raw)** | **yes (tier 3)** |
+| whole cell | swap extent (disk) | -> whole cell swapped in, then read | is the disk |
+
+## Decisions the spec must nail
+
+1. **Scatter vs contiguous on disk.**  An order-N cell is 2^N pages.
+   Scatter/gather across 2^N PAGE_SIZE swap slots (the directory records
+   the slot list per on-disk cell) is the pragmatic reuse of the swap
+   allocator; on-disk contiguity is a perf optimization, not correctness.
+   A contiguous large slot would need THP-large-swap, which is optional.
+2. **Write-after-swapin.**  Writing a free block requires the cell in
+   RAM and makes the RAM copy authoritative (the disk copy is stale) --
+   a dirty-bit at cell granularity, re-written on the next eviction.
+3. **GC scope.**  Run GC on in-RAM cells; an on-disk cell is only GC'd
+   after being swapped in, then evacuated with its swap discarded.  Cold
+   disk cells stay immutable.
+4. **Sizing.**  Swap must cover 2^N slots per cell; the directory's
+   per-cell RAM cost is small versus the data it lets leave RAM.
 
 ## What We Learned
 
 ### Technical
 
-- **Kernel memory is never swapped.**  Swap unmaps process PTEs; a
-  buddy/kmalloc-backed cell has no mapping, so no transparent paging of
-  the compressed store is possible.  Any disk spill is engine-managed.
+- **Kernel memory is never swapped** -- swap unmaps process PTEs; a
+  buddy/kmalloc-backed cell has no mapping.  Any disk spill is
+  engine-managed, never transparent kernel paging.
 - **ztmpfs already satisfies "compress on pageout, never decompress."**
-  Compression is the eviction; the decompressed page is a non-swapbacked
-  file cache of the durable compressed entry.  Nothing was lost when the
-  zcell *device* was removed -- that was a separate block/swap device,
-  not the tmpfs compression path.
-- **Reclaimable != swappable.**  File pages are dropped (and re-read
-  from a disk source of truth); anon/shmem pages are written to swap.
-  To make a blob's page *droppable* you still need it on disk first --
-  so the spill is unavoidable either way.
-- **Why the compressed store must stay unreclaimable:** zswap/zsmalloc
-  keep their pools in kernel memory for exactly the reentrancy reason;
-  backing it with swappable pages reintroduces the hazard the design
-  exists to avoid.
+  The zcell *device* removal did not touch this -- that was a separate
+  block/swap device, not the tmpfs compression path.
+- **The swap unit should follow the allocator's unit.**  Because cells
+  are already the allocation/RAM unit (contiguous order-N, write-once),
+  swapping the whole cell reuses that invariant instead of cutting
+  across it -- which is why whole-cell raw swap is simpler than per-blob
+  spill.  The compression happened once, at store time; the swap tier
+  need not know about it.
+- **Reclaimable != swappable**, and the compressed store must stay
+  unreclaimable (reentrancy) -- so it is the engine, from a sleepable
+  context, that moves cells to disk.
 
 ### Process
 
-- The disk-spill requirement was approached by eliminating the tempting
-  "let the kernel do it transparently" options one at a time (transparent
-  kernel swap -> impossible; swappable cells -> disqualified), which
-  isolates the engine-managed spill as the only design that keeps the
-  cell architecture.  Naming *why each cheaper option fails* is what
-  makes the chosen one obviously correct.
+- The requirement was met by eliminating the tempting "let the kernel do
+  it" options one at a time (transparent kernel swap -> impossible;
+  swappable cells -> disqualified), which isolated the engine-managed
+  path; then the user simplified the payload from per-blob to
+  whole-cell, which removed the decompress-on-swapin and the per-blob
+  bookkeeping.  Naming *why each cheaper option fails* is what makes the
+  chosen one obviously correct.
 
 ## What We Decided
 
-- **Tier-3 design: engine-managed spill of cold compressed blobs
-  through the swap subsystem (the zswap model).**  Reuses `swapon`'d
-  devices and files; keeps the cell allocator for the hot tier; runs
-  from the sleepable aging workqueue.
+- **Tier-3: whole-cell swap through the swap subsystem (device or
+  file).**  Raw move of the order-N cell; no compress/decompress in the
+  swap path; the cell is in RAM or on disk; metadata always in RAM;
+  swap-in-whole-cell on access; write-once blocks; discard swap on
+  evacuation.
+- **Per-slot alignment waste accepted** (user: *disk is cheaper than
+  RAM*) -- the compression win is RAM; a sub-page/partial cell on disk
+  is a fine trade.
 - **Swappable (shmem-backed) cells: rejected** -- reclaim reentrancy +
   cell-allocator forfeiture.
 - **Kernel-transparent swap of cell pages: impossible** (kernel memory
   is unswappable).
-- **Pageout stays compress-only**; the spill writes the compressed blob,
-  never a decompressed page.
-- **On-disk format: per-slot reuse of the swap subsystem** (user).  One
-  compressed blob per PAGE_SIZE slot on a `swapon`'d device/file.  Disk
-  is cheaper than RAM, so per-slot alignment waste is accepted; a packed
-  custom allocator is not worth rebuilding.
-
-## On-disk format: decided -- per-slot reuse of the swap subsystem
-
-**Decision (user): reuse swap slots, one blob per PAGE_SIZE slot.**  The
-rationale: *disk is cheaper than RAM*, so losing some disk capacity to
-per-slot alignment is acceptable.  The compression's win is RAM (the
-cell returns to the buddy); the disk footprint per spilled page is
-1 slot regardless of the blob's compressed size, and that is a fine
-trade because the alternative -- a packed custom format -- costs far
-more than the wasted disk it saves.
-
-- *Rejected -- packed custom format:* pack blobs into disk blocks ->
-  more logical pages per GB of swap.  Cost: manage our own disk-space
-  allocation (a file/partition with a custom allocator) -- essentially
-  rebuilding what the zcell device was.  Not worth it when disk
-  capacity is cheap relative to RAM.
+- **Pageout stays compress-only** for the uncompressed->compressed
+  transition; the disk swap moves raw cell bytes.
 
 ## Rules Added
 
-- **The compressed store must live in unreclaimable kernel memory**;
-  any disk spill is an explicit engine path through the swap subsystem,
-  never a swappable backing (reclaim reentrancy).
-- **To page tmpfs data to disk compressed, extend shmem's manual swap
-  management (swap slots) with a compressed payload** -- do not expect
-  the kernel to swap kernel memory, and do not decompress on pageout.
+- **The compressed store must live in unreclaimable kernel memory**; any
+  disk reach is an explicit engine path, never a swappable backing
+  (reclaim reentrancy).
+- **Swap at the allocator's granularity, raw** -- a cell already holds
+  compressed blobs, so paging a cell needs no (de)compression; do not
+  decompress on pageout.
+- **A paged-out cell is immutable until swapped in; freeing/evacuating
+  it discards its swap** -- never leave a stale disk copy.
 
 ## What We'd Do Differently
 
-- Would have jumped straight to "the compressed cell is kernel memory,
-  so the kernel can't page it" in turn 2 instead of first re-deriving
-  the bvec/watermark relevance -- the unswappable-kernel-memory fact
-  settles most of the space at once.
+- Would have jumped straight to "the cell is kernel memory, so the
+  kernel can't page it" and "swap at the cell unit, raw" instead of
+  first framing a per-blob zswap spill -- the unswappable-kernel-memory
+  fact plus the write-once-cell invariant settle the design at once.
 
 ## Files Changed
 
@@ -211,13 +205,15 @@ None -- design only.  No gates re-run.
 
 ## Next Steps
 
-1. ~~Decide per-slot vs packed~~ -- **settled: per-slot reuse** (see
-   "On-disk format").
-2. **Spec the tier-3 spill**: swap-slot alloc + compressed write from
-   the aging workqueue, a swap-backed entry state, a swapin+decompress
-   path (cannot reuse `shmem_swapin_folio`, which expects an
-   uncompressed page), and optional re-cache-on-swapin.
-3. The measurement that *sizes* the per-slot disk need (not whether to
-   build -- disk paging is a committed requirement): the compressed
-   footprint of the real working set vs RAM (the compressible-non-zero
-   workload the logs keep flagging as unmeasured).
+1. **Spec the whole-cell swap**: swap-slot allocation for a 2^N-page
+   cell (scatter/gather), the on-disk/in-RAM cell states in the
+   directory, whole-cell swap-out from the sleepable aging workqueue,
+   whole-cell swap-in on access, the cell dirty-bit for
+   write-after-swapin, and GC's evacuate-then-discard-swap.
+2. The measurement that *sizes* the disk need (not whether to build --
+   disk paging is a committed requirement): the compressed footprint of
+   the real working set vs RAM (the compressible-non-zero workload the
+   logs keep flagging as unmeasured).
+3. Confirm the read-amplification trade is acceptable on the target
+   workload (one-page read pulls a whole cell, 2^N pages) -- mitigated
+   because a cell backs multiple pages and disk is cheap.
