@@ -4759,6 +4759,13 @@ static void shmem_comp_maintain(struct shmem_comp_sb *comp, bool hot)
  * never compresses inline). Holds shmem_comp_mounts_lock so the pass is
  * serialized against gc_now and against put_super's teardown.
  */
+/*
+ * Whole-cell disk swap (specs/07): how many cold cells one aging pass
+ * pages out to the backing.  Bounded so a single pass does not stall on
+ * a burst of O_DIRECT writes; the next pass (age_delay_ms) continues.
+ */
+#define SHMEM_COMP_SWAP_BATCH	16
+
 static void shmem_comp_age_work(struct work_struct *work)
 {
 	struct shmem_comp_sb *comp = container_of(to_delayed_work(work),
@@ -4770,6 +4777,17 @@ static void shmem_comp_age_work(struct work_struct *work)
 	mutex_lock(&shmem_comp_mounts_lock);
 	shmem_comp_maintain(comp, hot);
 	mutex_unlock(&shmem_comp_mounts_lock);
+
+	/*
+	 * Whole-cell disk swap (specs/07): after aging has compressed the
+	 * backlog, page some cold cells out to the backing.  Runs in this
+	 * workqueue (process context) so the O_DIRECT I/O may sleep; never
+	 * from the shrinker (reclaim context).  Outside
+	 * shmem_comp_mounts_lock so the I/O does not block other mounts;
+	 * comp is pinned by this running work item.
+	 */
+	if (comp->pool && comp->pool->use_cells && comp->pool->cells)
+		cell_pool_swap_out(comp->pool->cells, SHMEM_COMP_SWAP_BATCH);
 }
 
 /*

@@ -208,6 +208,19 @@ void cell_pool_destroy(struct cell_pool *cp)
 			__free_pages(c->pages[0], cp->cell_order);
 	}
 
+	/*
+	 * Whole-cell swap: tear the backing down.  On-disk cells hold no
+	 * pages (nothing to free above); their extents live inside the
+	 * backing file, whose blocks are the file owner's to reclaim once
+	 * we drop the reference.
+	 */
+	if (cp->backing) {
+		if (cp->backing->filp)
+			fput(cp->backing->filp);
+		kvfree(cp->backing->free_map);
+		kfree(cp->backing);
+	}
+
 	kvfree(cp->cells);
 	kfree(cp);
 }
@@ -438,7 +451,13 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	}
 
 	c = &cp->cells[cellid];
-	if (!c->pages[0]) {
+	/*
+	 * A never-allocated or already-returned slot has no pages and no
+	 * swap state.  An ON_DISK cell has live_bytes but no resident
+	 * pages -- it must still be accounted (a truncate can free a
+	 * block behind a paged-out cell).
+	 */
+	if (!c->pages[0] && c->state != CELL_ON_DISK) {
 		spin_unlock(&cp->lock);
 		return;
 	}
@@ -451,6 +470,29 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 		 cellid, offset, len, c->live_bytes, c->live_objects,
 		 empty ? " -> empty" :
 		 cell_is_sparse(cp, c->live_bytes) ? " -> sparse" : "");
+
+	if (c->state == CELL_ON_DISK) {
+		/*
+		 * No RAM is held, so the only reclamation is the disk
+		 * extent.  On empty, recycle the extent and drop the slot
+		 * back to the free state.  A sparse non-empty on-disk cell
+		 * is left on disk (disk is cheap) and reclaimed after a
+		 * later swap-in; it is deliberately NOT linked into the
+		 * sparse list, because GC needs resident pages.
+		 */
+		if (empty) {
+			u64 extent = c->swap_extent;
+
+			c->swap_extent = 0;
+			c->state = CELL_IN_RAM;	/* free slot again */
+			c->live_objects = 0;
+			spin_unlock(&cp->lock);
+			cell_backing_free_extent(cp->backing, extent);
+			return;
+		}
+		spin_unlock(&cp->lock);
+		return;
+	}
 
 	if (!empty && cell_is_sparse(cp, c->live_bytes)) {
 		/*
