@@ -24,8 +24,6 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/uio.h>
-#include <linux/bitops.h>
-#include <linux/bitmap.h>
 #include <linux/fcntl.h>
 #include <linux/cell_store.h>
 
@@ -59,39 +57,14 @@ static gfp_t cell_gfp(struct cell_pool *cp)
  * byte-for-byte no-op.
  */
 
-/* Carve one cell-sized extent out of the free map.  Bit set = free. */
-static bool cell_backing_alloc_extent(struct cell_backing *b, u64 *extent_out)
+/*
+ * Raw O_DIRECT whole-cell I/O under the 1:1 mapping (specs/07): cell N
+ * lives at extent N, file offset N * cell_size.  The cellid is the disk
+ * slot, so there is no extent parameter and no allocation.
+ */
+static int cell_backing_write_cell(struct cell_pool *cp, struct cell *c)
 {
-	u64 i;
-	bool ok = false;
-
-	mutex_lock(&b->map_lock);
-	for (i = 0; i < b->nr_extents; i++) {
-		if (test_bit(i, b->free_map)) {
-			clear_bit(i, b->free_map);
-			*extent_out = i;
-			ok = true;
-			break;
-		}
-	}
-	mutex_unlock(&b->map_lock);
-	return ok;
-}
-
-static void cell_backing_free_extent(struct cell_backing *b, u64 extent)
-{
-	if (!b || extent >= b->nr_extents)
-		return;
-	mutex_lock(&b->map_lock);
-	set_bit(extent, b->free_map);
-	mutex_unlock(&b->map_lock);
-}
-
-/* Raw O_DIRECT write of a whole resident cell to @extent. */
-static int cell_backing_write_cell(struct cell_pool *cp, struct cell *c,
-				   u64 extent)
-{
-	loff_t pos = extent * cp->backing->cell_size;
+	loff_t pos = (loff_t)c->cellid * cp->backing->cell_size;
 	size_t len = cp->backing->cell_size;
 	ssize_t w;
 
@@ -99,11 +72,10 @@ static int cell_backing_write_cell(struct cell_pool *cp, struct cell *c,
 	return (w == (ssize_t)len) ? 0 : (w < 0 ? (int)w : -EIO);
 }
 
-/* Raw O_DIRECT read of a whole cell from @extent into @base. */
 static int cell_backing_read_cell(struct cell_pool *cp, struct cell *c,
-				  void *base, u64 extent)
+				  void *base)
 {
-	loff_t pos = extent * cp->backing->cell_size;
+	loff_t pos = (loff_t)c->cellid * cp->backing->cell_size;
 	size_t len = cp->backing->cell_size;
 	ssize_t r;
 
@@ -176,11 +148,8 @@ struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
 	 * state if a stale reader still holds it from the previous
 	 * incarnation.
 	 */
-	for (i = 0; i < cp->nslots; i++) {
+	for (i = 0; i < cp->nslots; i++)
 		init_rwsem(&cp->cells[i].lock);
-		/* whole-cell swap: one completion per slot, like the rwsem */
-		init_completion(&cp->cells[i].swap_comp);
-	}
 
 	cell_dbg("pool created: order=%u (%lu KiB/cell), use_thp=%d, "
 		 "max_cells=%u (%llu MiB incompressible cap)",
@@ -219,7 +188,6 @@ void cell_pool_destroy(struct cell_pool *cp)
 	if (cp->backing) {
 		if (cp->backing->filp)
 			fput(cp->backing->filp);
-		kvfree(cp->backing->free_map);
 		kfree(cp->backing);
 	}
 
@@ -483,13 +451,12 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 		 * sparse list, because GC needs resident pages.
 		 */
 		if (empty) {
-			u64 extent = c->swap_extent;
-
-			c->swap_extent = 0;
+			/* 1:1: the disk slot is permanent (extent cellid), so
+			 * there is nothing to free -- just drop the slot back
+			 * to the free state. */
 			c->state = CELL_IN_RAM;	/* free slot again */
 			c->live_objects = 0;
 			spin_unlock(&cp->lock);
-			cell_backing_free_extent(cp->backing, extent);
 			return;
 		}
 		spin_unlock(&cp->lock);
@@ -545,7 +512,6 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	struct cell_backing *b = cp->backing;
 	struct page *page;
 	void *base;
-	u64 extent;
 	int ret;
 
 	if (!b || !b->filp)
@@ -568,7 +534,7 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	}
 	base = page_address(page);
 
-	ret = cell_backing_read_cell(cp, c, base, c->swap_extent);
+	ret = cell_backing_read_cell(cp, c, base);
 	if (ret) {
 		__free_pages(page, cp->cell_order);
 		up_write(&c->lock);
@@ -579,13 +545,9 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	c->pages[0] = page;
 	c->base = base;
 	c->state = CELL_IN_RAM;
-	extent = c->swap_extent;
-	c->swap_extent = 0;
 	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
 	spin_unlock(&cp->lock);
 
-	/* The disk slot's contents now live in RAM; recycle the extent. */
-	cell_backing_free_extent(b, extent);
 	up_write(&c->lock);
 	return 0;
 }
@@ -660,8 +622,6 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
  */
 static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
 {
-	struct cell_backing *b = cp->backing;
-	u64 extent;
 	int ret;
 
 	down_write(&c->lock);
@@ -672,19 +632,16 @@ static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
 		up_write(&c->lock);
 		return -EBUSY;
 	}
-	if (!cell_backing_alloc_extent(b, &extent)) {
-		spin_unlock(&cp->lock);
-		up_write(&c->lock);
-		return -ENOSPC;
-	}
-	c->swap_extent = extent;
+	/* 1:1 mapping: this cell's permanent disk slot is extent cellid, so
+	 * there is nothing to allocate and no ENOSPC possible.  Flip state
+	 * before the I/O so a concurrent shrinker/GC skips the cell. */
 	c->state = CELL_ON_DISK;
 	if (!list_empty(&c->node))
 		list_del_init(&c->node);
 	spin_unlock(&cp->lock);
 
 	/* c->base is valid and stable: we hold c->lock for write. */
-	ret = cell_backing_write_cell(cp, c, extent);
+	ret = cell_backing_write_cell(cp, c);
 	if (!ret) {
 		__free_pages(c->pages[0], cp->cell_order);
 		spin_lock(&cp->lock);
@@ -693,11 +650,11 @@ static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
 		atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
 		spin_unlock(&cp->lock);
 	} else {
+		/* Roll back to resident; the (partial) disk image is ignored
+		 * because state returns to IN_RAM. */
 		spin_lock(&cp->lock);
 		c->state = CELL_IN_RAM;
-		c->swap_extent = 0;
 		spin_unlock(&cp->lock);
-		cell_backing_free_extent(b, extent);
 	}
 	up_write(&c->lock);
 	return ret;
@@ -732,7 +689,6 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 	struct cell_backing *b;
 	struct file *filp;
 	u64 cell_size, nr;
-	int ret;
 
 	if (!cp || !path || !path[0])
 		return -EINVAL;
@@ -743,7 +699,8 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 		return PTR_ERR(filp);
 
 	if (size_bytes) {
-		ret = vfs_fallocate(filp, 0, 0, size_bytes);
+		int ret = vfs_fallocate(filp, 0, 0, size_bytes);
+
 		if (ret) {
 			fput(filp);
 			return ret;
@@ -758,7 +715,22 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 		return -EINVAL;
 	}
 
+	/*
+	 * 1:1 mapping requires a permanent slot per directory entry, so
+	 * the backing must hold at least one extent per cell.  A smaller
+	 * backing is refused outright (no allocator fallback): the whole
+	 * tier exists to extend the tmpfs past RAM, which needs disk >=
+	 * the pool's cell capacity anyway.
+	 */
 	nr = size_bytes / cell_size;
+	if (nr < cp->nslots) {
+		fput(filp);
+		pr_warn("cell_store: swap backing %s too small (%llu extents "
+			"< %u cells); need >= %llu bytes\n", path, nr,
+			cp->nslots, (u64)cp->nslots * cell_size);
+		return -ENOSPC;
+	}
+
 	b = kzalloc(sizeof(*b), GFP_KERNEL);
 	if (!b) {
 		fput(filp);
@@ -767,17 +739,11 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 	b->filp = filp;
 	b->nr_extents = nr;
 	b->cell_size = cell_size;
-	mutex_init(&b->map_lock);
-	b->free_map = bitmap_zalloc(nr, GFP_KERNEL);	/* all free */
-	if (!b->free_map) {
-		fput(filp);
-		kfree(b);
-		return -ENOMEM;
-	}
 
 	cp->backing = b;
 	pr_info("cell_store: whole-cell swap backing %s, %llu extents x "
-		"%llu KiB\n", path, nr, cell_size / 1024);
+		"%llu KiB (1:1 with %u cells)\n", path, nr, cell_size / 1024,
+		cp->nslots);
 	return 0;
 }
 

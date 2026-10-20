@@ -57,7 +57,6 @@
 #include <linux/rwsem.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
-#include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
 
@@ -142,15 +141,21 @@ enum cell_state {
  * cell-sized extents.  O_DIRECT is load-bearing -- a buffered backing
  * file's page cache would pin the very RAM the swap frees (the
  * reclaim-reentrancy hazard that disqualified swappable cell memory).
- * The free_map is an in-RAM bitmap over the extents; it is metadata and
- * like the directory it never leaves RAM.
+ *
+ * The mapping is 1:1 and allocation-free: cell N lives at extent N
+ * (file offset N * cell_size).  The backing is required to have at
+ * least one extent per directory slot (nr_extents >= pool->nslots), so
+ * every cell has a permanent home and swap-out can never fail for lack
+ * of space.  There is no free-map, no allocator, and no per-cell disk
+ * bookkeeping beyond the cell's own state.  This also spreads writes
+ * across extents according to per-cell churn (each extent is written
+ * only when its own cell pages out), rather than concentrating them the
+ * way a first-fit allocator would.
  */
 struct cell_backing {
-	struct file	*filp;		/* O_DIRECT backing file, or NULL */
-	u64		nr_extents;	/* extents in the file */
+	struct file	*filp;		/* O_DIRECT backing file */
+	u64		nr_extents;	/* extents; >= pool->nslots */
 	u64		cell_size;	/* bytes per extent == per cell */
-	unsigned long	*free_map;	/* bitmap: 1 = extent free */
-	struct mutex	map_lock;	/* guards free_map */
 };
 
 struct cell {
@@ -179,15 +184,12 @@ struct cell {
 	struct rw_semaphore lock;
 	struct list_head node;		/* linkage in pool->sparse list */
 	/*
-	 * Whole-cell disk swap state (specs/07).  state/swap_extent/dirty
-	 * are guarded by cp->lock.  swap_comp serialises concurrent
-	 * swap-in of THIS cell: the first loader reinitialises it and
-	 * swaps; a second waits instead of issuing a duplicate read.
+	 * Whole-cell disk swap state (specs/07).  state is guarded by
+	 * cp->lock and is stable under the cell rwsem (only swap-in and
+	 * swap-out mutate it, both under down_write).  The backing extent
+	 * is cellid itself (1:1), so no per-cell disk offset is stored.
 	 */
 	enum cell_state state;
-	bool		dirty;		/* written since last swap-out */
-	u64		swap_extent;	/* backing extent index when ON_DISK */
-	struct completion swap_comp;	/* serialises concurrent swap-in */
 };
 
 struct cell_pool {
@@ -324,11 +326,14 @@ unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
 
 /*
  * Attach a whole-cell disk backing (specs/07): an O_DIRECT file carved
- * into @size_bytes / cell_size extents.  @size_bytes == 0 uses the
- * file's current size; otherwise the file is fallocate'd to it.  Must be
- * a positive multiple of the cell size.  Called once, right after pool
- * create and before the first store/swap.  On failure no backing is
- * attached (cells stay resident) and the pool remains usable.
+ * into 1:1 cell-sized extents (cell N -> extent N).  @size_bytes == 0
+ * uses the file's current size; otherwise the file is fallocate'd to
+ * it.  Must be a positive multiple of the cell size AND hold at least
+ * one extent per directory slot (>= pool->nslots cells) -- a smaller
+ * backing is refused with -ENOSPC (no allocator fallback).  Called once,
+ * right after pool create and before the first store/swap.  On failure
+ * no backing is attached (cells stay resident) and the pool remains
+ * usable.
  */
 int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 			     u64 size_bytes);
