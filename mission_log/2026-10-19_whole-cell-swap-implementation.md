@@ -198,3 +198,69 @@ gracefully (warn, cells stay resident, compression unaffected).
 4. Revisit the spec's open questions with real numbers: swap-out cells
    per pass, recency protection (avoid re-swapping a just-read cell),
    and interaction with the spec06 watermark.
+
+---
+
+## Session 77: The 1:1 cell-to-extent mapping (2026-10-19)
+
+### What We Did
+
+Reworked the disk mapping from a bitmap extent allocator to a **static
+1:1 mapping**: cell N lives at extent N (file offset `N * cell_size`),
+commit `28e259d`. Driven by two things from the follow-up discussion:
+
+1. The SBC use case (R/O root + a R/W ztmpfs whose cold cells page to a
+   backing file on a second MMC partition) where "disk is cheaper than
+   RAM" and disk >> RAM, so a backing >= the pool's cell capacity is the
+   natural sizing.
+2. A wear-leveling concern: the first-cut allocator was **first-fit**,
+   which concentrates writes on the low extents (a freed low extent is
+   the first reused) -- bad for MMC/eMMC endurance. The user proposed
+   aligning the disk layout with the in-RAM cell array.
+
+The new rule: `nr_extents >= nslots` is **required**; a smaller backing
+is refused with `-ENOSPC` (no allocator fallback). Everything else
+follows: cellid *is* the disk slot, so there is no free-map, no
+`map_lock`, no alloc/free-extent, no per-cell `swap_extent`/`dirty`/ 
+`swap_comp`, and swap-out can never fail for lack of space. Net -29
+lines.
+
+### What We Learned
+
+- **1:1 gives natural wear *spreading*, not active leveling.**  Each
+  extent is written only when its own cell pages out, so writes distribute
+  across extents by per-cell churn -- strictly better than first-fit's
+  concentration. But a single hot cell still concentrates on *its* extent
+  (round-robin would spread one hot cell across the device but loses the
+  stable mapping). For a tmpfs, churn is spread across many cells, so
+  1:1 is good enough; a per-cell rotation (`cellid ^ generation`) is the
+  escape hatch if an endurance hotspot ever appears.
+- **Requiring disk >= capacity is coherent with the feature's purpose.**
+  The tier exists to extend the tmpfs past RAM; if the disk were smaller
+  than the pool's cell capacity it could not extend anything, so refusing
+  it outright loses nothing.
+- **`down_write` on the state transition is the concurrent-swap-in
+  serializer** -- once the extent allocator went away, the completion
+  field (`swap_comp`) became redundant; the cell rwsem's write side
+  already collapses N loaders into one swap-in.
+
+### What We Decided
+
+- **1:1 mapping, capacity required, allocator deleted** (`28e259d`).
+- The **partition-not-loop** path is a later, separate change (drop-in
+  behind `cell_backing`: `filp` -> `bdev`, `kernel_read/write` -> bio);
+  the main case stays a regular O_DIRECT file.
+
+### Files Changed (this session)
+
+| File | Purpose |
+|------|---------|
+| `mm/cell_store.c` | 1:1 mapping: drop allocator, extent=cellid, capacity check |
+| `include/linux/cell_store.h` | slim `cell_backing`, cell.state only |
+| `specs/07_WHOLE_CELL_DISK_SWAP.md` | updated to the 1:1 design |
+
+### Test Results (this session)
+
+- i386 + x86_64 compile gates and full `mm/` build: 0 warnings / 0
+  errors after the refactor.
+- Runtime still untested (unchanged from Session 1).
