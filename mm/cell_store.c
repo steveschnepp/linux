@@ -774,13 +774,18 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 		 * the devtmpfs device-node inode has i_size 0. */
 		size_bytes = i_size_read(filp->f_mapping->host);
 	} else if (S_ISREG(inode->i_mode)) {
-		/* Regular file: fallocate to swapsize=, else use its size. */
+		/* Regular file: fallocate to swapsize=, else use its size.
+		 * Some filesystems (ext2, vfat) lack fallocate -- fall back to
+		 * the file's current size (pre-sized by the caller via
+		 * ftruncate); the capacity check below still applies. */
 		if (size_bytes) {
 			int ret = vfs_fallocate(filp, 0, 0, size_bytes);
 
 			if (ret) {
-				fput(filp);
-				return ret;
+				size_bytes = i_size_read(inode);
+				pr_warn("cell_store: fallocate %s failed (%d); "
+					"using file size %llu\n", path, ret,
+					size_bytes);
 			}
 		} else {
 			size_bytes = i_size_read(inode);
