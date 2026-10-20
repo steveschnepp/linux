@@ -98,26 +98,38 @@ extent-aligned, satisfying O_DIRECT's alignment requirement.
 
 ### Cell state
 
-`struct cell` gains swap state. A cell is IN_RAM or ON_DISK, never both;
-the transition is serialised per-cell. The backing extent is the cellid
-itself (1:1), so no per-cell disk offset is stored.
+`struct cell` tracks residency and disk presence with **two independent
+bits** -- RAM is a cache of the authoritative disk copy. The backing
+extent is the cellid itself (1:1), so no per-cell disk offset is stored.
 
 ```c
-enum cell_state {
-	CELL_IN_RAM = 0,   /* pages[] valid, base valid */
-	CELL_ON_DISK,      /* pages[] NULL, backing extent holds the data */
-};
-
 struct cell {
 	/* ...existing fields... */
-	enum cell_state state;
+	bool in_ram;    /* pages[]/base valid (resident) */
+	bool on_disk;   /* a valid disk copy exists at extent cellid */
 };
 ```
 
-`state` is guarded by `cp->lock` and is stable under the cell rwsem
+State machine (the bits, in order):
+
+| event | in_ram | on_disk |
+|-------|--------|---------|
+| free slot | 0 | 0 |
+| new cell (compressed into) | 1 | 0 |
+| first swap-out (write extent) | 0 | 1 |
+| swap-in (read extent) | 1 | 1 (RAM caches disk) |
+| re-swap under pressure (no write) | 0 | 1 |
+| free() | 0 | 0 (extent punched if it was 1) |
+
+Both bits are guarded by `cp->lock` and are stable under the cell rwsem
 (swap-in and swap-out are the only writers, both under `down_write`).
 Concurrent swap-in of one cell is serialised by that `down_write` (the
-losers re-check state and find IN_RAM).
+losers re-check `in_ram` and find it set).
+
+Because a non-active cell is immutable (invariant #1), a resident copy of
+an already-on-disk cell is byte-identical to the disk copy -- so a
+re-swap needs **no extent write**: it just clears `in_ram`, leaving the
+disk copy authoritative. Only a cell's *first* swap-out writes.
 
 ### Swap-out (whole cell, raw)
 
@@ -131,83 +143,90 @@ exposes:
 unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
 ```
 
-Selection: non-active, `state == CELL_IN_RAM`, `live_bytes > 0`, and
-not currently a GC victim. (Non-active cells are content-immutable --
-invariant #1 -- so no new block can land in a cell we are paging out.)
-Prefer full cells first (biggest RAM win); the first cut may simply take
-any eligible cell up to `max`.
+Selection: non-active, `in_ram`, `live_bytes > 0`, and not currently a
+GC victim. (Non-active cells are content-immutable -- invariant #1 -- so
+no new block can land in a cell we are paging out.)
 
 Per cell:
 1. Take `down_write(&c->lock)` -- this excludes concurrent `cell_load`
    readers (which hold `down_read` across their memcpy) and a GC
    evacuation, and it serialises concurrent swap-ins of the same cell.
-2. Under `cp->lock`: set `state = CELL_ON_DISK`, unlink from
-   `cp->sparse` (so GC never harvests an on-disk cell). The disk slot is
-   the cellid itself (1:1), so there is nothing to allocate.
-3. `kernel_write` the cell's `cell_size` bytes to extent `cellid`
-   (O_DIRECT), outside `cp->lock`.
+2. Under `cp->lock`: record `was_on_disk`, unlink from `cp->sparse`.
+3. If `!was_on_disk` (first swap-out): `kernel_write` the cell's
+   `cell_size` bytes to extent `cellid` (O_DIRECT), outside `cp->lock`.
+   If `was_on_disk` (re-swap): **skip the write** -- the disk copy is
+   still valid.
 4. `__free_pages(c->pages[0], cp->cell_order)`; clear `pages[0]`/`base`;
-   subtract from `pages_used`. Drop the rwsem.
+   set `in_ram = 0`, `on_disk = 1`; subtract from `pages_used`. Drop the
+   rwsem.
 
-If the write fails, roll back `state` to IN_RAM and leave the cell
-resident (the partial disk image is ignored).
+If the first-swap-out write fails, leave the cell resident (`in_ram`
+stays 1, `on_disk` unchanged) -- nothing was written.
 
 ### Swap-in (whole cell, raw)
 
-`cell_load()` gains a swap-in prologue. If `state == CELL_ON_DISK`:
+`cell_load()` gains a swap-in prologue. If `!in_ram && on_disk`:
 
 ```c
 static int cell_swap_in(struct cell_pool *cp, struct cell *c);
 ```
 
-1. Take `down_write(&c->lock)`; re-check `state` under it. If already
-   IN_RAM, a concurrent loader won -- return 0. The `down_write` is the
-   serializer: N concurrent loaders collapse to one swap-in.
+1. Take `down_write(&c->lock)`; re-check `in_ram` under it. If already
+   set, a concurrent loader won -- return 0. If `!on_disk` (free slot),
+   return `-EINVAL`. The `down_write` is the serializer: N concurrent
+   loaders collapse to one swap-in.
 2. `alloc_pages(cell_gfp(cp), cp->cell_order)` for the cell;
    `kernel_read` extent `cellid` into the new pages (O_DIRECT), outside
-   `cp->lock`. If the read fails, free the pages, leave state ON_DISK,
-   and return the error.
-3. Under `cp->lock` install `pages[0]`/`base`, set `state = CELL_IN_RAM`,
-   add to `pages_used`. Drop the rwsem.
+   `cp->lock`. If the read fails, free the pages, leave `on_disk` (still
+   1, `in_ram` 0), and return the error.
+3. Under `cp->lock` install `pages[0]`/`base`, set `in_ram = 1`
+   (`on_disk` STAYS 1 -- RAM caches disk), add to `pages_used`. Drop the
+   rwsem.
 
 The caller then proceeds with the normal `memcpy` from `c->base + offset`.
 A cell swapped back in rejoins the in-RAM pool (eligible for GC, and
 re-swappable once cold again).
 
-### Dirty tracking
+### Write-free re-swap
 
-None needed. A non-active cell is immutable (invariant #1), and the
-active cell is never swapped out -- so a cell's bytes never change while
-it is ON_DISK, and every swap-out writes the full cell. There is no
-partial update and no dirty bit; a cell swapped in for a read simply
-rejoins the resident pool and is rewritten wholesale on its next
-swap-out.
+The two-bit model needs no dirty bit: a non-active cell is immutable
+(invariant #1) and the active cell is never swapped out, so a resident
+copy of an on-disk cell is always byte-identical to the disk copy. A
+re-swap therefore just clears `in_ram` (no extent write); only a cell's
+first swap-out writes. This is the flash-endurance win: a cell that
+churns between RAM and disk writes its extent once, not per swap.
 
 ### GC interaction
 
-- `cell_pool_pick_victim()` skips `state == CELL_ON_DISK` cells (they
-  hold no RAM to reclaim and are already cold).
-- An on-disk cell is only GC'd after being swapped in: a read brings it
+- `cell_pool_pick_victim()` skips disk-only cells (`!in_ram`), and
+  re-validates `in_ram` under `down_write` (a concurrent swap-out could
+  drop the resident copy between the sparse-list walk and the lock --
+  returning such a cell would let `cell_relocate_one` read a NULL base).
+- A disk-only cell is only GC'd after being swapped in: a read brings it
   resident, it becomes sparse-eligible, and a later pass evacuates it.
-- Evacuation/empty-return of a cell leaves its disk slot alone (1:1: the
-  extent is permanent and simply overwritten next time that cellid swaps
-  out); only the RAM is freed.
+- Evacuation/empty-return of a cell frees only RAM; the disk copy stays
+  (on_disk stays 1) until the cell is freed.
 
 ### Free / evacuate / teardown
 
-- `cell_free()` on an ON_DISK cell: decrement `live_bytes` (no RAM is
-  held). If it reaches 0, drop the slot back to free (the disk extent is
-  permanent and ignored). If it becomes sparse but non-empty, leave it on
-  disk (disk is cheap); it is reclaimed after a swap-in.
-- `cell_pool_return()` / `cell_pool_release_victim()` free only RAM (the
-  disk slot is permanent and needs no release).
+- `cell_free()`: decrement `live_bytes` (a disk-only cell still holds
+  live_bytes). On empty, dispose on BOTH: return the resident pages (if
+  `in_ram`) and **punch the extent** (if `on_disk`) via
+  `FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE`, then clear both bits. The
+  punch can issue discard/TRIM, letting an eMMC/SSD reclaim the physical
+  blocks and lowering write amplification on the extent's next use. On
+  non-empty + sparse: link to `cp->sparse` only if `in_ram` (GC needs
+  resident pages); a disk-only sparse cell is left on disk.
+- `cell_pool_return()` / `cell_pool_release_victim()` free only RAM; the
+  disk copy stays until the cell is freed.
 - `cell_pool_destroy()` closes the backing file; no swap image survives
   the pool.
 
 ### Locking
 
-- `cp->lock` guards `state` and the directory; it is never held across
-  I/O (O_DIRECT read/write happen outside it).
+- `cp->lock` guards `in_ram`/`on_disk` and the directory; it is never
+  held across I/O (O_DIRECT read/write and the free-path punch happen
+  outside it).
 - Per-cell rwsem (`c->lock`): swap-out and swap-in take `down_write`
   (excludes `cell_load` readers and GC evacuation, and serialises
   concurrent swap-ins); `cell_load` takes `down_read` for its memcpy.
@@ -216,9 +235,16 @@ swap-out.
 ### Mount option
 
 `swapfile=<path>` (enables the backing; absent = no swap tier, current
-behaviour) and `swapsize=<bytes>` (backing extent count; default derived
-or a fixed multiple of the mount size). Parsed alongside the existing
-options in `mm/shmem.c`; carried to `cell_pool_create()`.
+behaviour) and `swapsize=<bytes>` (backing size; 0 = the file's current
+size). The file must be a positive multiple of the cell size AND hold
+>= `nslots` extents (disk >= the pool's cell capacity) -- a smaller
+backing is refused (`-ENOSPC`). Parsed in `mm/shmem.c`; carried through
+`shmem_comp_pool_create()` to `cell_pool_enable_backing()`.
+
+For the free-path TRIM (discard) to actually reach the device, the
+backing file should live on a filesystem mounted with `discard` (or be
+covered by periodic `fstrim`), and that fs must support
+`FALLOC_FL_PUNCH_HOLE`. Otherwise the punch is a best-effort no-op.
 
 ## Build Changes
 
