@@ -239,6 +239,14 @@ struct cell_pool {
 	struct list_head sparse;	/* cells below gc_percent utilization */
 	atomic_long_t	pages_used;	/* (1 << cell_order) * live cells */
 	/*
+	 * Whole-cell swap observability (specs/07): monotonic counts of
+	 * cells paged out to / in from the backing.  Lets a test assert the
+	 * tier actually engaged (cell RAM pages alone also drop on GC/free,
+	 * so they are not a clean signal).  Zero-initialised.
+	 */
+	atomic_long_t	cells_swapped_out;
+	atomic_long_t	cells_swapped_in;
+	/*
 	 * Registered by the compression layer when the pool is cell-
 	 * backed; NULL otherwise.  The shrinker is the async GC trigger
 	 * under memory pressure.

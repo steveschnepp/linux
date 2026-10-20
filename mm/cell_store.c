@@ -578,6 +578,7 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	c->base = base;
 	c->in_ram = true;		/* on_disk stays set: RAM caches disk */
 	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
+	atomic_long_inc(&cp->cells_swapped_in);
 	spin_unlock(&cp->lock);
 
 	up_write(&c->lock);
@@ -696,6 +697,7 @@ static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
 	c->in_ram = false;
 	c->on_disk = true;
 	atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
+	atomic_long_inc(&cp->cells_swapped_out);
 	spin_unlock(&cp->lock);
 	up_write(&c->lock);
 	return 0;

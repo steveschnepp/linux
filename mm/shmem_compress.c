@@ -2150,10 +2150,11 @@ int shmem_comp_cell_stats_show(char *buf, size_t size)
 			continue;
 
 		off += scnprintf(buf + off, size - off,
-			"pool %d: order=%u use_thp=%d nr_cells=%u pages_used=%ld gc_percent=%u\n",
+			"pool %d: order=%u use_thp=%d nr_cells=%u pages_used=%ld gc_percent=%u swap_out=%ld swap_in=%ld\n",
 			pool_id, cp->cell_order, cp->use_thp,
 			cp->nr_cells, atomic_long_read(&cp->pages_used),
-			cp->gc_percent);
+			cp->gc_percent, atomic_long_read(&cp->cells_swapped_out),
+			atomic_long_read(&cp->cells_swapped_in));
 
 		for (i = 0; i < cp->nr_cells; i++) {
 			struct cell *c = &cp->cells[i];
