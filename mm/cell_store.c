@@ -729,28 +729,48 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 {
 	struct cell_backing *b;
 	struct file *filp;
+	struct inode *inode;
+	bool is_blkdev;
 	u64 cell_size, nr;
 
 	if (!cp || !path || !path[0])
 		return -EINVAL;
 	cell_size = (u64)PAGE_SIZE << cp->cell_order;
 
+	/*
+	 * The backing may be a regular file (common case: a file on a
+	 * mounted disk fs) or a raw block device/partition (swap=/dev/...).
+	 * O_DIRECT on either bypasses the page cache -- load-bearing, since
+	 * a buffered backing would re-pin the RAM the swap frees.
+	 */
 	filp = filp_open(path, O_RDWR | O_DIRECT | O_LARGEFILE, 0);
 	if (IS_ERR(filp))
 		return PTR_ERR(filp);
+	inode = file_inode(filp);
+	is_blkdev = S_ISBLK(inode->i_mode);
 
-	if (size_bytes) {
-		int ret = vfs_fallocate(filp, 0, 0, size_bytes);
+	if (is_blkdev) {
+		/* Raw device/partition: the size is the device capacity;
+		 * swapsize= is ignored (nothing to fallocate). */
+		size_bytes = i_size_read(inode);
+	} else if (S_ISREG(inode->i_mode)) {
+		/* Regular file: fallocate to swapsize=, else use its size. */
+		if (size_bytes) {
+			int ret = vfs_fallocate(filp, 0, 0, size_bytes);
 
-		if (ret) {
-			fput(filp);
-			return ret;
+			if (ret) {
+				fput(filp);
+				return ret;
+			}
+		} else {
+			size_bytes = i_size_read(inode);
 		}
 	} else {
-		size_bytes = i_size_read(file_inode(filp));
+		fput(filp);
+		return -EINVAL;	/* neither a regular file nor a device */
 	}
 
-	/* One extent == one cell; the file must be a positive multiple. */
+	/* One extent == one cell; the backing must be a positive multiple. */
 	if (size_bytes < cell_size || (size_bytes & (cell_size - 1))) {
 		fput(filp);
 		return -EINVAL;
@@ -782,8 +802,9 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 	b->cell_size = cell_size;
 
 	cp->backing = b;
-	pr_info("cell_store: whole-cell swap backing %s, %llu extents x "
-		"%llu KiB (1:1 with %u cells)\n", path, nr, cell_size / 1024,
+	pr_info("cell_store: whole-cell swap backing %s (%s), %llu extents "
+		"x %llu KiB (1:1 with %u cells)\n", path,
+		is_blkdev ? "device" : "file", nr, cell_size / 1024,
 		cp->nslots);
 	return 0;
 }

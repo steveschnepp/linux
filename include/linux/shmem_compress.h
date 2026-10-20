@@ -371,10 +371,12 @@ struct shmem_comp_opts {
 	bool age_batch_seen;
 	unsigned int gc_debounce_ms;	/* demand-GC debounce */
 	bool gc_debounce_seen;
-	/* Whole-cell disk swap backing (specs/07).  swapfile NULL = no
-	 * backing (cells stay resident).  swapsize 0 = the file's size. */
-	char *swapfile;			/* backing file path, owned */
-	unsigned long long swapsize_bytes;	/* backing size; 0 = file size */
+	/* Whole-cell disk swap backing (specs/07): a regular file or a
+	 * raw device.  swap_backing NULL = no backing (cells stay
+	 * resident).  swapsize 0 = the backing's own size (file size, or
+	 * device capacity). */
+	char *swap_backing;		/* backing path (file or dev), owned */
+	unsigned long long swapsize_bytes;	/* file backing size; 0 = own */
 };
 
 void shmem_comp_opts_init(struct shmem_comp_opts *opts);
@@ -560,7 +562,7 @@ struct shmem_comp_pool *shmem_comp_pool_create(const char *algo,
 						unsigned int nr_cells,
 						unsigned int gc_percent,
 						unsigned int gc_debounce_ms,
-						const char *swapfile,
+						const char *swap_backing,
 						unsigned long long swapsize_bytes);
 
 /**

@@ -328,15 +328,16 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
 
 /*
- * Attach a whole-cell disk backing (specs/07): an O_DIRECT file carved
- * into 1:1 cell-sized extents (cell N -> extent N).  @size_bytes == 0
- * uses the file's current size; otherwise the file is fallocate'd to
- * it.  Must be a positive multiple of the cell size AND hold at least
- * one extent per directory slot (>= pool->nslots cells) -- a smaller
- * backing is refused with -ENOSPC (no allocator fallback).  Called once,
- * right after pool create and before the first store/swap.  On failure
- * no backing is attached (cells stay resident) and the pool remains
- * usable.
+ * Attach a whole-cell disk backing (specs/07): an O_DIRECT regular file
+ * OR raw block device/partition, carved into 1:1 cell-sized extents
+ * (cell N -> extent N).  For a file, @size_bytes fallocates it (0 = the
+ * file's size); for a device the capacity is used and @size_bytes is
+ * ignored.  Either way the backing must be a positive multiple of the
+ * cell size AND hold >= pool->nslots extents (disk >= the pool's cell
+ * capacity) -- a smaller backing is refused with -ENOSPC (no allocator
+ * fallback).  Called once, right after pool create and before the first
+ * store/swap.  On failure no backing is attached (cells stay resident)
+ * and the pool remains usable.
  */
 int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 			     u64 size_bytes);
