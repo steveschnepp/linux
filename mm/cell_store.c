@@ -25,6 +25,7 @@
 #include <linux/file.h>
 #include <linux/uio.h>
 #include <linux/fcntl.h>
+#include <linux/falloc.h>
 #include <linux/cell_store.h>
 
 #define cell_dbg(fmt, ...) \
@@ -81,6 +82,26 @@ static int cell_backing_read_cell(struct cell_pool *cp, struct cell *c,
 
 	r = kernel_read(cp->backing->filp, base, len, &pos);
 	return (r == (ssize_t)len) ? 0 : (r < 0 ? (int)r : -EIO);
+}
+
+/*
+ * Discard a freed cell's disk extent (1:1: extent cellid).  A cell's
+ * data is authoritative on disk once swapped out (RAM is a cache of it),
+ * so the extent is released only when the cell's data dies -- on free().
+ * PUNCH_HOLE can issue discard/TRIM to the device, letting an eMMC/SSD
+ * reclaim the physical blocks and lowering write amplification on the
+ * extent's next write.  Best-effort: a backing fs without punch/discard,
+ * or a failed discard, is not an error.  Called from cell_free's empty
+ * path, outside cp->lock (fallocate sleeps).
+ */
+static void cell_backing_discard_extent(struct cell_pool *cp, u32 cellid)
+{
+	if (!cp->backing || !cp->backing->filp)
+		return;
+	vfs_fallocate(cp->backing->filp,
+		      FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+		      (loff_t)cellid * cp->backing->cell_size,
+		      cp->backing->cell_size);
 }
 
 struct cell_pool *cell_pool_create(unsigned int order, bool use_thp,
@@ -422,12 +443,11 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 
 	c = &cp->cells[cellid];
 	/*
-	 * A never-allocated or already-returned slot has no pages and no
-	 * swap state.  An ON_DISK cell has live_bytes but no resident
-	 * pages -- it must still be accounted (a truncate can free a
-	 * block behind a paged-out cell).
+	 * A free slot holds neither a resident copy (in_ram) nor a disk
+	 * copy (on_disk).  A cell with either must still be accounted (a
+	 * truncate can free a block behind a paged-out cell).
 	 */
-	if (!c->pages[0] && c->state != CELL_ON_DISK) {
+	if (!c->in_ram && !c->on_disk) {
 		spin_unlock(&cp->lock);
 		return;
 	}
@@ -441,29 +461,58 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 		 empty ? " -> empty" :
 		 cell_is_sparse(cp, c->live_bytes) ? " -> sparse" : "");
 
-	if (c->state == CELL_ON_DISK) {
+	if (empty) {
 		/*
-		 * No RAM is held, so the only reclamation is the disk
-		 * extent.  On empty, recycle the extent and drop the slot
-		 * back to the free state.  A sparse non-empty on-disk cell
-		 * is left on disk (disk is cheap) and reclaimed after a
-		 * later swap-in; it is deliberately NOT linked into the
-		 * sparse list, because GC needs resident pages.
+		 * Dispose on BOTH RAM and disk (specs/07): return the
+		 * resident pages if any, discard the disk extent (can issue
+		 * discard/TRIM) so no stale copy survives, and drop the slot
+		 * fully free (both bits clear).
 		 */
-		if (empty) {
-			/* 1:1: the disk slot is permanent (extent cellid), so
-			 * there is nothing to free -- just drop the slot back
-			 * to the free state. */
-			c->state = CELL_IN_RAM;	/* free slot again */
+		bool was_in_ram = c->in_ram;
+		bool was_on_disk = c->on_disk;
+
+		c->on_disk = false;
+		if (was_in_ram) {
+			/*
+			 * Resident empty: return the pages to the buddy.
+			 * down_read excludes a concurrent GC holding this cell
+			 * as victim; without it we could __free_pages() memory
+			 * a GC reader is memcpy'ing from.  The recheck under
+			 * both locks closes the window where GC relocated the
+			 * last objects and returned the cell itself.
+			 */
+			spin_unlock(&cp->lock);
+			down_read(&c->lock);
+			spin_lock(&cp->lock);
+			if (c->pages[0] && c->live_bytes == 0)
+				cell_pool_return(cp, c);
+			c->in_ram = false;
 			c->live_objects = 0;
 			spin_unlock(&cp->lock);
-			return;
+			up_read(&c->lock);
+		} else {
+			/* Disk-only empty: no RAM to return. */
+			c->in_ram = false;
+			c->live_objects = 0;
+			spin_unlock(&cp->lock);
 		}
+		/* The disk copy is dead too: TRIM the extent. */
+		if (was_on_disk)
+			cell_backing_discard_extent(cp, cellid);
+		return;
+	}
+
+	if (!c->in_ram) {
+		/*
+		 * Disk-only and sparse: left on disk (disk is cheap),
+		 * reclaimed after a later swap-in.  Deliberately NOT linked
+		 * into the sparse list, because GC needs resident pages.
+		 */
 		spin_unlock(&cp->lock);
 		return;
 	}
 
-	if (!empty && cell_is_sparse(cp, c->live_bytes)) {
+	if (cell_is_sparse(cp, c->live_bytes)) {
 		/*
 		 * Sparse (gc_percent byte utilization, default 50): hand to
 		 * the async GC.  Evacuation never runs in the freeing
@@ -479,33 +528,16 @@ void cell_free(struct cell_pool *cp, u32 cellid, u32 offset,
 	}
 
 	spin_unlock(&cp->lock);
-
-	if (!empty)
-		return;
-
-	/*
-	 * Tier 1: the cell is empty — nothing to move, so the pages go
-	 * back to the buddy inline.  This is what makes MemFree track
-	 * tmpfs usage without waiting for a shrinker.  down_read excludes
-	 * a concurrent GC holding this cell as victim; without it we
-	 * could __free_pages() memory a GC reader is memcpy'ing from.
-	 * The recheck under both locks closes the window where GC
-	 * relocated the last objects and returned the cell itself.
-	 */
-	down_read(&c->lock);
-	spin_lock(&cp->lock);
-	if (c->pages[0] && c->live_bytes == 0)
-		cell_pool_return(cp, c);
-	spin_unlock(&cp->lock);
-	up_read(&c->lock);
 }
 
 /*
- * Swap an ON_DISK cell back into RAM (whole, raw).  Takes c->lock for
- * write: that excludes concurrent cell_load readers and a GC eviction,
- * and it is the serializer that collapses N concurrent loaders into one
- * swap-in (the losers re-check state under the lock and find IN_RAM).
- * The O_DIRECT read sleeps but never runs under cp->lock.
+ * Swap an on-disk-only cell back into RAM (whole, raw).  Takes c->lock
+ * for write: that excludes concurrent cell_load readers and a GC
+ * eviction, and it is the serializer that collapses N concurrent loaders
+ * into one swap-in (the losers re-check in_ram and find it set).  Sets
+ * in_ram while LEAVING on_disk set -- the resident copy is a cache of
+ * the authoritative disk copy.  The O_DIRECT read sleeps but never runs
+ * under cp->lock.
  */
 static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 {
@@ -518,11 +550,11 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 		return -EINVAL;
 
 	down_write(&c->lock);
-	if (c->state == CELL_IN_RAM) {		/* lost the race; already in */
+	if (c->in_ram) {			/* lost the race; already in */
 		up_write(&c->lock);
 		return 0;
 	}
-	if (c->state != CELL_ON_DISK) {		/* free slot */
+	if (!c->on_disk) {			/* free slot */
 		up_write(&c->lock);
 		return -EINVAL;
 	}
@@ -544,7 +576,7 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	spin_lock(&cp->lock);
 	c->pages[0] = page;
 	c->base = base;
-	c->state = CELL_IN_RAM;
+	c->in_ram = true;		/* on_disk stays set: RAM caches disk */
 	atomic_long_add(1UL << cp->cell_order, &cp->pages_used);
 	spin_unlock(&cp->lock);
 
@@ -564,23 +596,26 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	c = &cp->cells[cellid];
 
 	/*
-	 * Whole-cell swap-in loop: a cell found ON_DISK is paged back in
-	 * (whole, raw) and we retry.  c->state is stable under down_read
-	 * because only swap-in/swap-out mutate it and both take
-	 * down_write.  A concurrent swap-out could re-page the cell out
-	 * between our up_read and the next down_read, so this loops; it
-	 * terminates once the cell stays resident long enough to serve
-	 * the memcpy below (which holds down_read throughout).
+	 * Whole-cell swap-in loop: a cell with no resident copy but a disk
+	 * copy is paged back in (whole, raw) and we retry.  in_ram/on_disk
+	 * are stable under down_read because only swap-in/swap-out mutate
+	 * them and both take down_write.  A concurrent swap-out could drop
+	 * the resident copy between our up_read and the next down_read, so
+	 * this loops; it terminates once the cell stays resident long
+	 * enough to serve the memcpy below (which holds down_read
+	 * throughout).
 	 */
 	for (;;) {
 		down_read(&c->lock);
-		if (c->state != CELL_ON_DISK) {
+		if (c->in_ram) {
 			if (c->pages[0] && c->base)
 				break;	/* resident: serve below */
 			up_read(&c->lock);
-			return -EINVAL;	/* free slot */
+			return -EINVAL;	/* corrupt: in_ram without pages */
 		}
 		up_read(&c->lock);
+		if (!c->on_disk)
+			return -EINVAL;	/* free slot */
 		{
 			int ret = cell_swap_in(cp, c);
 			if (ret)
@@ -614,50 +649,56 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 /*
  * Swap one resident cell out to the backing (whole, raw).  Takes
  * c->lock for write so it cannot race a cell_load memcpy or a GC
- * evacuation.  The state flips to ON_DISK (and the cell unlinks from the
- * sparse list) BEFORE the I/O so a concurrent shrinker/GC sees it as
- * on-disk and skips it.  On I/O failure the cell rolls back to resident.
- * Process context only (sleeps on I/O): the aging workqueue, never the
- * shrinker (reclaim context; I/O there risks recursion).
+ * evacuation.  Process context only (sleeps on I/O): the aging
+ * workqueue, never the shrinker (reclaim context; I/O there risks
+ * recursion).
+ *
+ * The extent is written ONLY on the first swap-out (on_disk clear).  If a
+ * disk copy already exists, the resident bytes are a cache of it and are
+ * identical (non-active cells are immutable), so the write is skipped and
+ * we just drop the RAM cache -- a re-swap is write-free, the flash-
+ * endurance win of the 2-bit model.
  */
 static int cell_swap_out_one(struct cell_pool *cp, struct cell *c)
 {
-	int ret;
+	bool was_on_disk;
+	int ret = 0;
 
 	down_write(&c->lock);
 	spin_lock(&cp->lock);
-	if (c == cp->active || c->state != CELL_IN_RAM || !c->pages[0] ||
+	if (!c->in_ram || c == cp->active || !c->pages[0] ||
 	    c->live_bytes == 0) {
 		spin_unlock(&cp->lock);
 		up_write(&c->lock);
 		return -EBUSY;
 	}
-	/* 1:1 mapping: this cell's permanent disk slot is extent cellid, so
-	 * there is nothing to allocate and no ENOSPC possible.  Flip state
-	 * before the I/O so a concurrent shrinker/GC skips the cell. */
-	c->state = CELL_ON_DISK;
+	was_on_disk = c->on_disk;
 	if (!list_empty(&c->node))
 		list_del_init(&c->node);
 	spin_unlock(&cp->lock);
 
-	/* c->base is valid and stable: we hold c->lock for write. */
-	ret = cell_backing_write_cell(cp, c);
-	if (!ret) {
-		__free_pages(c->pages[0], cp->cell_order);
-		spin_lock(&cp->lock);
-		c->pages[0] = NULL;
-		c->base = NULL;
-		atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
-		spin_unlock(&cp->lock);
-	} else {
-		/* Roll back to resident; the (partial) disk image is ignored
-		 * because state returns to IN_RAM. */
-		spin_lock(&cp->lock);
-		c->state = CELL_IN_RAM;
-		spin_unlock(&cp->lock);
+	/* First time on disk: persist the resident image to extent cellid.
+	 * c->base is valid and stable: we hold c->lock for write. */
+	if (!was_on_disk) {
+		ret = cell_backing_write_cell(cp, c);
+		if (ret) {
+			/* Stay resident; nothing written, on_disk unchanged. */
+			up_write(&c->lock);
+			return ret;
+		}
 	}
+
+	/* Data is now (or already was) on disk: drop the RAM cache. */
+	__free_pages(c->pages[0], cp->cell_order);
+	spin_lock(&cp->lock);
+	c->pages[0] = NULL;
+	c->base = NULL;
+	c->in_ram = false;
+	c->on_disk = true;
+	atomic_long_sub(1UL << cp->cell_order, &cp->pages_used);
+	spin_unlock(&cp->lock);
 	up_write(&c->lock);
-	return ret;
+	return 0;
 }
 
 unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max)
@@ -674,7 +715,7 @@ unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max)
 		/* Selection is a heuristic (re-checked under lock in
 		 * cell_swap_out_one): resident, non-empty, non-sparse.  The
 		 * active cell and sparse cells (GC's job) are skipped. */
-		if (c->state != CELL_IN_RAM || c->live_bytes == 0 ||
+		if (!c->in_ram || c->live_bytes == 0 ||
 		    cell_is_sparse(cp, c->live_bytes))
 			continue;
 		if (cell_swap_out_one(cp, c) == 0)
@@ -783,14 +824,23 @@ struct cell *cell_pool_pick_victim(struct cell_pool *cp)
 		 */
 		if (c == cp->active)
 			continue;
-		/* Never harvest an ON_DISK cell: it holds no RAM to reclaim
-		 * (swap-out already unlinked it from sparse; this is a
-		 * defensive skip for a cell freed->sparse while on disk). */
-		if (c->state == CELL_ON_DISK)
+		/* Never harvest a disk-only cell: it holds no RAM to reclaim. */
+		if (!c->in_ram)
 			continue;
 		list_del_init(&c->node);
 		spin_unlock(&cp->lock);
 		down_write(&c->lock);
+		/*
+		 * Re-validate under down_write: a concurrent whole-cell
+		 * swap-out may have dropped the resident copy between the
+		 * list walk and this lock.  Returning such a cell would let
+		 * cell_relocate_one read a NULL base.  Bail (no victim this
+		 * pass) rather than use it.
+		 */
+		if (!c->in_ram || !c->pages[0] || c->live_bytes == 0) {
+			up_write(&c->lock);
+			return NULL;
+		}
 		return c;
 	}
 	spin_unlock(&cp->lock);

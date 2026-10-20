@@ -124,17 +124,13 @@ struct file;
 #define GC_MAX_VICTIMS	64
 
 /*
- * Whole-cell disk swap (specs/07_WHOLE_CELL_DISK_SWAP.md).  A cell is
- * either wholly in RAM (pages[] valid) or wholly on disk (a backing
- * extent holds its raw bytes), never both.  Only the data leaves RAM;
- * the directory (this struct, indexed by cellid) always stays resident.
- * The swap unit is the whole cell, moved as RAW bytes -- a cell already
- * holds compressed blobs, so the swap path does no compression.
+ * Whole-cell disk swap (specs/07_WHOLE_CELL_DISK_SWAP.md).  The swap
+ * unit is the whole cell, moved as RAW bytes -- a cell already holds
+ * compressed blobs, so the swap path does no compression.  Only the data
+ * leaves RAM; the directory (struct cell, indexed by cellid) always
+ * stays resident.  Per-cell residency and disk presence are tracked by
+ * TWO independent bits (see struct cell): in_ram and on_disk.
  */
-enum cell_state {
-	CELL_IN_RAM = 0,	/* pages[]/base valid */
-	CELL_ON_DISK,		/* pages[] NULL; backing extent holds the data */
-};
 
 /*
  * The pool-owned disk backing: an O_DIRECT file carved into fixed
@@ -167,8 +163,8 @@ struct cell {
 	 * page needs its own slot; the head is stored so the free path
 	 * can find it.
 	 *
-	 * NULL while the slot is free OR while the cell is ON_DISK (both
-	 * read as "no resident pages"; state disambiguates).
+	 * NULL while the slot has no resident copy (free, or swapped out
+	 * to disk); in_ram distinguishes "resident" from "free/on-disk".
 	 */
 	struct page	*pages[1];
 	void		*base;		/* virtual base = page_address(pages[0]) */
@@ -184,12 +180,19 @@ struct cell {
 	struct rw_semaphore lock;
 	struct list_head node;		/* linkage in pool->sparse list */
 	/*
-	 * Whole-cell disk swap state (specs/07).  state is guarded by
-	 * cp->lock and is stable under the cell rwsem (only swap-in and
-	 * swap-out mutate it, both under down_write).  The backing extent
-	 * is cellid itself (1:1), so no per-cell disk offset is stored.
+	 * Whole-cell disk swap state (specs/07): two independent bits --
+	 * RAM is a cache of the authoritative disk copy.
+	 *   in_ram   -- pages[]/base valid (resident).
+	 *   on_disk  -- a valid disk copy exists at extent cellid (1:1).
+	 * A new cell is in_ram only; the first swap-out persists it and
+	 * leaves on_disk only; a swap-in sets in_ram (on_disk stays, so a
+	 * re-swap is write-free); free() with on_disk set punches (TRIMs)
+	 * the extent.  Both bits are guarded by cp->lock and stable under
+	 * the cell rwsem (only swap-in/swap-out mutate them, both under
+	 * down_write).
 	 */
-	enum cell_state state;
+	bool		in_ram;
+	bool		on_disk;
 };
 
 struct cell_pool {
