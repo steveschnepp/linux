@@ -3291,8 +3291,19 @@ static ssize_t gc_now_store(struct kobject *kobj,
 	 * gate (specs/06).
 	 */
 	mutex_lock(&shmem_comp_mounts_lock);
-	list_for_each_entry(comp, &shmem_comp_mounts, list)
+	list_for_each_entry(comp, &shmem_comp_mounts, list) {
 		shmem_comp_maintain(comp, true);
+		/*
+		 * Whole-cell disk swap (specs/07): gc_now is an immediate-
+		 * relief request, so also kick the aging work, which pages
+		 * cold cells to the backing.  mod_delayed_work is safe under
+		 * this mutex; the actual swap-out I/O runs in the workqueue,
+		 * OUTSIDE the lock (holding mounts_lock across the I/O could
+		 * deadlock via reclaim -> shrinker -> maintain).  This is the
+		 * deterministic swap-out trigger for tests.
+		 */
+		mod_delayed_work(system_wq, &comp->age_work, 0);
+	}
 	mutex_unlock(&shmem_comp_mounts_lock);
 
 	shmem_comp_cell_gc_all();
