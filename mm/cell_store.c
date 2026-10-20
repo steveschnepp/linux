@@ -327,6 +327,8 @@ static struct cell *cell_make_active(struct cell_pool *cp, unsigned int len,
 	c->next_free = 0;
 	c->live_bytes = 0;
 	c->live_objects = 0;
+	c->in_ram = true;	/* fresh resident cell */
+	c->on_disk = false;	/* never backed until first swap-out */
 	INIT_LIST_HEAD(&c->node);
 	/* rwsem initialised once at pool create — slots are reused */
 
@@ -585,6 +587,20 @@ static int cell_swap_in(struct cell_pool *cp, struct cell *c)
 	return 0;
 }
 
+/*
+ * Ensure cell @cellid is resident: if it was paged out to the backing,
+ * swap it back in (whole, raw).  Returns 0 when resident (or just swapped
+ * in), negative errno otherwise.  Called from the compression layer's
+ * read path (shmem_comp_loc_read), which accesses cells directly rather
+ * than via cell_load().
+ */
+int cell_ensure_resident(struct cell_pool *cp, u32 cellid)
+{
+	if (!cp || cellid >= cp->nslots)
+		return -EINVAL;
+	return cell_swap_in(cp, &cp->cells[cellid]);
+}
+
 int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
 	      void *dst, unsigned int *len)
 {
@@ -753,8 +769,10 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 
 	if (is_blkdev) {
 		/* Raw device/partition: the size is the device capacity;
-		 * swapsize= is ignored (nothing to fallocate). */
-		size_bytes = i_size_read(inode);
+		 * swapsize= is ignored (nothing to fallocate).  Read it from
+		 * the bdev inode (filp->f_mapping->host), NOT file_inode():
+		 * the devtmpfs device-node inode has i_size 0. */
+		size_bytes = i_size_read(filp->f_mapping->host);
 	} else if (S_ISREG(inode->i_mode)) {
 		/* Regular file: fallocate to swapsize=, else use its size. */
 		if (size_bytes) {

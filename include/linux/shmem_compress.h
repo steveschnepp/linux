@@ -628,6 +628,7 @@ void shmem_comp_loc_pin_put(struct shmem_comp_pool *pool,
 
 /* Debug hook: run one async GC pass on every cell-backed pool. */
 void shmem_comp_cell_gc_all(void);
+void shmem_comp_swap_out_all(void);
 
 /**
  * shmem_comp_compress - Compress a block of memory

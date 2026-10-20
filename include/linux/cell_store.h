@@ -335,6 +335,9 @@ int cell_load(struct cell_pool *cp, u32 cellid, u32 offset,
  */
 unsigned int cell_pool_swap_out(struct cell_pool *cp, unsigned int max);
 
+/* Ensure cell @cellid is resident (swap in from backing if paged out). */
+int cell_ensure_resident(struct cell_pool *cp, u32 cellid);
+
 /*
  * Attach a whole-cell disk backing (specs/07): an O_DIRECT regular file
  * OR raw block device/partition, carved into 1:1 cell-sized extents

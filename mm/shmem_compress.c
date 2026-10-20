@@ -1961,7 +1961,17 @@ static int shmem_comp_loc_load(struct shmem_comp_pool *pool,
 			continue;
 		}
 		if (!c->pages[0] || !c->base) {
+			/* Whole-cell swap (specs/07): an on-disk cell has no
+			 * resident pages -- swap it back in, then retry. */
+			bool need_swapin = !c->in_ram && c->on_disk;
+
 			up_read(&c->lock);
+			if (need_swapin) {
+				int r = cell_ensure_resident(cp, cellid);
+
+				if (r)
+					return r;
+			}
 			continue;
 		}
 
@@ -2019,7 +2029,17 @@ int shmem_comp_loc_read(struct shmem_comp_pool *pool,
 			continue;
 		}
 		if (!c->pages[0] || !c->base) {
+			/* Whole-cell swap (specs/07): an on-disk cell has no
+			 * resident pages -- swap it back in, then retry. */
+			bool need_swapin = !c->in_ram && c->on_disk;
+
 			up_read(&c->lock);
+			if (need_swapin) {
+				int r = cell_ensure_resident(cp, cellid);
+
+				if (r)
+					return r;
+			}
 			continue;
 		}
 
@@ -2065,6 +2085,34 @@ void shmem_comp_cell_gc_all(void)
 		mutex_unlock(&pool->cells->gc_lock);
 	}
 	spin_unlock(&shmem_comp_pools_lock);
+}
+
+/*
+ * Whole-cell disk swap (specs/07): page cold cells to the backing across
+ * every pool.  Snapshot each pool's cell_pool under the pools spinlock,
+ * then swap out OUTSIDE it -- swap-out does O_DIRECT I/O (sleeps), which
+ * is illegal under a spinlock.  Pools are stable here (gc_now is a debug
+ * trigger; no concurrent unmount).  This is the deterministic swap-out
+ * trigger for tests: gc_now pages every eligible cell out in one call,
+ * rather than relying on the aging workqueue's timing.
+ */
+void shmem_comp_swap_out_all(void)
+{
+	struct shmem_comp_pool *pool;
+	struct cell_pool *cps[16];
+	unsigned int n = 0, i;
+
+	spin_lock(&shmem_comp_pools_lock);
+	list_for_each_entry(pool, &shmem_comp_pools, list) {
+		if (!pool->use_cells || !pool->cells)
+			continue;
+		if (n < ARRAY_SIZE(cps))
+			cps[n++] = pool->cells;
+	}
+	spin_unlock(&shmem_comp_pools_lock);
+
+	for (i = 0; i < n; i++)
+		cell_pool_swap_out(cps[i], UINT_MAX);
 }
 
 /*
@@ -3307,6 +3355,8 @@ static ssize_t gc_now_store(struct kobject *kobj,
 	mutex_unlock(&shmem_comp_mounts_lock);
 
 	shmem_comp_cell_gc_all();
+	/* Whole-cell disk swap (specs/07): deterministic swap-out for tests. */
+	shmem_comp_swap_out_all();
 	return count;
 }
 static struct kobj_attribute gc_now_attr = __ATTR(gc_now, 0200, NULL,
