@@ -783,9 +783,11 @@ int cell_pool_enable_backing(struct cell_pool *cp, const char *path,
 	 * the backing must hold at least one extent per cell.  A smaller
 	 * backing is refused outright (no allocator fallback): the whole
 	 * tier exists to extend the tmpfs past RAM, which needs disk >=
-	 * the pool's cell capacity anyway.
+	 * the pool's cell capacity anyway.  cell_size is a power of two
+	 * (PAGE_SIZE << order), so shift rather than a runtime u64
+	 * division (which needs __udivdi3, absent on 32-bit kernels).
 	 */
-	nr = size_bytes / cell_size;
+	nr = size_bytes >> (PAGE_SHIFT + cp->cell_order);
 	if (nr < cp->nslots) {
 		fput(filp);
 		pr_warn("cell_store: swap backing %s too small (%llu extents "
