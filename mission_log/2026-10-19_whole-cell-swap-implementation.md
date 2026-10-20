@@ -264,3 +264,80 @@ lines.
 - i386 + x86_64 compile gates and full `mm/` build: 0 warnings / 0
   errors after the refactor.
 - Runtime still untested (unchanged from Session 1).
+
+---
+
+## Session 78: 2-bit swap state, write-free re-swap, TRIM on free (2026-10-19)
+
+### What We Did
+
+Refined the on-disk model from a single `cell_state` enum to **two
+independent bits** -- `in_ram` and `on_disk` -- with RAM as a cache of
+the authoritative disk copy, commit `361dc3d`. Driven by the observation
+that a cell does not *need* to be on disk, and once it is, its disk copy
+should persist across RAM churn. The bits (in order): new cell = in_ram
+only; first swap-out writes the extent -> on_disk only; swap-in sets
+in_ram (on_disk stays); a re-swap under pressure just clears in_ram (NO
+extent write); free() with on_disk set punches the extent.
+
+Two consequences:
+
+1. **Write-free re-swap** (`cell_swap_out_one` writes only when
+   `!was_on_disk`). A non-active cell is immutable, so a resident copy of
+   an on-disk cell is byte-identical to the disk copy -- a re-swap needs
+   no write. A cell that churns between RAM and disk writes its extent
+   once, not per swap: a direct flash-endurance win on the MMC use case.
+2. **TRIM on free** (`cell_backing_discard_extent`). `cell_free()` on an
+   emptied cell now disposes on BOTH RAM and disk: returns the pages (if
+   in_ram) and `fallocate(FALLOC_FL_PUNCH_HOLE|KEEP_SIZE)` the extent (if
+   on_disk). The punch can issue discard/TRIM, letting the eMMC/SSD
+   reclaim the physical blocks and lowering write amplification on the
+   extent's next use -- arguably *more* important for endurance than the
+   allocation policy, because it hands dead blocks to the device's own
+   wear-leveling. Best-effort (a fs without punch/discard no-ops).
+
+Also closed a **latent GC race** found while re-checking the locking:
+`cell_pool_pick_victim()` could grab a cell that a concurrent whole-cell
+swap-out paged out between the sparse-list walk and `down_write` --
+returning it would let `cell_relocate_one` read a NULL base. Fixed by
+re-validating `in_ram` under `down_write` (bail if the resident copy
+went away).
+
+### What We Learned
+
+- **RAM-as-cache-of-disk is the right frame**, and it falls out of
+  invariant #1 (non-active cells immutable): the resident copy can never
+  diverge from the disk copy, which is what makes the re-swap write-free
+  and removes any need for a dirty bit.
+- **Punch-on-free > allocate-then-overwrite for flash.** Handing a dead
+  cell's blocks back via TRIM lets the device's wear-leveling work; just
+  leaving stale bytes (the pre-Session-77 behaviour) keeps them "live" in
+  the controller's view. Worth doing at the one point where the data
+  provably dies (cell empty).
+- **The state machine had a hidden invariant to protect**: pick_victim
+  and swap-out both take the cell `down_write`, but a cell can move
+  sparse<->resident between a list walk and the lock, so the harvest side
+  must re-validate, not trust the list.
+
+### What We Decided
+
+- **Two bits (`in_ram`/`on_disk`), not an enum** -- the "both" state
+  (RAM caching disk) is expressible and enables write-free re-swap.
+- **Punch (TRIM) only on free**, not on swap-in (the disk copy is the
+  data while resident; punching there would TRIM-then-rewrite churn).
+- **Backing should be on a `discard`-mounted (or fstrim'd) fs** for the
+  TRIM to reach the device; noted in specs/07.
+
+### Files Changed (this session)
+
+| File | Purpose |
+|------|---------|
+| `mm/cell_store.c` | 2-bit state, write-free re-swap, discard-on-free, pick_victim re-validation |
+| `include/linux/cell_store.h` | `in_ram`/`on_disk` replace the enum |
+| `specs/07_WHOLE_CELL_DISK_SWAP.md` | 2-bit model, state machine table, TRIM note |
+
+### Test Results (this session)
+
+- i386 + x86_64 compile gates and full `mm/` build: 0 warnings / 0 errors.
+- Runtime still untested (the punch/TRIM and write-free paths in
+  particular need the loop-file boot test, ideally on real eMMC).
